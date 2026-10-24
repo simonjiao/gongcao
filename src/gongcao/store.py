@@ -132,7 +132,7 @@ class Store:
                     "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
                 ).fetchone()
                 # Human intervention cannot be cleared by a later remote content edit.
-                if state != State.HUMAN:
+                if state not in {State.HUMAN, State.RECONCILE}:
                     state = State.RECONCILE if active else State.QUEUED
                     reason = "GitHub head, base or request changed; previous evidence is invalid"
             if snapshot.get("state") != "open":

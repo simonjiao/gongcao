@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import subprocess
+from dataclasses import replace
 
 import pytest
 from test_runner import install_worker
@@ -152,8 +153,9 @@ def fixture_github(tmp_path, repo, sha, snapshot, monkeypatch):
 
 
 @pytest.fixture
-def policy():
+def policy(auth_file):
     return Config(
+        auth_file=auth_file,
         checks=[["{python}", "-c", "from pathlib import Path; assert Path('sample.txt').exists()"]],
         real_checks=[
             [
@@ -219,7 +221,7 @@ async def test_missing_external_evidence_cannot_be_replaced_by_agent_claims(
     if blocker == "formal_approval":
         fixture_github.decision = "REVIEW_REQUIRED"
     if blocker == "revision_limit":
-        policy = Config(checks=policy.checks, ci_workflows=policy.ci_workflows, max_revisions=0)
+        policy = replace(policy, max_revisions=0)
     await Workflow(store, policy, fixture_github).run(task_id)
     task = store.task(task_id)
     assert task["stage"] != Stage.MERGEABLE
@@ -236,8 +238,11 @@ async def test_changed_quality_policy_invalidates_review_and_validation(
 ):
     await Workflow(store, policy, fixture_github).run(task_id)
     old = [r["id"] for r in store.runs(task_id) if r["role"] == "reviewer" and r["evidence_valid"]]
-    changed = Config(
-        checks=[["{python}", "-c", "raise SystemExit(1)"]], ci_workflows=["ci.yml"], max_revisions=0
+    changed = replace(
+        policy,
+        checks=[["{python}", "-c", "raise SystemExit(1)"]],
+        ci_workflows=["ci.yml"],
+        max_revisions=0,
     )
     await Workflow(store, changed, fixture_github).run(task_id)
     assert store.task(task_id)["state"] == State.HUMAN
@@ -474,7 +479,8 @@ async def test_policy_change_can_publish_new_same_sha_review(
 ):
     await Workflow(store, policy, fixture_github).run(task_id)
     sha = store.task(task_id)["target_sha"]
-    changed = Config(
+    changed = replace(
+        policy,
         checks=policy.checks + [["{python}", "-c", "assert 1+1==2"]],
         ci_workflows=policy.ci_workflows,
     )
@@ -637,6 +643,16 @@ def test_write_intent_survives_restart_and_rejects_changed_payload(store, task_i
     finally:
         reopened.close()
     assert store.operation("key")["state"] == "unknown"
+
+
+def test_remote_change_does_not_resume_an_unconfirmed_write(store, task_id, snapshot):
+    task = store.task(task_id)
+    store.intent(task, "unknown-key", "push", "{}")
+    store.operation_result("unknown-key", "unknown", None)
+    store.halt(task_id, State.RECONCILE, "Write needs reconciliation")
+    store.sync(task_id, snapshot | {"head_sha": "f" * 40})
+    assert store.task(task_id)["state"] == State.RECONCILE
+    assert store.operation("unknown-key")["state"] == "unknown"
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .config import Config
+from .events import Redactor
 from .github import GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage
 from .sandbox import Sandbox
@@ -85,7 +86,9 @@ class Controlled:
         try:
             await write()
         except BaseException as exc:
-            self.store.operation_result(key, "unknown", None)
+            self.store.operation_result(
+                key, "unknown", {"error": Redactor().text(f"{type(exc).__name__}: {exc}")}
+            )
             try:
                 found = await observe()
             except Exception:
@@ -94,7 +97,7 @@ class Controlled:
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 raise UncertainWrite(
-                    "Write result is unknown; remote confirmation required"
+                    f"Write result unconfirmed: {type(exc).__name__}: {exc}"
                 ) from exc
             self.store.operation_result(key, "succeeded", found)
             current_task = asyncio.current_task()
@@ -130,7 +133,7 @@ class Controlled:
         if not workspace.is_relative_to(self.store.root / "worktrees"):
             raise ValueError("Development output is outside the allocated Worktree root")
         slug = hashlib.sha256(task["url"].encode()).hexdigest()[:12]
-        branch = snapshot["head_ref"] if task["pr_number"] else f"gongcao/task-{slug}"
+        branch = snapshot["head_ref"] if task["pr_number"] else f"gongcao/work-{slug}"
         if task["pr_number"]:
             if snapshot["head_repository"] != snapshot["repository"]:
                 raise ValueError("Cross-repository PR pushes require manual handling")
