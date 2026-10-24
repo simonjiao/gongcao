@@ -128,8 +128,6 @@ def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -
         latest = max(candidates, key=lambda run: (run["id"], run.get("run_attempt", 1)))
         if latest["status"] != "completed":
             return State.WAITING_DEPENDENCY, f"CI {name} is {latest['status']}"
-        if latest["conclusion"] != "success":
-            return State.FAILED, f"CI {name} concluded {latest['conclusion']}"
         proof = latest.get("target_proof") or {}
         if any(
             proof.get(key) != value
@@ -144,4 +142,6 @@ def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -
             }.items()
         ):
             return State.WAITING_DEPENDENCY, f"CI {name} has no verified current PR/base checkout"
+        if latest["conclusion"] != "success":
+            return State.FAILED, f"CI {name} concluded {latest['conclusion']}"
     return State.COMPLETED, "Required CI workflows passed at the target SHA"

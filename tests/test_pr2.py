@@ -407,10 +407,13 @@ def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot)
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.FAILED
 
 
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
 @pytest.mark.parametrize(
     "field,value", [("pr_number", 10), ("base_sha", "2" * 40), ("base_ref", "release")]
 )
-def test_ci_from_another_pr_or_old_base_never_satisfies_gate(snapshot, sha, field, value):
+def test_ci_from_another_pr_or_old_base_never_satisfies_gate(
+    snapshot, sha, field, value, conclusion
+):
     task = {
         "target_sha": sha,
         "pr_number": 9,
@@ -436,7 +439,7 @@ def test_ci_from_another_pr_or_old_base_never_satisfies_gate(snapshot, sha, fiel
                 "event": "pull_request",
                 "path": ".github/workflows/ci.yml",
                 "status": "completed",
-                "conclusion": "success",
+                "conclusion": conclusion,
                 "target_proof": proof,
             }
         ],
@@ -591,6 +594,46 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
     monkeypatch.setattr("gongcao.github.command", raw)
     assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
     assert "--slurp" not in calls[0]
+
+
+async def test_failed_ci_carries_bound_and_redacted_failure_log(snapshot, sha, monkeypatch):
+    github = GitHub()
+    task = {
+        "pr_number": 9,
+        "target_sha": sha,
+        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
+    }
+
+    async def pages(path, *args):
+        if "/timeline?" in path:
+            return []
+        return [
+            {
+                "id": 2,
+                "conclusion": "failure",
+                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
+            }
+        ]
+
+    async def read(*args):
+        return {"parents": [{"sha": "1" * 40}, {"sha": sha}]}
+
+    async def logs(*args):
+        return (
+            checkout_log(9, "3" * 40)
+            + "\nModuleNotFoundError: fixture\nkey=sk-proj-testCredential12345"
+        )
+
+    monkeypatch.setattr(github, "pages", pages)
+    monkeypatch.setattr(github, "read", read)
+    monkeypatch.setattr("gongcao.github.command", logs)
+    proof = await github.checkout_proof(
+        task,
+        {"id": 1, "run_attempt": 1, "conclusion": "failure", "created_at": "2026-01-01T00:00:00Z"},
+    )
+    assert "ModuleNotFoundError" in proof["failure_tail"]
+    assert "testCredential" not in proof["failure_tail"]
+    assert proof["pr_number"] == 9 and proof["head_sha"] == sha
 
 
 async def test_quality_imports_target_code_and_has_no_model_auth(store, task_id):

@@ -157,7 +157,7 @@ class GitHub:
         # Some workflow-run payloads omit pull_requests. Prove the actual checkout
         # belongs to this PR and has exactly the current base/head merge parents.
         for run in data["workflows"]:
-            if run["status"] == "completed" and run["conclusion"] == "success":
+            if run["status"] == "completed":
                 try:
                     run["target_proof"] = await self.checkout_proof(task, run)
                 except (RuntimeError, OSError, ValueError) as exc:
@@ -188,10 +188,10 @@ class GitHub:
             f"repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
             "jobs",
         )
-        for job in jobs:
-            if job["conclusion"] != "success" or not any(
+        for job in sorted(jobs, key=lambda item: item["conclusion"] != "failure"):
+            if not any(
                 "actions/checkout@" in step["name"] and step["conclusion"] == "success"
-                for step in job["steps"]
+                for step in (job.get("steps") or [])
             ):
                 continue
             log = await command("gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs")
@@ -202,7 +202,7 @@ class GitHub:
             parents = [parent["sha"] for parent in commit["parents"]]
             if parents != [task["snapshot"]["base_sha"], task["target_sha"]]:
                 continue
-            return {
+            proof = {
                 "pr_number": task["pr_number"],
                 "repository": repository,
                 "base_sha": parents[0],
@@ -221,6 +221,12 @@ class GitHub:
                 "source": "actions/checkout job log + GitHub commit parents",
                 "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
             }
+            if run.get("conclusion") != "success" and job["conclusion"] == "failure":
+                proof["failure_tail"] = Redactor().text(
+                    log.encode()[-20000:].decode(errors="replace")
+                )
+                proof["failure_tail_truncated"] = len(log.encode()) > 20000
+            return proof
         return None
 
 
