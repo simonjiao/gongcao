@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "implementation_sha": "ee7d97bcc25d4a48f0be612a803194862c292431",
+  "observed_at_utc": "2026-10-24T13:16:47.300872+00:00",
+  "versions": {
+    "gongcao": "0.1.0",
+    "openai-codex": "0.163.0",
+    "openai-codex-cli-bin": "0.163.0",
+    "uv": "0.11.33",
+    "beartype": "0.23.1",
+    "pytest-beartype": "0.3.0"
+  },
+  "github_read": {
+    "url": "https://github.com/simonjiao/gongcao/issues/1",
+    "title": "[MVP] 建立 Gongcao 本地 Agent 调度闭环（状态机、独立上下文、运行监控）",
+    "state": "open",
+    "updated_at": "2026-10-24T12:24:37Z"
+  },
+  "task": {
+    "id": 1,
+    "target_sha": "ee7d97bcc25d4a48f0be612a803194862c292431",
+    "stage": "pending_development",
+    "state": "queued",
+    "reason": "Analysis artifact recorded; development is queued"
+  },
+  "run": {
+    "id": "59d944de178643fa83ed06bf225eacde",
+    "state": "completed",
+    "role": "analyst",
+    "target_sha": "ee7d97bcc25d4a48f0be612a803194862c292431",
+    "thread_id": "01a16e0e-2539-7b20-b5fc-b1699c5da0e5",
+    "context_hash": "819217fb1707befb10ae58701d9b14137b1a1f6531db66747b2ed21c3196411b",
+    "started": 1792847781.4939501,
+    "ended": 1792847807.3008716,
+    "evidence_valid": 1
+  },
+  "duration_seconds": 25.807,
+  "isolation_probe": {
+    "host_credentials": "blocked",
+    "host_repository": "blocked",
+    "workspace_writable": false,
+    "external_writes": "blocked",
+    "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+  },
+  "tool_executions": [
+    {
+      "command": "/bin/bash -lc \"pwd; rg --files -g 'README.md' -g '*.py' -g '*accept*' -g '*evidence*' -g 'AGENTS.md' -g 'pyproject.toml' -g '*.yml'\"",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    },
+    {
+      "command": "/bin/bash -lc 'git rev-parse HEAD; cat README.md; cat src/gongcao/runner.py'",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    },
+    {
+      "command": "/bin/bash -lc 'cat docs/pr1.md; cat src/gongcao/model.py; cat tests/test_sandbox.py; cat .github/workflows/ci.yml'",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    },
+    {
+      "command": "/bin/bash -lc 'cat docs/acceptance-pr1.md; cat src/gongcao/github.py'",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    }
+  ],
+  "usage": {
+    "last": {
+      "cacheWriteInputTokens": 0,
+      "cachedInputTokens": 23296,
+      "inputTokens": 24194,
+      "outputTokens": 297,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 24491
+    },
+    "modelContextWindow": 475000,
+    "total": {
+      "cacheWriteInputTokens": 0,
+      "cachedInputTokens": 77184,
+      "inputTokens": 101767,
+      "outputTokens": 514,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 102281
+    }
+  },
+  "result": {
+    "conclusion": "ready",
+    "summary": "PR1 foundation is implemented in the inspected files. Acceptance still requires runtime evidence tied to the supplied SHA; this analysis does not satisfy controller gates.",
+    "basis": [
+      "README.md documents explicit registration, read-only synchronization, isolated Codex sessions, Worktrees, status, inspect, logs and cancellation.",
+      "src/gongcao/runner.py creates a Worktree before execution, verifies sandbox isolation, records structured results and events, and handles cancellation and failures.",
+      "src/gongcao/model.py separates stages from execution states; analysis advances to development, while development waits for later GitHub gates.",
+      "src/gongcao/github.py exposes read-only snapshots. tests/test_sandbox.py includes actual OS access checks; CI configures locked uv dependencies, Ruff, mypy and pytest.",
+      "docs/pr1.md links docs/acceptance-pr1.md, which is absent from this checkout. Git could not verify HEAD because /workspace/.git has an invalid gitfile format. No tests, credential access or network operations were performed."
+    ],
+    "target_sha": "ee7d97bcc25d4a48f0be612a803194862c292431",
+    "next_steps": [
+      "Controller should verify checkout provenance and collect the required CI/check results for the supplied SHA.",
+      "Record a real Codex run with queryable stage, result and logs, actual role sandbox isolation evidence, and explicit failure/cancellation records; supply the missing acceptance document."
+    ]
+  },
+  "event_counts": {
+    "started": 1,
+    "isolation_verified": 1,
+    "thread": 1,
+    "sdk_event": 311,
+    "result": 1,
+    "ended": 1
+  },
+  "journal_sha256": "0d99f20e806d3290f3f24c45528a58af8fad4bdac271971777da4df05cd8c73f",
+  "logs_follow": {
+    "records": 316,
+    "ended_observed": true
+  },
+  "worktree_clean": true,
+  "local_artifacts": "/tmp/gongcao-pr1-acceptance-ee7d97b",
+  "automated_checks": {
+    "implementation_sha": "ee7d97bcc25d4a48f0be612a803194862c292431",
+    "pytest": "43 passed",
+    "ruff": "passed",
+    "format": "passed",
+    "mypy": "passed"
+  },
+  "review": {
+    "standards": "3 findings fixed and re-reviewed; no blocking findings",
+    "spec": "3 findings fixed and re-reviewed; no blocking findings"
+  }
+}
