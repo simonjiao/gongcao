@@ -241,3 +241,41 @@ async def test_version_change_before_claim_cannot_accept_stale_context(
         await Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id)
     assert not store.runs(task_id)
     assert store.task(task_id)["stage"] == Stage.ANALYSIS
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "raise SystemExit(7)",
+        "import sys; sys.stdin.readline(); print('invalid-json', flush=True); "
+        "sys.stdout.write('x' * 4_194_304); sys.stdout.flush()",
+    ],
+)
+async def test_worker_errors_release_all_pipes_before_returning(
+    store, task_id, snapshot, auth_file, monkeypatch, source
+):
+    install_worker(monkeypatch, source)
+    created = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def capture(*args, **kwargs):
+        process = await spawn(*args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture)
+    try:
+        await asyncio.wait_for(
+            Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id),
+            timeout=6,
+        )
+        assert store.task(task_id)["state"] == State.FAILED
+        for process in created:
+            assert process.returncode is not None
+            assert process.stdout.at_eof()
+            assert process.stderr.at_eof()
+    finally:
+        for process in created:
+            if process.returncode is None:
+                process.kill()
+            await process.communicate()

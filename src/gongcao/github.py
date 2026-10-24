@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .events import Redactor
+from .processes import stop
 
 
 @dataclass(frozen=True)
@@ -35,13 +36,12 @@ async def command(*args: str, cwd: str | None = None) -> str:
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
     except BaseException:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+        await stop(process)
         raise
     if process.returncode:
         raise RuntimeError(Redactor().text(stderr.decode(errors="replace")[-2000:]))

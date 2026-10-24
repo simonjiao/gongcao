@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-import os
-import signal
 import sqlite3
 import sys
 import time
@@ -14,26 +12,10 @@ from .config import Config
 from .events import Journal, Redactor
 from .github import GitHub, Target
 from .model import AgentResult, Role, Stage, State, after_run
+from .processes import stop
 from .sandbox import IsolationError, Sandbox
 from .store import Store
 from .workspace import context, worktree
-
-
-async def stop(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=3)
-    except TimeoutError:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
 
 
 class Runner:
@@ -168,13 +150,13 @@ class Runner:
                     pass  # The SQLite execution record must survive a failed log sink.
             self.store.finish(run_id, state, stage, state, message)
         finally:
-            if process is not None:
-                await stop(process)
             for consumer in consumers:
                 if not consumer.done():
                     consumer.cancel()
             if consumers:
                 await asyncio.gather(*consumers, return_exceptions=True)
+            if process is not None:
+                await stop(process)
             if journal is not None:
                 try:
                     journal.emit(

@@ -28,6 +28,10 @@ gongcao = "gongcao.cli:main"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 beartype_packages = "gongcao"
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+    "error::ResourceWarning",
+]
 
 [tool.ruff]
 line-length = 100
