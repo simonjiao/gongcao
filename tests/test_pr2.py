@@ -404,6 +404,9 @@ def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot)
     }
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.COMPLETED
     facts["workflows"][0]["conclusion"] = "skipped"
+    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
+    facts["workflows"][0]["conclusion"] = "failure"
+    facts["workflows"][0]["target_proof"]["failure_tail"] = "Confirmed test failure"
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.FAILED
 
 
@@ -537,7 +540,8 @@ async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, mon
     monkeypatch.setattr(github, "read", read)
     monkeypatch.setattr("gongcao.github.command", logs)
     result = await github.checkout_proof(
-        task, {"id": 1, "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"}
+        task,
+        {"id": 1, "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z", "conclusion": "success"},
     )
     assert (result is not None) == valid
     assert checkout_sha(log, 10) is None
@@ -577,6 +581,7 @@ async def test_checkout_proof_cannot_relabel_same_sha_ci_after_retarget(
     monkeypatch.setattr("gongcao.github.command", logs)
     run = {
         "id": 1,
+        "conclusion": "success",
         "run_attempt": 2,
         "created_at": "2026-01-01T00:00:02Z" if after else "2026-01-01T00:00:00Z",
     }
@@ -621,7 +626,10 @@ async def test_failed_ci_carries_bound_and_redacted_failure_log(snapshot, sha, m
     async def logs(*args):
         return (
             checkout_log(9, "3" * 40)
-            + "\nModuleNotFoundError: fixture\nkey=sk-proj-testCredential12345"
+            + "\nModuleNotFoundError: fixture\nkey=github_pat_"
+            + "PRIVATESEGMENT" * 100
+            + " "
+            + "x" * 19850
         )
 
     monkeypatch.setattr(github, "pages", pages)
@@ -632,8 +640,48 @@ async def test_failed_ci_carries_bound_and_redacted_failure_log(snapshot, sha, m
         {"id": 1, "run_attempt": 1, "conclusion": "failure", "created_at": "2026-01-01T00:00:00Z"},
     )
     assert "ModuleNotFoundError" in proof["failure_tail"]
-    assert "testCredential" not in proof["failure_tail"]
+    assert "PRIVATESEGMENT" not in proof["failure_tail"]
     assert proof["pr_number"] == 9 and proof["head_sha"] == sha
+
+
+async def test_environment_failure_cannot_use_another_successful_job_as_failure_evidence(
+    snapshot, sha, monkeypatch
+):
+    github = GitHub()
+    task = {
+        "pr_number": 9,
+        "target_sha": sha,
+        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
+    }
+
+    async def pages(path, *args):
+        if "/timeline?" in path:
+            return []
+        return [
+            {"id": 2, "conclusion": "failure", "steps": []},
+            {
+                "id": 3,
+                "conclusion": "success",
+                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
+            },
+        ]
+
+    monkeypatch.setattr(github, "pages", pages)
+    proof = await github.checkout_proof(
+        task,
+        {"id": 1, "run_attempt": 1, "conclusion": "failure", "created_at": "2026-01-01T00:00:00Z"},
+    )
+    assert proof is None
+
+
+async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id):
+    config = Config(
+        checks=[["{python}", "-c", "print('github_pat_'+'PRIVATESEGMENT'*100+' '+'x'*19850)"]]
+    )
+    data = await Quality(store, config).run(store.task(task_id), "checks")
+    output = data["commands"][0]["stdout"]
+    assert output["truncated"] and data["passed"]
+    assert "PRIVATESEGMENT" not in output["tail"]
 
 
 async def test_quality_imports_target_code_and_has_no_model_auth(store, task_id):

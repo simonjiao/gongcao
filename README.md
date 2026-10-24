@@ -5,7 +5,8 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 
 实现计划与验收边界见 [Issue #1](https://github.com/simonjiao/gongcao/issues/1)。
 
-PR1 的运行与隔离基础已合并；当前实现 **PR2：GitHub 工作闭环与质量门禁**。
+基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
+当前第二阶段是 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4)。
 支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
 租约、后台调度与重启恢复属于 PR3。
 

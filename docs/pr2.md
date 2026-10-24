@@ -1,4 +1,4 @@
-# PR2 范围与执行契约
+# 第二阶段范围与执行契约（实现 PR #4）
 
 来源：[Issue #1](https://github.com/simonjiao/gongcao/issues/1)。PR1 已在 PR #2 合并。
 本 PR 实现显式登记任务的前台闭环；PR3 的租约、并发调度与重启恢复保持独立。
@@ -35,6 +35,8 @@ base_ref_changed/automatic_base_change_succeeded；不使用 rerun 的新启动�
 和 [timeline 接口](https://docs.github.com/en/rest/issues/timeline#list-timeline-events-for-an-issue)。
 失败 CI 也先验证 PR/base/head 归属，再允许进入修订；修订依据携带绑定版本的失败 job 日志尾部，
 脱敏并限制为 20KB，不能用其他 PR 的失败或未证明归属的环境故障驱动代码变更。
+CI 日志先完整脱敏再截尾；检查输出按完整行脱敏后保留尾部，超过 1MiB 的单行整行省略并标记。
+工作流取消、跳过或只有其他成功 job、缺少绑定版本的失败依据时均等待，不自动修改代码。
 不把 SDK 自述当作 CI 或测试通过。正式审批需求由 GitHub reviewDecision/mergeStateStatus 核验，
 同账号模型评审仅为 COMMENT。目标请求/head/base 改变使本地旧审查和检查失效，配置摘要变化也重建门禁。
 

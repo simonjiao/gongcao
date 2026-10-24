@@ -189,6 +189,11 @@ class GitHub:
             "jobs",
         )
         for job in sorted(jobs, key=lambda item: item["conclusion"] != "failure"):
+            if run.get("conclusion") != "success" and job["conclusion"] not in {
+                "failure",
+                "timed_out",
+            }:
+                continue
             if not any(
                 "actions/checkout@" in step["name"] and step["conclusion"] == "success"
                 for step in (job.get("steps") or [])
@@ -221,10 +226,9 @@ class GitHub:
                 "source": "actions/checkout job log + GitHub commit parents",
                 "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
             }
-            if run.get("conclusion") != "success" and job["conclusion"] == "failure":
-                proof["failure_tail"] = Redactor().text(
-                    log.encode()[-20000:].decode(errors="replace")
-                )
+            if run.get("conclusion") != "success":
+                clean = Redactor().text(log)
+                proof["failure_tail"] = clean.encode()[-20000:].decode(errors="replace")
                 proof["failure_tail_truncated"] = len(log.encode()) > 20000
             return proof
         return None

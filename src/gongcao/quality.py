@@ -57,13 +57,35 @@ class Quality:
             async def output(stream: asyncio.StreamReader | None) -> dict[str, Any]:
                 assert stream is not None
                 tail = b""
+                line = b""
                 size = 0
+                dropping = False
+                omitted = False
                 while chunk := await stream.read(65536):
                     size += len(chunk)
-                    tail = (tail + chunk)[-20000:]
+                    for part in chunk.splitlines(keepends=True):
+                        if not dropping:
+                            line += part
+                            if len(line) > 1_048_576:
+                                line, dropping, omitted = b"", True, True
+                        if part.endswith((b"\n", b"\r")):
+                            clean = (
+                                b"[oversized output line omitted]\n"
+                                if dropping
+                                else (Redactor().text(line.decode(errors="replace")).encode())
+                            )
+                            tail = (tail + clean)[-20000:]
+                            line, dropping = b"", False
+                if line or dropping:
+                    clean = (
+                        b"[oversized output line omitted]"
+                        if dropping
+                        else (Redactor().text(line.decode(errors="replace")).encode())
+                    )
+                    tail = (tail + clean)[-20000:]
                 return {
-                    "tail": Redactor().text(tail.decode(errors="replace")),
-                    "truncated": size > 20000,
+                    "tail": tail.decode(errors="replace"),
+                    "truncated": size > 20000 or omitted,
                     "bytes": size,
                 }
 
@@ -85,7 +107,7 @@ class Quality:
                 await stop(process, readers)
             results.append(
                 {
-                    "argv": expanded,
+                    "argv": [Redactor().text(arg) for arg in expanded],
                     "exit_code": code,
                     "stdout": stdout,
                     "stderr": stderr,
@@ -143,5 +165,7 @@ def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -
         ):
             return State.WAITING_DEPENDENCY, f"CI {name} has no verified current PR/base checkout"
         if latest["conclusion"] != "success":
+            if not proof.get("failure_tail"):
+                return State.WAITING_DEPENDENCY, f"CI {name} has no bound failure diagnostics"
             return State.FAILED, f"CI {name} concluded {latest['conclusion']}"
     return State.COMPLETED, "Required CI workflows passed at the target SHA"
