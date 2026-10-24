@@ -1,0 +1,389 @@
+{
+  "schema_version": 2,
+  "implementation_sha": "42d4b6c30d14c7324e3dd324bc2f95fc95fe8153",
+  "observed_at_utc": "2026-10-24T14:47:36.501164+00:00",
+  "scope": "PR1 local real SDK analyst/developer acceptance; read-only GitHub metadata; no GitHub writes, reviews, merges or PR2/PR3 workflow claims",
+  "versions": {
+    "gongcao": "0.1.0",
+    "openai-codex": "0.163.0",
+    "openai-codex-cli-bin": "0.163.0",
+    "uv": "0.11.33",
+    "beartype": "0.23.1",
+    "pytest-beartype": "0.3.0"
+  },
+  "github_read": {
+    "url": "https://github.com/simonjiao/gongcao/issues/1",
+    "title": "[MVP] 建立 Gongcao 本地 Agent 调度闭环（状态机、独立上下文、运行监控）",
+    "state": "open",
+    "updated_at": "2026-10-24T14:02:31Z"
+  },
+  "github_snapshot_sha256": "f24fef670af75aa12fb48100abeec9360b98f3e2dea11633a3036672e8fb82cf",
+  "fixture": {
+    "kind": "temporary trusted local Git repository; origin URL used only for real read-only Issue lookup; fixture commit was never pushed",
+    "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+    "commit": "tree a4d911282f7fecee75a10dc44f90f983ce7cd793\nauthor Gongcao Acceptance <acceptance@example.invalid> 1792851037 +0800\ncommitter Gongcao Acceptance <acceptance@example.invalid> 1792851037 +0800\n\nTrusted PR1 local developer acceptance fixture\n",
+    "tree": "a4d911282f7fecee75a10dc44f90f983ce7cd793",
+    "baseline_files": {
+      ".gitignore": ".venv/\n__pycache__/\n*.pyc\n",
+      ".python-version": "3.12\n",
+      "AGENTS.md": "Trusted PR1 acceptance fixture. Work only on calculator.py. Do not change tests or project configuration. Use uv for checks. Never access credentials or perform remote mutations.\n",
+      "README.md": "PR1 trusted local acceptance fixture. Fix add so it returns the sum for positive, negative and zero inputs. The tests must pass without changes. This fixture is local only; its origin URL is used solely for read-only Issue metadata.\n",
+      "calculator.py": "def add(left: int, right: int) -> int:\n    return left - right\n",
+      "pyproject.toml": "[project]\nname = \"gongcao-pr1-fixture\"\nversion = \"0.0.1\"\nrequires-python = \">=3.12\"\n",
+      "tests/test_calculator.py": "import unittest\nfrom calculator import add\n\n\nclass AdditionTests(unittest.TestCase):\n    def test_positive(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_negative(self):\n        self.assertEqual(add(-2, -3), -5)\n\n    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n",
+      "uv.lock": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"gongcao-pr1-fixture\"\nversion = \"0.0.1\"\nsource = { virtual = \".\" }\n"
+    },
+    "baseline_tests": {
+      "command": "/usr/bin/python3.12 -B -m unittest discover -s tests -v",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "test_negative (test_calculator.AdditionTests.test_negative) ... FAIL\ntest_positive (test_calculator.AdditionTests.test_positive) ... FAIL\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n======================================================================\nFAIL: test_negative (test_calculator.AdditionTests.test_negative)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/gongcao-pr1-developer-42d4b6c/fixture/tests/test_calculator.py\", line 10, in test_negative\n    self.assertEqual(add(-2, -3), -5)\nAssertionError: 1 != -5\n\n======================================================================\nFAIL: test_positive (test_calculator.AdditionTests.test_positive)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/gongcao-pr1-developer-42d4b6c/fixture/tests/test_calculator.py\", line 7, in test_positive\n    self.assertEqual(add(2, 3), 5)\nAssertionError: -1 != 5\n\n----------------------------------------------------------------------\nRan 3 tests in 0.001s\n\nFAILED (failures=2)\n"
+    }
+  },
+  "configuration": {
+    "model": "gpt-6.1-sol",
+    "roles": {
+      "analyst": "This is the explicitly requested PR1 real Developer acceptance, using a tiny trusted LOCAL fixture; do not implement the broader MVP in the GitHub issue. Read README.md, calculator.py and tests/test_calculator.py. Plan ONLY to fix add to return the sum, without changing tests or config. Read only; do not run tests or access credentials. Return ready with this narrow plan and exact supplied target_sha.",
+      "developer": "This is the explicitly requested PR1 real Developer acceptance using a tiny trusted LOCAL fixture, not the broader MVP. Follow confirmed_analysis: fix ONLY calculator.py so add returns the sum. Do not modify tests, AGENTS.md, README.md or configuration. Run this exact check from /workspace: uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v. Verify that tests pass; record the command and result in basis. No commits or remote writes, and do not read authentication files (including the dedicated Codex model authentication). Return the original context target_sha in the structured result; the controller retains local uncommitted work for PR1. The original host fixture must remain untouched."
+    },
+    "timeout_seconds": 180
+  },
+  "task": {
+    "id": 1,
+    "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+    "stage": "pending_development",
+    "state": "waiting_dependency",
+    "reason": "Local changes retained; PR/review gates require PR2"
+  },
+  "runs": [
+    {
+      "run": {
+        "id": "dd1f6643c9084bf3baf245b0476c1393",
+        "role": "analyst",
+        "state": "completed",
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "thread_id": "01a16e61-1a22-7f41-97cd-c853e0f0a188",
+        "context_hash": "8f005626ebb2757e045b242460615ad0d1a32a7c45ed0ff395f63207ebb3944a",
+        "started": 1792853218.0078824,
+        "ended": 1792853233.1067154,
+        "evidence_valid": 1
+      },
+      "duration_seconds": 15.099,
+      "isolation_probe": {
+        "host_credentials": "blocked",
+        "host_repository": "blocked",
+        "workspace_writable": false,
+        "external_writes": "blocked",
+        "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+      },
+      "tool_executions": [
+        {
+          "command": "/bin/bash -lc 'cat README.md calculator.py tests/test_calculator.py'",
+          "cwd": "/workspace",
+          "status": "completed",
+          "exitCode": 0,
+          "durationMs": 0,
+          "aggregatedOutput": "PR1 trusted local acceptance fixture. Fix add so it returns the sum for positive, negative and zero inputs. The tests must pass without changes. This fixture is local only; its origin URL is used solely for read-only Issue metadata.\ndef add(left: int, right: int) -> int:\n    return left - right\nimport unittest\nfrom calculator import add\n\n\nclass AdditionTests(unittest.TestCase):\n    def test_positive(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_negative(self):\n        self.assertEqual(add(-2, -3), -5)\n\n    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n"
+        }
+      ],
+      "file_changes": [],
+      "usage": {
+        "last": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 16768,
+          "inputTokens": 17103,
+          "outputTokens": 135,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 17238
+        },
+        "modelContextWindow": 475000,
+        "total": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 16768,
+          "inputTokens": 33955,
+          "outputTokens": 171,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 34126
+        }
+      },
+      "result": {
+        "conclusion": "ready",
+        "summary": "Plan only: change calculator.py add to return left + right.",
+        "basis": [
+          "Read README.md, calculator.py, and tests/test_calculator.py.",
+          "add currently subtracts; existing tests require sums for positive, negative, and zero inputs.",
+          "No files changed, tests run, credentials accessed, or remote mutations performed."
+        ],
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "next_steps": [
+          "Developer: replace left - right with left + right in calculator.py only; leave tests and configuration unchanged."
+        ]
+      },
+      "event_counts": {
+        "started": 1,
+        "isolation_verified": 1,
+        "thread": 1,
+        "sdk_event": 137,
+        "result": 1,
+        "ended": 1
+      },
+      "journal_sha256": "51591d5fe88ce2fa6130af0379a9fbc6688ede5e4944ed1240b89c556ded3d04",
+      "context_hash_verified": true,
+      "worktree_head": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+      "worktree_status": ""
+    },
+    {
+      "run": {
+        "id": "c3e8fb19361b4034b2a4932ece6510ae",
+        "role": "developer",
+        "state": "completed",
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "thread_id": "01a16e61-5907-70e3-9708-9176e391e339",
+        "context_hash": "a583b5013576b2908daba4afc1cb8b6bc8e2ab8b1d9e42c1016ae06489e08372",
+        "started": 1792853234.3870301,
+        "ended": 1792853256.5011637,
+        "evidence_valid": 1
+      },
+      "duration_seconds": 22.114,
+      "isolation_probe": {
+        "host_credentials": "blocked",
+        "host_repository": "blocked",
+        "workspace_writable": true,
+        "external_writes": "blocked",
+        "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+      },
+      "tool_executions": [
+        {
+          "command": "/bin/bash -lc 'pwd\ncat calculator.py\ngit status --short'",
+          "cwd": "/workspace",
+          "status": "failed",
+          "exitCode": 128,
+          "durationMs": 0,
+          "aggregatedOutput": "/workspace\ndef add(left: int, right: int) -> int:\n    return left - right\nfatal: invalid gitfile format: /workspace/.git\n"
+        },
+        {
+          "command": "/bin/bash -lc 'UV_CACHE_DIR=/tmp/gongcao-uv-cache uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v'",
+          "cwd": "/workspace",
+          "status": "completed",
+          "exitCode": 0,
+          "durationMs": 30,
+          "aggregatedOutput": "Using CPython 3.12.3 interpreter at: /usr/bin/python3.12\nCreating virtual environment at: .venv\ntest_negative (test_calculator.AdditionTests.test_negative) ... ok\ntest_positive (test_calculator.AdditionTests.test_positive) ... ok\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n"
+        }
+      ],
+      "file_changes": [
+        {
+          "changes": [
+            {
+              "diff": "@@ -1,2 +1,2 @@\n def add(left: int, right: int) -> int:\n-    return left - right\n+    return left + right\n",
+              "kind": {
+                "move_path": null,
+                "type": "update"
+              },
+              "path": "/workspace/calculator.py"
+            }
+          ],
+          "id": "exec-b44fa1c2-d968-4a03-9b25-6efe92d516f5",
+          "status": "completed",
+          "type": "fileChange"
+        }
+      ],
+      "usage": {
+        "last": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 17408,
+          "inputTokens": 17726,
+          "outputTokens": 175,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 17901
+        },
+        "modelContextWindow": 475000,
+        "total": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 51712,
+          "inputTokens": 69732,
+          "outputTokens": 377,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 70109
+        }
+      },
+      "result": {
+        "conclusion": "ready",
+        "summary": "Changed calculator.py so add returns left + right. All 3 tests pass.",
+        "basis": [
+          "Only calculator.py source was changed; tests and configuration were unchanged.",
+          "Required command: uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v. Initial execution failed because the default uv cache directory was read-only.",
+          "Reran the required command with UV_CACHE_DIR=/tmp/gongcao-uv-cache: exit 0, all 3 tests passed.",
+          "No credentials accessed, commits created, or remote mutations performed."
+        ],
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "next_steps": [
+          "Controller: retain the local change for independent review."
+        ]
+      },
+      "event_counts": {
+        "started": 1,
+        "isolation_verified": 1,
+        "thread": 1,
+        "sdk_event": 191,
+        "result": 1,
+        "ended": 1
+      },
+      "journal_sha256": "0e0d15004fc68f63d87b68608abc71aeee680ddba84c6e045616aff9288db7c7",
+      "context_hash_verified": true,
+      "worktree_head": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+      "worktree_status": " M calculator.py\n"
+    }
+  ],
+  "handoff": {
+    "separate_threads": true,
+    "separate_worktrees": true,
+    "confirmed_analysis_only": true
+  },
+  "source_integrity": {
+    "before": {
+      ".gitignore": "472f568478bff9056ec56b5c5e8a7ca3d280c651d527321e1eb80892801164be",
+      ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+      "AGENTS.md": "9846d5a02c1c5a04df23e7d5e0b7f6e329328da5a25ba6bd2d5ff177d0c4cf0f",
+      "README.md": "f6ab7205eb411c986b93b2ffaabbce928649373a6240310a096c382a6c69c646",
+      "calculator.py": "8f85450200db13108dc37d54ada5376d715d7c7aff3bceb5ffa1f6a75b0c8a03",
+      "pyproject.toml": "8c9500b2a04a988a77669b5a31d54745c0dcd5db12618804a73e81fca0927393",
+      "tests/test_calculator.py": "46121ecdfa355c03014be089cd1f1abe029846482ff443bde4ae83e18f4c9304",
+      "uv.lock": "a447b0baeecc7fbf3996486f38de22e818494c335a31c928fb8c8da6c871ded1"
+    },
+    "after": {
+      ".gitignore": "472f568478bff9056ec56b5c5e8a7ca3d280c651d527321e1eb80892801164be",
+      ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+      "AGENTS.md": "9846d5a02c1c5a04df23e7d5e0b7f6e329328da5a25ba6bd2d5ff177d0c4cf0f",
+      "README.md": "f6ab7205eb411c986b93b2ffaabbce928649373a6240310a096c382a6c69c646",
+      "calculator.py": "8f85450200db13108dc37d54ada5376d715d7c7aff3bceb5ffa1f6a75b0c8a03",
+      "pyproject.toml": "8c9500b2a04a988a77669b5a31d54745c0dcd5db12618804a73e81fca0927393",
+      "tests/test_calculator.py": "46121ecdfa355c03014be089cd1f1abe029846482ff443bde4ae83e18f4c9304",
+      "uv.lock": "a447b0baeecc7fbf3996486f38de22e818494c335a31c928fb8c8da6c871ded1"
+    },
+    "unchanged": true,
+    "git_status": "",
+    "source_venv_exists": false
+  },
+  "developer_change": {
+    "patch": "diff --git a/calculator.py b/calculator.py\nindex c481219..5b38b28 100644\n--- a/calculator.py\n+++ b/calculator.py\n@@ -1,2 +1,2 @@\n def add(left: int, right: int) -> int:\n-    return left - right\n+    return left + right\n",
+    "after": "def add(left: int, right: int) -> int:\n    return left + right\n",
+    "other_tracked_files_unchanged": true,
+    "workspace_venv_created": true,
+    "controller_independent_check": {
+      "command": "/usr/bin/python3.12 -B -m unittest discover -s tests -v",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "test_negative (test_calculator.AdditionTests.test_negative) ... ok\ntest_positive (test_calculator.AdditionTests.test_positive) ... ok\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n"
+    }
+  },
+  "logs_follow": {
+    "mode": "replay after completion; live following previously exercised at c5a8343",
+    "records": 196,
+    "ended_observed": true,
+    "sha256": "0e0d15004fc68f63d87b68608abc71aeee680ddba84c6e045616aff9288db7c7"
+  },
+  "existing_host_paths_verified_unreadable": {
+    "/home/simon/.config/gh/hosts.yml": true,
+    "/tmp/gongcao-pr1-developer-42d4b6c/fixture/.git/config": true,
+    "/home/simon/.codex/auth.json": true
+  },
+  "automated_checks": {
+    "implementation_sha": "42d4b6c30d14c7324e3dd324bc2f95fc95fe8153",
+    "python": "3.12.3",
+    "pytest": "70 passed in 28.69s",
+    "ruff": "passed",
+    "format": "passed",
+    "mypy": "passed",
+    "uv_lock_check": "passed",
+    "warning_policy": "ResourceWarning and PytestUnraisableExceptionWarning are errors"
+  },
+  "ci": {
+    "run_id": 40104037452,
+    "url": "https://github.com/simonjiao/gongcao/actions/runs/40104037452",
+    "implementation_sha": "42d4b6c30d14c7324e3dd324bc2f95fc95fe8153",
+    "jobs": [
+      {
+        "id": 120901898649,
+        "name": "test (3.13)",
+        "conclusion": "success",
+        "pytest_summary": "2026-10-24T14:48:06.7303409Z 70 passed in 20.66s",
+        "python": "2026-10-24T14:47:10.0436856Z   pythonLocation: /opt/hostedtoolcache/Python/3.13.16/x64",
+        "leaks": []
+      },
+      {
+        "id": 120901898864,
+        "name": "test (3.12)",
+        "conclusion": "success",
+        "pytest_summary": "2026-10-24T14:48:08.8975697Z 70 passed in 20.68s",
+        "python": "2026-10-24T14:47:10.3844820Z   pythonLocation: /opt/hostedtoolcache/Python/3.12.15/x64",
+        "leaks": []
+      }
+    ]
+  },
+  "review": {
+    "base_sha": "c1b582def8249166ed6c8db6a94c27d9c25dbf0c",
+    "reviewed_sha": "42d4b6c30d14c7324e3dd324bc2f95fc95fe8153",
+    "standards": "1 unbounded post-KILL cleanup finding; fixed and re-reviewed closed, no remaining findings",
+    "spec": "1 unbounded post-KILL cleanup finding; fixed and re-reviewed closed, no remaining findings"
+  },
+  "limitations": [
+    "Linux and Bubblewrap are required. Only trusted task code is supported: dedicated model authentication remains readable inside the runtime and network access is allowed.",
+    "Source working files stayed identical; the controller created local Git branches and Worktree metadata as expected.",
+    "The agent git-status attempt failed with exit 128 because .git is intentionally masked. Controller-side Git checks independently confirmed target HEAD and exact patch.",
+    "The successful SDK uv check explicitly sets UV_CACHE_DIR=/tmp/gongcao-uv-cache. Arbitrary target repository checks still require project configuration.",
+    "Fixture target SHA is distinct from Gongcao implementation SHA. Passing developer output stops at waiting_dependency and is not a PR/review/CI merge gate.",
+    "Emergency local pipe closure uses the CPython Process private transport only after bounded TERM/KILL attempts. Detached descendant termination remains unconfirmed and is reported as CleanupError; Runner cannot advance in that case."
+  ],
+  "local_artifacts": "/tmp/gongcao-pr1-developer-42d4b6c",
+  "cli_runtime_cleanup": {
+    "environment": "PYTHONWARNINGS=error::ResourceWarning",
+    "stderr": {
+      "registration": "",
+      "analysis": "",
+      "development": "",
+      "inspection": ""
+    }
+  },
+  "diagnosis": {
+    "original_ci": {
+      "run_id": 40101964067,
+      "job_id": 120895791633,
+      "symptom": "PytestUnraisableExceptionWarning / BaseSubprocessTransport.__del__: RuntimeError: Event loop is closed"
+    },
+    "root_cause": "A reaped parent can still have open inherited output pipes. Skipping cleanup by returncode, or only waiting for process exit after cancellation, leaves pipe transports alive after the event loop closes.",
+    "python_reference": "https://docs.python.org/3.12/library/asyncio-subprocess.html",
+    "reproducer": "import asyncio\nimport gc\nimport inspect\nimport json\nimport os\nimport signal\nimport sys\nimport warnings\n\nfrom gongcao.runner import stop\n\n\nasync def scenario():\n    process = await asyncio.create_subprocess_exec(\n        sys.executable, '-c',\n        'import os,time; child=os.fork(); time.sleep(30) if child==0 else os._exit(0)',\n        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,\n        stderr=asyncio.subprocess.PIPE, start_new_session=True,\n    )\n    while process.returncode is None:\n        await asyncio.sleep(0.001)\n    await stop(process)\n    return process.pid, process.stdout.at_eof(), process.stderr.at_eof()\n\n\nerrors = []\nstates = []\noriginal_hook = sys.unraisablehook\nsys.unraisablehook = lambda event: errors.append({\n    'exception': type(event.exc_value).__name__, 'message': str(event.exc_value),\n    'object': getattr(event.object, '__qualname__', str(event.object)),\n})\nwith warnings.catch_warnings(record=True) as collected:\n    warnings.simplefilter('always', ResourceWarning)\n    for _ in range(20):\n        pid, stdout_eof, stderr_eof = asyncio.run(scenario())\n        states.append({'stdout_eof': stdout_eof, 'stderr_eof': stderr_eof})\n        gc.collect()\n        try:\n            os.killpg(pid, signal.SIGKILL)\n        except ProcessLookupError:\n            pass\n    gc.collect()\nsys.unraisablehook = original_hook\nresult = {\n    'mode': sys.argv[1], 'python': sys.version, 'cleanup_source': inspect.getsourcefile(stop),\n    'iterations': 20, 'pipe_states': states, 'unraisable': errors,\n    'resource_warnings': [str(w.message) for w in collected],\n}\nprint(json.dumps(result, indent=2))\nraise SystemExit(1 if errors or collected or not all(s['stdout_eof'] and s['stderr_eof'] for s in states) else 0)\n",
+    "baseline_command": "PYTHONPATH=/tmp/gongcao-pr1-before-pipes/src uv run python /tmp/gongcao-pr1-process-loop.py baseline",
+    "fixed_command": "uv run python /tmp/gongcao-pr1-process-loop.py fixed",
+    "comparison": {
+      "baseline": {
+        "implementation_sha": "c1b582def8249166ed6c8db6a94c27d9c25dbf0c",
+        "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+        "iterations": 20,
+        "exit_code": 1,
+        "pipes_eof": 0,
+        "unraisable_count": 20,
+        "first_unraisable": {
+          "exception": "RuntimeError",
+          "message": "Event loop is closed",
+          "object": "BaseSubprocessTransport.__del__"
+        },
+        "resource_warning_count": 140,
+        "raw_artifact_sha256": "d163526b54dc11df1cc795147d97f6ef4c4a8b65644b0ae9b5f4015a16105637"
+      },
+      "fixed": {
+        "implementation_sha": "42d4b6c30d14c7324e3dd324bc2f95fc95fe8153",
+        "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+        "iterations": 20,
+        "exit_code": 0,
+        "pipes_eof": 20,
+        "unraisable_count": 0,
+        "first_unraisable": null,
+        "resource_warning_count": 0,
+        "raw_artifact_sha256": "3cdaac5ccf68acdf3ae488a2092f0e7aa81c2230a6914faa81dfe8bfd8c71c88"
+      }
+    },
+    "regression_red_before_fix": "uv run pytest -q tests/test_processes.py: 4 failed in 1.17s on c1b582d",
+    "regression_after_fix": "uv run pytest -q tests/test_processes.py tests/test_runner.py: 23 passed in 16.07s"
+  }
+}
