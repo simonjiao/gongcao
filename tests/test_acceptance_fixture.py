@@ -18,7 +18,10 @@ class ClampScoreTests(unittest.TestCase):
                 self.assertEqual(clamp_score(value), value)
 
     def test_upper_bound(self) -> None:
-        for value in (100, 101, 200):
+        self.assertEqual(clamp_score(100), 100)
+
+    def test_values_above_upper_bound(self) -> None:
+        for value in (101, 200):
             with self.subTest(value=value):
                 self.assertEqual(clamp_score(value), 100)
 
