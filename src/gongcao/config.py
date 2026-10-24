@@ -12,7 +12,8 @@ from .model import Role
 
 PROMPTS = {
     Role.ANALYST: "Analyze the request and give a concrete implementation plan. Read only.",
-    Role.DEVELOPER: "Implement the confirmed plan in the assigned workspace. Run relevant tests.",
+    Role.DEVELOPER: "Implement the confirmed analysis or current-SHA revision findings "
+    "in the assigned workspace. Run relevant tests.",
     Role.REVIEWER: "Independently review requirements, diff, design, security, tests and risks. "
     "Read only. Use conclusion revise for actionable defects, ready only when satisfied.",
     Role.VALIDATOR: "Inspect actual quality and CI evidence for the exact revision. Read only. "

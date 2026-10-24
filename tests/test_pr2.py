@@ -508,6 +508,8 @@ async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, mon
     log = checkout_log(9, "3" * 40)
 
     async def pages(*args):
+        if "/timeline?" in args[0]:
+            return []
         return [
             {
                 "id": 2,
@@ -525,10 +527,52 @@ async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, mon
     monkeypatch.setattr(github, "pages", pages)
     monkeypatch.setattr(github, "read", read)
     monkeypatch.setattr("gongcao.github.command", logs)
-    result = await github.checkout_proof(task, {"id": 1, "run_attempt": 1})
+    result = await github.checkout_proof(
+        task, {"id": 1, "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z"}
+    )
     assert (result is not None) == valid
     assert checkout_sha(log, 10) is None
     assert checkout_sha(log.replace("Run actions/checkout@v4", "Run user echo"), 9) is None
+
+
+@pytest.mark.parametrize("after", [False, True])
+async def test_checkout_proof_cannot_relabel_same_sha_ci_after_retarget(
+    snapshot, sha, monkeypatch, after
+):
+    github = GitHub()
+    task = {
+        "pr_number": 9,
+        "target_sha": sha,
+        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "release"},
+    }
+
+    async def pages(path, *args):
+        if "/timeline?" in path:
+            return [{"event": "base_ref_changed", "created_at": "2026-01-01T00:00:01Z"}]
+        return [
+            {
+                "id": 2,
+                "conclusion": "success",
+                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
+            }
+        ]
+
+    async def read(*args):
+        return {"parents": [{"sha": "1" * 40}, {"sha": sha}]}
+
+    async def logs(*args):
+        return checkout_log(9, "3" * 40)
+
+    monkeypatch.setattr(github, "pages", pages)
+    monkeypatch.setattr(github, "read", read)
+    monkeypatch.setattr("gongcao.github.command", logs)
+    run = {
+        "id": 1,
+        "run_attempt": 2,
+        "created_at": "2026-01-01T00:00:02Z" if after else "2026-01-01T00:00:00Z",
+    }
+    proof = await github.checkout_proof(task, run)
+    assert (proof is not None) == after
 
 
 async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):

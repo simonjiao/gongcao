@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .events import Redactor
@@ -157,7 +158,11 @@ class GitHub:
         # belongs to this PR and has exactly the current base/head merge parents.
         for run in data["workflows"]:
             if run["status"] == "completed" and run["conclusion"] == "success":
-                run["target_proof"] = await self.checkout_proof(task, run)
+                try:
+                    run["target_proof"] = await self.checkout_proof(task, run)
+                except (RuntimeError, OSError, ValueError) as exc:
+                    run["target_proof"] = None
+                    run["proof_error"] = Redactor().text(f"{type(exc).__name__}: {exc}")
         return data  # type: ignore[no-any-return]
 
     async def checkout_proof(
@@ -165,6 +170,20 @@ class GitHub:
     ) -> dict[str, Any] | None:
         repository = task["snapshot"]["repository"]
         attempt = run.get("run_attempt", 1)
+        timeline = await self.pages(
+            f"repos/{repository}/issues/{task['pr_number']}/timeline?per_page=100"
+        )
+        base_changes = [
+            event
+            for event in timeline
+            if event.get("event") in {"base_ref_changed", "automatic_base_change_succeeded"}
+        ]
+        created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+        if any(
+            created <= datetime.fromisoformat(event["created_at"].replace("Z", "+00:00"))
+            for event in base_changes
+        ):
+            return None
         jobs = await self.pages(
             f"repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
             "jobs",
@@ -189,6 +208,12 @@ class GitHub:
                 "base_sha": parents[0],
                 "head_sha": parents[1],
                 "base_ref": task["snapshot"]["base_ref"],
+                "base_ref_basis": "current ref + complete retarget history before run creation",
+                "run_created_at": run["created_at"],
+                "last_base_change": max((e["created_at"] for e in base_changes), default=None),
+                "timeline_sha256": hashlib.sha256(
+                    json.dumps(timeline, sort_keys=True).encode()
+                ).hexdigest(),
                 "checkout_sha": sha,
                 "run_id": run["id"],
                 "attempt": attempt,

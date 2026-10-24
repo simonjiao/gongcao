@@ -28,6 +28,11 @@ CI 通过 GitHub Actions API 获取，按仓库、目标 SHA、head 分支、pul
 选择最新运行；还须从成功 job 的 actions/checkout 步骤证明当前 PR merge ref 的实际 checkout SHA，
 并通过 GitHub Commit API 核实其父提交恰为当前 base/head。缺少关联信息时等待，不能只凭 head 接纳
 其他 PR 或旧 base 的 CI；pending 等待，失败进入修订，skipped 不能满足必需 workflow。
+base 分支名还通过完整 PR timeline 推断：原始 run.created_at 必须严格晚于最后一次
+base_ref_changed/automatic_base_change_succeeded；不使用 rerun 的新启动时间来替代事件上下文。
+这是结合当前 ref 和权威事件历史的推断；读取失败或时间相等均不通过，需要更新版本的运行。
+依据：[GitHub 事件类型](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#base_ref_changed)
+和 [timeline 接口](https://docs.github.com/en/rest/issues/timeline#list-timeline-events-for-an-issue)。
 不把 SDK 自述当作 CI 或测试通过。正式审批需求由 GitHub reviewDecision/mergeStateStatus 核验，
 同账号模型评审仅为 COMMENT。目标请求/head/base 改变使本地旧审查和检查失效，配置摘要变化也重建门禁。
 

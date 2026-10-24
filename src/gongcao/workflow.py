@@ -199,6 +199,7 @@ class Workflow:
             if self.cached_run(current, Role.VALIDATOR) is None:
                 raise UncertainWrite("Validation evidence became invalid during readiness update")
             final = await self.github.gates(current)
+            current = await self.confirm(task)
             state, reason = ci_gate(current, final, self.config.ci_workflows)
             if state == State.COMPLETED and (
                 final["reviewDecision"] not in {"", "APPROVED"}
