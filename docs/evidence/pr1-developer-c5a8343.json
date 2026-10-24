@@ -1,0 +1,338 @@
+{
+  "schema_version": 2,
+  "implementation_sha": "c5a83435809265ccb91e37a4e668ae108c4e9380",
+  "observed_at_utc": "2026-10-24T14:13:46.632960+00:00",
+  "scope": "PR1 local real SDK analyst/developer acceptance; read-only GitHub metadata; no GitHub writes, reviews, merges or PR2/PR3 workflow claims",
+  "versions": {
+    "gongcao": "0.1.0",
+    "openai-codex": "0.163.0",
+    "openai-codex-cli-bin": "0.163.0",
+    "uv": "0.11.33",
+    "beartype": "0.23.1",
+    "pytest-beartype": "0.3.0"
+  },
+  "github_read": {
+    "url": "https://github.com/simonjiao/gongcao/issues/1",
+    "title": "[MVP] 建立 Gongcao 本地 Agent 调度闭环（状态机、独立上下文、运行监控）",
+    "state": "open",
+    "updated_at": "2026-10-24T14:02:31Z"
+  },
+  "github_snapshot_sha256": "f24fef670af75aa12fb48100abeec9360b98f3e2dea11633a3036672e8fb82cf",
+  "fixture": {
+    "kind": "temporary trusted local Git repository; origin URL used only for real read-only Issue lookup; fixture commit was never pushed",
+    "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+    "commit": "tree a4d911282f7fecee75a10dc44f90f983ce7cd793\nauthor Gongcao Acceptance <acceptance@example.invalid> 1792851037 +0800\ncommitter Gongcao Acceptance <acceptance@example.invalid> 1792851037 +0800\n\nTrusted PR1 local developer acceptance fixture\n",
+    "tree": "a4d911282f7fecee75a10dc44f90f983ce7cd793",
+    "baseline_files": {
+      ".gitignore": ".venv/\n__pycache__/\n*.pyc\n",
+      ".python-version": "3.12\n",
+      "AGENTS.md": "Trusted PR1 acceptance fixture. Work only on calculator.py. Do not change tests or project configuration. Use uv for checks. Never access credentials or perform remote mutations.\n",
+      "README.md": "PR1 trusted local acceptance fixture. Fix add so it returns the sum for positive, negative and zero inputs. The tests must pass without changes. This fixture is local only; its origin URL is used solely for read-only Issue metadata.\n",
+      "calculator.py": "def add(left: int, right: int) -> int:\n    return left - right\n",
+      "pyproject.toml": "[project]\nname = \"gongcao-pr1-fixture\"\nversion = \"0.0.1\"\nrequires-python = \">=3.12\"\n",
+      "tests/test_calculator.py": "import unittest\nfrom calculator import add\n\n\nclass AdditionTests(unittest.TestCase):\n    def test_positive(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_negative(self):\n        self.assertEqual(add(-2, -3), -5)\n\n    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n",
+      "uv.lock": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"gongcao-pr1-fixture\"\nversion = \"0.0.1\"\nsource = { virtual = \".\" }\n"
+    },
+    "baseline_tests": {
+      "command": "/usr/bin/python3.12 -B -m unittest discover -s tests -v",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "test_negative (test_calculator.AdditionTests.test_negative) ... FAIL\ntest_positive (test_calculator.AdditionTests.test_positive) ... FAIL\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n======================================================================\nFAIL: test_negative (test_calculator.AdditionTests.test_negative)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/gongcao-pr1-developer-c5a8343/fixture/tests/test_calculator.py\", line 10, in test_negative\n    self.assertEqual(add(-2, -3), -5)\nAssertionError: 1 != -5\n\n======================================================================\nFAIL: test_positive (test_calculator.AdditionTests.test_positive)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/gongcao-pr1-developer-c5a8343/fixture/tests/test_calculator.py\", line 7, in test_positive\n    self.assertEqual(add(2, 3), 5)\nAssertionError: -1 != 5\n\n----------------------------------------------------------------------\nRan 3 tests in 0.001s\n\nFAILED (failures=2)\n"
+    }
+  },
+  "configuration": {
+    "model": "gpt-6.1-sol",
+    "roles": {
+      "analyst": "This is the explicitly requested PR1 real Developer acceptance, using a tiny trusted LOCAL fixture; do not implement the broader MVP in the GitHub issue. Read README.md, calculator.py and tests/test_calculator.py. Plan ONLY to fix add to return the sum, without changing tests or config. Read only; do not run tests or access credentials. Return ready with this narrow plan and exact supplied target_sha.",
+      "developer": "This is the explicitly requested PR1 real Developer acceptance using a tiny trusted LOCAL fixture, not the broader MVP. Follow confirmed_analysis: fix ONLY calculator.py so add returns the sum. Do not modify tests, AGENTS.md, README.md or configuration. Run this exact check from /workspace: uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v. Verify that tests pass; record the command and result in basis. No commits or remote writes, and do not read authentication files (including the dedicated Codex model authentication). Return the original context target_sha in the structured result; the controller retains local uncommitted work for PR1. The original host fixture must remain untouched."
+    },
+    "timeout_seconds": 180
+  },
+  "task": {
+    "id": 1,
+    "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+    "stage": "pending_development",
+    "state": "waiting_dependency",
+    "reason": "Local changes retained; PR/review gates require PR2"
+  },
+  "runs": [
+    {
+      "run": {
+        "id": "1fcd8cc5f5ce4fab97e85e1ce523847a",
+        "role": "analyst",
+        "state": "completed",
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "thread_id": "01a16e41-f1a7-7ad3-b87a-f60b2c63be99",
+        "context_hash": "8f005626ebb2757e045b242460615ad0d1a32a7c45ed0ff395f63207ebb3944a",
+        "started": 1792851175.9403837,
+        "ended": 1792851193.0201447,
+        "evidence_valid": 1
+      },
+      "duration_seconds": 17.08,
+      "isolation_probe": {
+        "host_credentials": "blocked",
+        "host_repository": "blocked",
+        "workspace_writable": false,
+        "external_writes": "blocked",
+        "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+      },
+      "tool_executions": [
+        {
+          "command": "/bin/bash -lc 'cat README.md calculator.py tests/test_calculator.py'",
+          "cwd": "/workspace",
+          "status": "completed",
+          "exitCode": 0,
+          "durationMs": 0,
+          "aggregatedOutput": "PR1 trusted local acceptance fixture. Fix add so it returns the sum for positive, negative and zero inputs. The tests must pass without changes. This fixture is local only; its origin URL is used solely for read-only Issue metadata.\ndef add(left: int, right: int) -> int:\n    return left - right\nimport unittest\nfrom calculator import add\n\n\nclass AdditionTests(unittest.TestCase):\n    def test_positive(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_negative(self):\n        self.assertEqual(add(-2, -3), -5)\n\n    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n"
+        }
+      ],
+      "file_changes": [],
+      "usage": {
+        "last": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 16768,
+          "inputTokens": 17106,
+          "outputTokens": 140,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 17246
+        },
+        "modelContextWindow": 475000,
+        "total": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 16768,
+          "inputTokens": 33958,
+          "outputTokens": 182,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 34140
+        }
+      },
+      "result": {
+        "conclusion": "ready",
+        "summary": "Plan only: change calculator.py add to return left + right.",
+        "basis": [
+          "Read README.md, calculator.py, and tests/test_calculator.py.",
+          "add currently subtracts; existing tests expect sums for positive, negative, and zero inputs.",
+          "No files changed, tests run, credentials accessed, or remote mutations performed."
+        ],
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "next_steps": [
+          "Developer changes only calculator.py to return left + right, preserving tests and configuration.",
+          "Validate using uv when authorized for the development stage."
+        ]
+      },
+      "event_counts": {
+        "started": 1,
+        "isolation_verified": 1,
+        "thread": 1,
+        "sdk_event": 142,
+        "result": 1,
+        "ended": 1
+      },
+      "journal_sha256": "6907fc41362c9cf31e4c319c3e62d73ede00dc1bd2e8734134484794930dd110",
+      "context_hash_verified": true,
+      "worktree_head": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+      "worktree_status": ""
+    },
+    {
+      "run": {
+        "id": "06b8cc63a0c849cd9d2e85a57c4dc152",
+        "role": "developer",
+        "state": "completed",
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "thread_id": "01a16e42-37ac-7472-8ccb-1be68b77b411",
+        "context_hash": "12ee86b4e9ec4e915c166ab30f687d73e3e97067f390f33132361f61a4e8b1dc",
+        "started": 1792851194.113636,
+        "ended": 1792851226.6329603,
+        "evidence_valid": 1
+      },
+      "duration_seconds": 32.519,
+      "isolation_probe": {
+        "host_credentials": "blocked",
+        "host_repository": "blocked",
+        "workspace_writable": true,
+        "external_writes": "blocked",
+        "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+      },
+      "tool_executions": [
+        {
+          "command": "/bin/bash -lc 'pwd && git status --short && cat calculator.py'",
+          "cwd": "/workspace",
+          "status": "failed",
+          "exitCode": 128,
+          "durationMs": 0,
+          "aggregatedOutput": "/workspace\nfatal: invalid gitfile format: /workspace/.git\n"
+        },
+        {
+          "command": "/bin/bash -lc 'cat calculator.py'",
+          "cwd": "/workspace",
+          "status": "completed",
+          "exitCode": 0,
+          "durationMs": 0,
+          "aggregatedOutput": "def add(left: int, right: int) -> int:\n    return left - right\n"
+        },
+        {
+          "command": "/bin/bash -lc 'UV_CACHE_DIR=/tmp/pr1-uv-cache uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v'",
+          "cwd": "/workspace",
+          "status": "completed",
+          "exitCode": 0,
+          "durationMs": 24,
+          "aggregatedOutput": "Using CPython 3.12.3 interpreter at: /usr/bin/python3.12\nCreating virtual environment at: .venv\ntest_negative (test_calculator.AdditionTests.test_negative) ... ok\ntest_positive (test_calculator.AdditionTests.test_positive) ... ok\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n"
+        }
+      ],
+      "file_changes": [
+        {
+          "changes": [
+            {
+              "diff": "@@ -1,2 +1,2 @@\n def add(left: int, right: int) -> int:\n-    return left - right\n+    return left + right\n",
+              "kind": {
+                "move_path": null,
+                "type": "update"
+              },
+              "path": "/workspace/calculator.py"
+            }
+          ],
+          "id": "exec-5ab1fa17-60da-470b-9f64-9d2544f0ac49",
+          "status": "completed",
+          "type": "fileChange"
+        }
+      ],
+      "usage": {
+        "last": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 17536,
+          "inputTokens": 17826,
+          "outputTokens": 177,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 18003
+        },
+        "modelContextWindow": 475000,
+        "total": {
+          "cacheWriteInputTokens": 0,
+          "cachedInputTokens": 51968,
+          "inputTokens": 87342,
+          "outputTokens": 418,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 87760
+        }
+      },
+      "result": {
+        "conclusion": "ready",
+        "summary": "Changed only calculator.py so add returns left + right. All 3 tests passed.",
+        "basis": [
+          "Updated calculator.py from subtraction to addition; tests and configuration were unchanged.",
+          "Requested command: uv run --offline --locked --python /usr/bin/python3.12 python -m unittest discover -s tests -v. Initial execution failed because the default uv cache was read-only.",
+          "Reran the same check with UV_CACHE_DIR=/tmp/pr1-uv-cache: exit 0; all 3 tests passed.",
+          "No credentials accessed, commits created, or remote mutations performed."
+        ],
+        "target_sha": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+        "next_steps": [
+          "Controller can review the local uncommitted calculator.py change."
+        ]
+      },
+      "event_counts": {
+        "started": 1,
+        "isolation_verified": 1,
+        "thread": 1,
+        "sdk_event": 197,
+        "result": 1,
+        "ended": 1
+      },
+      "journal_sha256": "e62fd2ab51d447215e288a46160865e4b44e591576b47d5440ba148de4d8be39",
+      "context_hash_verified": true,
+      "worktree_head": "2987f9ccfb65460053f6234f7ed56d0c017e90f4",
+      "worktree_status": " M calculator.py\n"
+    }
+  ],
+  "handoff": {
+    "separate_threads": true,
+    "separate_worktrees": true,
+    "confirmed_analysis_only": true
+  },
+  "source_integrity": {
+    "before": {
+      ".gitignore": "472f568478bff9056ec56b5c5e8a7ca3d280c651d527321e1eb80892801164be",
+      ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+      "AGENTS.md": "9846d5a02c1c5a04df23e7d5e0b7f6e329328da5a25ba6bd2d5ff177d0c4cf0f",
+      "README.md": "f6ab7205eb411c986b93b2ffaabbce928649373a6240310a096c382a6c69c646",
+      "calculator.py": "8f85450200db13108dc37d54ada5376d715d7c7aff3bceb5ffa1f6a75b0c8a03",
+      "pyproject.toml": "8c9500b2a04a988a77669b5a31d54745c0dcd5db12618804a73e81fca0927393",
+      "tests/test_calculator.py": "46121ecdfa355c03014be089cd1f1abe029846482ff443bde4ae83e18f4c9304",
+      "uv.lock": "a447b0baeecc7fbf3996486f38de22e818494c335a31c928fb8c8da6c871ded1"
+    },
+    "after": {
+      ".gitignore": "472f568478bff9056ec56b5c5e8a7ca3d280c651d527321e1eb80892801164be",
+      ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+      "AGENTS.md": "9846d5a02c1c5a04df23e7d5e0b7f6e329328da5a25ba6bd2d5ff177d0c4cf0f",
+      "README.md": "f6ab7205eb411c986b93b2ffaabbce928649373a6240310a096c382a6c69c646",
+      "calculator.py": "8f85450200db13108dc37d54ada5376d715d7c7aff3bceb5ffa1f6a75b0c8a03",
+      "pyproject.toml": "8c9500b2a04a988a77669b5a31d54745c0dcd5db12618804a73e81fca0927393",
+      "tests/test_calculator.py": "46121ecdfa355c03014be089cd1f1abe029846482ff443bde4ae83e18f4c9304",
+      "uv.lock": "a447b0baeecc7fbf3996486f38de22e818494c335a31c928fb8c8da6c871ded1"
+    },
+    "unchanged": true,
+    "git_status": "",
+    "source_venv_exists": false
+  },
+  "developer_change": {
+    "patch": "diff --git a/calculator.py b/calculator.py\nindex c481219..5b38b28 100644\n--- a/calculator.py\n+++ b/calculator.py\n@@ -1,2 +1,2 @@\n def add(left: int, right: int) -> int:\n-    return left - right\n+    return left + right\n",
+    "after": "def add(left: int, right: int) -> int:\n    return left + right\n",
+    "other_tracked_files_unchanged": true,
+    "workspace_venv_created": true,
+    "controller_independent_check": {
+      "command": "/usr/bin/python3.12 -B -m unittest discover -s tests -v",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "test_negative (test_calculator.AdditionTests.test_negative) ... ok\ntest_positive (test_calculator.AdditionTests.test_positive) ... ok\ntest_zero (test_calculator.AdditionTests.test_zero) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n"
+    }
+  },
+  "logs_follow": {
+    "mode": "started while developer was running; replayed existing events then followed through ended",
+    "records": 202,
+    "ended_observed": true,
+    "sha256": "e62fd2ab51d447215e288a46160865e4b44e591576b47d5440ba148de4d8be39"
+  },
+  "existing_host_paths_verified_unreadable": {
+    "/home/simon/.config/gh/hosts.yml": true,
+    "/tmp/gongcao-pr1-developer-c5a8343/fixture/.git/config": true,
+    "/home/simon/.codex/auth.json": true
+  },
+  "automated_checks": {
+    "implementation_sha": "c5a83435809265ccb91e37a4e668ae108c4e9380",
+    "pytest": "61 passed in 18.73s",
+    "ruff": "passed",
+    "format": "passed",
+    "mypy": "passed",
+    "uv_lock_check": "passed"
+  },
+  "ci": {
+    "run_id": 40101514511,
+    "url": "https://github.com/simonjiao/gongcao/actions/runs/40101514511",
+    "implementation_sha": "c5a83435809265ccb91e37a4e668ae108c4e9380",
+    "jobs": [
+      {
+        "id": 120894471968,
+        "name": "test (3.12)",
+        "conclusion": "success"
+      },
+      {
+        "id": 120894472178,
+        "name": "test (3.13)",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "review": {
+    "base_sha": "0a1e72ba6be95c6e861c1a4b5961717f104cb3a7",
+    "reviewed_sha": "c5a83435809265ccb91e37a4e668ae108c4e9380",
+    "standards": "1 pre-claim snapshot race found, fixed and re-reviewed; no remaining findings",
+    "spec": "no remaining findings; pre-claim change re-reviewed without regressions"
+  },
+  "limitations": [
+    "Linux and Bubblewrap are required. Only trusted task code is supported: dedicated model authentication remains readable inside the runtime and network access is allowed.",
+    "Source working files stayed identical; the controller created local Git branches and Worktree metadata as expected.",
+    "The agent git-status attempt failed with exit 128 because .git is intentionally masked. Controller-side Git checks independently confirmed target HEAD and exact patch.",
+    "The recorded successful uv check sets UV_CACHE_DIR=/tmp/pr1-uv-cache. No claim is made that arbitrary target-repository checks work unchanged.",
+    "Fixture target SHA is distinct from Gongcao implementation SHA. Passing developer output stops at waiting_dependency and is not a PR/review/CI merge gate."
+  ],
+  "local_artifacts": "/tmp/gongcao-pr1-developer-c5a8343"
+}
