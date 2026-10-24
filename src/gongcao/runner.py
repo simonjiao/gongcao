@@ -12,7 +12,7 @@ from .config import Config
 from .events import Journal, Redactor
 from .github import GitHub, Target
 from .model import AgentResult, Role, Stage, State, after_run
-from .processes import stop
+from .processes import CleanupError, stop
 from .sandbox import IsolationError, Sandbox
 from .store import Store
 from .workspace import context, worktree
@@ -38,6 +38,13 @@ class Runner:
         consumers: list[asyncio.Task[Any]] = []
         started = time.monotonic()
         stage = Stage(task["stage"])
+        outcome: tuple[State, Stage, State, str, str | None] = (
+            State.FAILED,
+            stage,
+            State.FAILED,
+            "Execution interrupted",
+            None,
+        )
         try:
             run_dir.mkdir(parents=True, mode=0o700)
             journal = Journal(self.store, run_id, self.config.max_log_bytes, Redactor())
@@ -45,12 +52,12 @@ class Runner:
                 "started", {"task_id": task_id, "role": role, "target_sha": task["target_sha"]}
             )
             if task["snapshot"]["state"] != "open":
-                self.store.finish(
-                    run_id,
+                outcome = (
                     State.HUMAN,
                     stage,
                     State.HUMAN,
                     "GitHub object is closed; manual handling required",
+                    None,
                 )
                 return run_id
             repo = Path(task["repo_path"])
@@ -124,8 +131,7 @@ class Runner:
                     State.HUMAN,
                     "GitHub object closed during execution",
                 )
-            self.store.finish(
-                run_id,
+            outcome = (
                 State.COMPLETED,
                 next_stage,
                 state,
@@ -134,10 +140,12 @@ class Runner:
             )
         except asyncio.CancelledError:
             self.store.cancel(task_id)
-            self.store.finish(run_id, State.CANCELLED, stage, State.CANCELLED, "Cancelled by user")
+            outcome = (State.CANCELLED, stage, State.CANCELLED, "Cancelled by user", None)
         except Exception as exc:
             state = (
-                State.WAITING_ENVIRONMENT
+                State.RECONCILE
+                if isinstance(exc, CleanupError)
+                else State.WAITING_ENVIRONMENT
                 if isinstance(exc, (IsolationError, OSError)) and not isinstance(exc, TimeoutError)
                 else State.FAILED
             )
@@ -148,15 +156,19 @@ class Runner:
                     journal.emit("error", message)
                 except (OSError, sqlite3.Error):
                     pass  # The SQLite execution record must survive a failed log sink.
-            self.store.finish(run_id, state, stage, state, message)
+            outcome = (state, stage, state, message, None)
         finally:
-            for consumer in consumers:
-                if not consumer.done():
-                    consumer.cancel()
-            if consumers:
-                await asyncio.gather(*consumers, return_exceptions=True)
             if process is not None:
-                await stop(process)
+                try:
+                    await stop(process, consumers)
+                except asyncio.CancelledError:
+                    self.store.cancel(task_id)
+                    outcome = (State.CANCELLED, stage, State.CANCELLED, "Cancelled by user", None)
+                except CleanupError as exc:
+                    message = str(exc)
+                    outcome = (State.RECONCILE, stage, State.RECONCILE, message, None)
+            # Accept the outcome only after all subprocess resources have been settled.
+            self.store.finish(run_id, *outcome)
             if journal is not None:
                 try:
                     journal.emit(

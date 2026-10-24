@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from gongcao.github import command
-from gongcao.processes import stop
+from gongcao.processes import CleanupError, stop
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Requires POSIX process groups")
 
@@ -15,6 +15,8 @@ ORPHAN = """
 import os, pathlib, signal, sys, time
 ready = pathlib.Path(sys.argv[1])
 if os.fork() == 0:
+    if sys.argv[2] == 'escape':
+        os.setsid()
     if sys.argv[2] == 'ignore':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     ready.write_text(str(os.getpid()))
@@ -66,6 +68,38 @@ async def test_stop_releases_pipes_even_after_the_leader_has_exited(tmp_path, ha
         assert process.stdout.at_eof()
         assert process.stderr.at_eof()
         assert process.stdin.is_closing()
+        await process.stdin.wait_closed()
+    finally:
+        await cleanup(process, ready)
+
+
+@pytest.mark.parametrize("mode", ["escape", "repeated_cancel"])
+async def test_stop_has_bounded_cleanup_and_does_not_abandon_pipes(tmp_path, mode):
+    ready = tmp_path / "child.pid"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        ORPHAN,
+        str(ready),
+        "escape" if mode == "escape" else "ignore",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        await exited(process)
+        task = asyncio.create_task(stop(process))
+        if mode == "repeated_cancel":
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        expected = CleanupError if mode == "escape" else asyncio.CancelledError
+        with pytest.raises(expected):
+            await asyncio.wait_for(task, timeout=6)
+        assert process.stdout.at_eof()
+        assert process.stderr.at_eof()
         await process.stdin.wait_closed()
     finally:
         await cleanup(process, ready)

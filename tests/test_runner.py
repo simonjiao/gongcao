@@ -8,6 +8,7 @@ from gongcao.config import Config
 from gongcao.events import Journal
 from gongcao.github import GitHub
 from gongcao.model import Stage, State
+from gongcao.processes import CleanupError
 from gongcao.runner import Runner
 from gongcao.sandbox import IsolationError, Sandbox
 
@@ -279,3 +280,20 @@ async def test_worker_errors_release_all_pipes_before_returning(
             if process.returncode is None:
                 process.kill()
             await process.communicate()
+
+
+async def test_uncertain_cleanup_cannot_advance_or_leave_a_completed_run(
+    store, task_id, snapshot, auth_file, monkeypatch
+):
+    from gongcao.processes import stop
+
+    async def uncertain(process, readers):
+        await stop(process, readers)
+        raise CleanupError("Local pipes closed; descendant exit could not be confirmed")
+
+    install_worker(monkeypatch, SUCCESS)
+    monkeypatch.setattr("gongcao.runner.stop", uncertain)
+    await Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.ANALYSIS
+    assert store.task(task_id)["state"] == State.RECONCILE
+    assert store.runs(task_id)[0]["state"] == State.RECONCILE
