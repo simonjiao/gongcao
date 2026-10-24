@@ -229,6 +229,9 @@ class Store:
                 run_state = task_state = State.CANCELLED
                 stage = Stage(task["stage"])
                 reason = "Cancelled by user"
+            elif task["snapshot"].get("merged"):
+                stage, task_state = Stage.MERGED, State.COMPLETED
+                reason = "GitHub confirms the PR was merged"
             elif task["snapshot"].get("state") != "open" or task["state"] == State.HUMAN:
                 stage, task_state = Stage(task["stage"]), State.HUMAN
                 reason = task["reason"] or "GitHub object is closed; manual handling required"
@@ -269,6 +272,8 @@ class Store:
 
     def guard(self, expected: dict[str, Any]) -> dict[str, Any]:
         task = self.task(expected["id"])
+        if task["stage"] == Stage.MERGED:
+            raise ValueError("Merged tasks are terminal")
         if task["cancel_requested"] or task["state"] in {
             State.CANCELLED,
             State.RECONCILE,

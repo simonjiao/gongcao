@@ -42,6 +42,8 @@ class Config:
                     "real_checks": self.real_checks,
                     "ci_workflows": self.ci_workflows,
                     "require_real_checks": self.require_real_checks,
+                    "roles": {role.value: prompt for role, prompt in self.prompts.items()},
+                    "model": self.model,
                 },
                 sort_keys=True,
             ).encode()

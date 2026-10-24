@@ -1,6 +1,7 @@
 """Business stages are separate from the state of an execution."""
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +16,16 @@ VERSION_FIELDS = (
     "pull_title",
     "pull_body",
 )
+
+
+def same_version(expected: dict[str, Any], current: dict[str, Any]) -> bool:
+    return (
+        expected["target_sha"] == current["target_sha"]
+        and expected["stage"] == current["stage"]
+        and all(
+            expected["snapshot"].get(key) == current["snapshot"].get(key) for key in VERSION_FIELDS
+        )
+    )
 
 
 class Stage(StrEnum):

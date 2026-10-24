@@ -36,6 +36,8 @@ class Controlled:
             raise UncertainWrite("Remote target changed before a controlled write")
         current = self.store.task(expected["id"])
         self.store.guard(current)
+        if any(run["state"] == "running" for run in self.store.runs(current["id"])):
+            raise ValueError("An active agent cannot authorize a remote mutation")
         allowed = {
             "push": {Stage.DEVELOPMENT, Stage.REVISION},
             "pull": {Stage.DEVELOPMENT, Stage.REVISION},
@@ -197,7 +199,10 @@ class Controlled:
         await self.perform(task, "push", branch, {"sha": head, "branch": branch}, pushed, push)
         if task["pr_number"]:
             updated = await self.github.task_snapshot(task)
-            if updated["head_sha"] != head:
+            if updated["head_sha"] != head or any(
+                updated.get(key) != snapshot.get(key)
+                for key in ("title", "body", "base_sha", "base_ref", "base_repository")
+            ):
                 raise UncertainWrite("Published PR head moved before confirmation")
             return updated, task["pr_number"]
         repository_name = snapshot["repository"]
@@ -240,14 +245,19 @@ class Controlled:
         result = await self.perform(task, "pull", branch, payload, existing, create)
         temporary = task | {"pr_number": result["number"]}
         updated = await self.github.task_snapshot(temporary)
-        if updated["head_sha"] != head:
+        if (
+            updated["head_sha"] != head
+            or updated["base_sha"] != task["target_sha"]
+            or any(updated.get(key) != snapshot.get(key) for key in ("title", "body"))
+        ):
             raise UncertainWrite("PR head moved before confirmation")
         return updated, result["number"]
 
-    async def review(self, task: dict[str, Any], result: dict[str, Any]) -> None:
+    async def review(self, task: dict[str, Any], result: dict[str, Any], run_id: str) -> None:
         number = task["pr_number"]
         endpoint = f"repos/{task['snapshot']['repository']}/pulls/{number}/reviews"
-        tag = f"<!-- gongcao:{self.identity(task, 'review', str(number))} -->"
+        object_id = f"{number}:{run_id}"
+        tag = f"<!-- gongcao:{self.identity(task, 'review', object_id)} -->"
         payload = {
             "event": "COMMENT",
             "commit_id": task["target_sha"],
@@ -270,11 +280,15 @@ class Controlled:
         async def create() -> dict[str, Any]:
             return await self.github.mutate(endpoint, payload)
 
-        await self.perform(task, "review", str(number), payload, existing, create)
+        await self.perform(task, "review", object_id, payload, existing, create)
 
     async def ready(self, task: dict[str, Any]) -> None:
         async def observed() -> dict[str, Any] | None:
             snapshot = await self.github.task_snapshot(task)
+            if snapshot["head_sha"] != task["target_sha"] or any(
+                snapshot.get(key) != task["snapshot"].get(key) for key in VERSION_FIELDS
+            ):
+                raise UncertainWrite("PR changed while confirming readiness")
             return {"ready": True} if not snapshot["draft"] else None
 
         async def write() -> dict[str, Any]:

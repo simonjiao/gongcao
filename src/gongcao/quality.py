@@ -130,4 +130,18 @@ def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -
             return State.WAITING_DEPENDENCY, f"CI {name} is {latest['status']}"
         if latest["conclusion"] != "success":
             return State.FAILED, f"CI {name} concluded {latest['conclusion']}"
+        proof = latest.get("target_proof") or {}
+        if any(
+            proof.get(key) != value
+            for key, value in {
+                "repository": task["snapshot"]["repository"],
+                "pr_number": task["pr_number"],
+                "head_sha": task["target_sha"],
+                "base_sha": task["snapshot"]["base_sha"],
+                "base_ref": task["snapshot"]["base_ref"],
+                "run_id": latest["id"],
+                "attempt": latest.get("run_attempt", 1),
+            }.items()
+        ):
+            return State.WAITING_DEPENDENCY, f"CI {name} has no verified current PR/base checkout"
     return State.COMPLETED, "Required CI workflows passed at the target SHA"

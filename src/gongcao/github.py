@@ -1,6 +1,7 @@
 """GitHub facts and low-level transport. Only the controller authorizes mutations."""
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -47,7 +48,10 @@ async def command(*args: str, cwd: str | None = None, input_data: str | None = N
         await stop(process)
         raise
     if process.returncode:
-        raise RuntimeError(Redactor().text(stderr.decode(errors="replace")[-2000:]))
+        message = Redactor().text(stderr.decode(errors="replace")[-2000:])
+        if args[0] == "gh" and ("HTTP 403" in message or "HTTP 401" in message):
+            raise PermissionError(message)
+        raise RuntimeError(message)
     return stdout.decode()
 
 
@@ -56,7 +60,13 @@ class GitHub:
         return json.loads(await command("gh", "api", path))
 
     async def pages(self, path: str, field: str | None = None) -> list[dict[str, Any]]:
-        pages = json.loads(await command("gh", "api", "--paginate", "--slurp", path))
+        raw = (await command("gh", "api", "--paginate", path)).lstrip()
+        pages = []
+        decoder = json.JSONDecoder()
+        while raw:
+            page, end = decoder.raw_decode(raw)
+            pages.append(page)
+            raw = raw[end:].lstrip()
         return [item for page in pages for item in (page[field] if field else page)]
 
     async def mutate(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -143,4 +153,70 @@ class GitHub:
             f"repos/{repository}/actions/runs?head_sha={task['target_sha']}&event=pull_request&per_page=100",
             "workflow_runs",
         )
+        # Some workflow-run payloads omit pull_requests. Prove the actual checkout
+        # belongs to this PR and has exactly the current base/head merge parents.
+        for run in data["workflows"]:
+            if run["status"] == "completed" and run["conclusion"] == "success":
+                run["target_proof"] = await self.checkout_proof(task, run)
         return data  # type: ignore[no-any-return]
+
+    async def checkout_proof(
+        self, task: dict[str, Any], run: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        repository = task["snapshot"]["repository"]
+        attempt = run.get("run_attempt", 1)
+        jobs = await self.pages(
+            f"repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
+            "jobs",
+        )
+        for job in jobs:
+            if job["conclusion"] != "success" or not any(
+                "actions/checkout@" in step["name"] and step["conclusion"] == "success"
+                for step in job["steps"]
+            ):
+                continue
+            log = await command("gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs")
+            sha = checkout_sha(log, task["pr_number"])
+            if sha is None:
+                continue
+            commit = await self.read(f"repos/{repository}/git/commits/{sha}")
+            parents = [parent["sha"] for parent in commit["parents"]]
+            if parents != [task["snapshot"]["base_sha"], task["target_sha"]]:
+                continue
+            return {
+                "pr_number": task["pr_number"],
+                "repository": repository,
+                "base_sha": parents[0],
+                "head_sha": parents[1],
+                "base_ref": task["snapshot"]["base_ref"],
+                "checkout_sha": sha,
+                "run_id": run["id"],
+                "attempt": attempt,
+                "job_id": job["id"],
+                "source": "actions/checkout job log + GitHub commit parents",
+                "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
+            }
+        return None
+
+
+def checkout_sha(log: str, number: int) -> str | None:
+    """Only accept checkout's own PR merge ref and following full git-log SHA."""
+    block = False
+    ref = False
+    expect_sha = False
+    for line in log.splitlines():
+        if "##[group]Run actions/checkout@" in line:
+            block, ref, expect_sha = True, False, False
+        elif block and "##[group]Run " in line:
+            block = False
+        if not block:
+            continue
+        if re.search(rf"\[command\].*git checkout .* refs/remotes/pull/{number}/merge$", line):
+            ref = True
+        if ref and re.search(r"\[command\].*git log -1 --format=%H$", line):
+            expect_sha = True
+            continue
+        if expect_sha:
+            match = re.fullmatch(r"\S+Z ([0-9a-f]{40})", line)
+            return match[1] if match else None
+    return None

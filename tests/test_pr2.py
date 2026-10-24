@@ -7,7 +7,7 @@ import pytest
 from test_runner import install_worker
 
 from gongcao.config import Config
-from gongcao.github import GitHub, command
+from gongcao.github import GitHub, checkout_sha, command
 from gongcao.model import Role, Stage, State
 from gongcao.quality import Quality, ci_gate
 from gongcao.remote import Controlled, UncertainWrite
@@ -39,8 +39,11 @@ class FixtureGitHub(GitHub):
         self.ci = "success"
         self.decision = ""
         self.writes = []
+        self.head_override = None
 
     def head(self):
+        if self.head_override:
+            return self.head_override
         if self.pull:
             return subprocess.check_output(
                 [
@@ -115,6 +118,15 @@ class FixtureGitHub(GitHub):
                     "head_branch": self.pull["head_ref"],
                     "status": "completed" if self.ci else "in_progress",
                     "conclusion": self.ci,
+                    "target_proof": {
+                        "pr_number": 9,
+                        "repository": "example/demo",
+                        "head_sha": self.head(),
+                        "base_sha": self.pull["base_sha"],
+                        "base_ref": self.pull["base_ref"],
+                        "run_id": 1,
+                        "attempt": 1,
+                    },
                 }
             ],
         }
@@ -355,7 +367,11 @@ def test_future_schema_is_rejected_without_rewriting(tmp_path):
 
 
 def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot):
-    task = {"target_sha": sha, "snapshot": snapshot | {"head_ref": "work"}}
+    task = {
+        "target_sha": sha,
+        "pr_number": 9,
+        "snapshot": snapshot | {"head_ref": "work", "base_sha": "1" * 40, "base_ref": "main"},
+    }
     facts = {
         "headRefOid": sha,
         "workflows": [
@@ -372,9 +388,159 @@ def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot)
     }
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
     facts["workflows"][0]["head_sha"] = sha
+    facts["workflows"][0]["target_proof"] = {
+        "pr_number": 9,
+        "repository": snapshot["repository"],
+        "head_sha": sha,
+        "base_sha": "1" * 40,
+        "base_ref": "main",
+        "run_id": 1,
+        "attempt": 1,
+    }
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.COMPLETED
     facts["workflows"][0]["conclusion"] = "skipped"
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.FAILED
+
+
+@pytest.mark.parametrize(
+    "field,value", [("pr_number", 10), ("base_sha", "2" * 40), ("base_ref", "release")]
+)
+def test_ci_from_another_pr_or_old_base_never_satisfies_gate(snapshot, sha, field, value):
+    task = {
+        "target_sha": sha,
+        "pr_number": 9,
+        "snapshot": snapshot | {"head_ref": "work", "base_ref": "main", "base_sha": "1" * 40},
+    }
+    proof = {
+        "repository": snapshot["repository"],
+        "pr_number": 9,
+        "head_sha": sha,
+        "base_ref": "main",
+        "base_sha": "1" * 40,
+        "run_id": 1,
+        "attempt": 1,
+    }
+    proof[field] = value
+    facts = {
+        "headRefOid": sha,
+        "workflows": [
+            {
+                "id": 1,
+                "head_sha": sha,
+                "head_branch": "work",
+                "event": "pull_request",
+                "path": ".github/workflows/ci.yml",
+                "status": "completed",
+                "conclusion": "success",
+                "target_proof": proof,
+            }
+        ],
+    }
+    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
+
+
+@pytest.mark.parametrize(
+    "change", ["head_after_ready", "base_after_ready", "head_after_review", "merged"]
+)
+async def test_refresh_never_relabels_old_evidence_or_overwrites_merged(
+    store, task_id, fixture_github, policy, change, monkeypatch
+):
+    workflow = Workflow(store, policy, fixture_github)
+    operation = "review" if change == "head_after_review" else "ready"
+    original = getattr(workflow.remote, operation)
+
+    async def changed(*args):
+        await original(*args)
+        if change == "merged":
+            fixture_github.pull.update(merged=True, state="closed")
+        elif change == "base_after_ready":
+            fixture_github.pull["base_sha"] = "b" * 40
+        else:
+            fixture_github.head_override = "f" * 40
+
+    monkeypatch.setattr(workflow.remote, operation, changed)
+    await workflow.run(task_id)
+    task = store.task(task_id)
+    assert task["stage"] == (Stage.MERGED if change == "merged" else Stage.ANALYSIS), task["reason"]
+    assert task["state"] == (State.COMPLETED if change == "merged" else State.RECONCILE), task[
+        "reason"
+    ]
+    assert store.artifact(task_id, "validation", policy.policy_hash) is None
+    assert store.artifact(task_id, "revision", policy.policy_hash) is None
+
+
+async def test_policy_change_can_publish_new_same_sha_review(
+    store, task_id, fixture_github, policy
+):
+    await Workflow(store, policy, fixture_github).run(task_id)
+    sha = store.task(task_id)["target_sha"]
+    changed = Config(
+        checks=policy.checks + [["{python}", "-c", "assert 1+1==2"]],
+        ci_workflows=policy.ci_workflows,
+    )
+    await Workflow(store, changed, fixture_github).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.MERGEABLE, store.task(task_id)["reason"]
+    assert store.task(task_id)["target_sha"] == sha
+    assert len(fixture_github.reviews) == 3
+
+
+def checkout_log(number, sha):
+    return "\n".join(
+        [
+            "2026-01-01T00:00:00Z ##[group]Run actions/checkout@v4",
+            "2026-01-01T00:00:00Z [command]/usr/bin/git checkout --progress --force "
+            f"refs/remotes/pull/{number}/merge",
+            "2026-01-01T00:00:00Z [command]/usr/bin/git log -1 --format=%H",
+            f"2026-01-01T00:00:00Z {sha}",
+            "2026-01-01T00:00:00Z ##[group]Run user test",
+        ]
+    )
+
+
+@pytest.mark.parametrize("valid", [True, False])
+async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, monkeypatch, valid):
+    github = GitHub()
+    task = {
+        "target_sha": sha,
+        "pr_number": 9,
+        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
+    }
+    log = checkout_log(9, "3" * 40)
+
+    async def pages(*args):
+        return [
+            {
+                "id": 2,
+                "conclusion": "success",
+                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
+            }
+        ]
+
+    async def read(*args):
+        return {"parents": [{"sha": "1" * 40 if valid else "2" * 40}, {"sha": sha}]}
+
+    async def logs(*args):
+        return log
+
+    monkeypatch.setattr(github, "pages", pages)
+    monkeypatch.setattr(github, "read", read)
+    monkeypatch.setattr("gongcao.github.command", logs)
+    result = await github.checkout_proof(task, {"id": 1, "run_attempt": 1})
+    assert (result is not None) == valid
+    assert checkout_sha(log, 10) is None
+    assert checkout_sha(log.replace("Run actions/checkout@v4", "Run user echo"), 9) is None
+
+
+async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
+    calls = []
+
+    async def raw(*args):
+        calls.append(args)
+        return '{"items":[{"id":1}]}\n {"items":[{"id":2}]}'
+
+    monkeypatch.setattr("gongcao.github.command", raw)
+    assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
+    assert "--slurp" not in calls[0]
 
 
 async def test_quality_imports_target_code_and_has_no_model_auth(store, task_id):

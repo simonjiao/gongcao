@@ -11,7 +11,7 @@ from typing import Any
 from .config import Config
 from .events import Journal, Redactor
 from .github import GitHub
-from .model import AgentResult, Role, Stage, State, after_run
+from .model import AgentResult, Role, Stage, State, after_run, same_version
 from .processes import CleanupError, stop
 from .sandbox import IsolationError, Sandbox
 from .store import Store
@@ -22,10 +22,17 @@ class Runner:
     def __init__(self, store: Store, config: Config, github: GitHub):
         self.store, self.config, self.github = store, config, github
 
-    async def run(self, task_id: int, evidence: dict[str, Any] | None = None) -> str:
+    async def run(
+        self,
+        task_id: int,
+        evidence: dict[str, Any] | None = None,
+        expected_task: dict[str, Any] | None = None,
+    ) -> str:
         task = self.store.task(task_id)
         self.store.sync(task_id, await self.github.task_snapshot(task))
         task = self.store.task(task_id)
+        if expected_task is not None and not same_version(expected_task, task):
+            raise ValueError("Task version changed before starting the requested agent role")
         role = {
             Stage.ANALYSIS: Role.ANALYST,
             Stage.DEVELOPMENT: Role.DEVELOPER,

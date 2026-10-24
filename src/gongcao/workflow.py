@@ -8,7 +8,7 @@ from typing import Any
 from .config import Config
 from .events import Redactor
 from .github import GitHub
-from .model import Role, Stage, State
+from .model import Role, Stage, State, same_version
 from .quality import Quality, ci_gate
 from .remote import Controlled, UncertainWrite
 from .runner import Runner
@@ -27,6 +27,12 @@ class Workflow:
         task = self.store.task(task_id)
         self.store.sync(task_id, await self.github.task_snapshot(task))
         return self.store.task(task_id)
+
+    async def confirm(self, expected: dict[str, Any]) -> dict[str, Any]:
+        current = await self.sync(expected["id"])
+        if not same_version(expected, current):
+            raise UncertainWrite("Target changed; old evidence cannot authorize the new version")
+        return self.store.guard(current)
 
     def cached_run(self, task: dict[str, Any], role: Role) -> dict[str, Any] | None:
         rows = [
@@ -50,7 +56,7 @@ class Workflow:
             self.store.transition(
                 task, Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
             )
-        await self.runner.run(task["id"], evidence)
+        await self.runner.run(task["id"], evidence, expected_task=task)
         current = self.store.task(task["id"])
         if current["state"] in {
             State.HUMAN,
@@ -131,10 +137,12 @@ class Workflow:
             run = await self.agent(task, Role.REVIEWER, checks)
             if run is None:
                 return
-            current = await self.sync(task["id"])
+            current = await self.confirm(task)
             result = json.loads(run["result"])
-            await self.remote.review(current, result)
-            current = await self.sync(task["id"])
+            await self.remote.review(current, result, run["id"])
+            current = await self.confirm(task)
+            if self.cached_run(current, Role.REVIEWER) is None:
+                raise UncertainWrite("Review evidence became invalid during publication")
             if result["conclusion"] == "revise":
                 self.revision(current, result)
             elif result["conclusion"] == "ready":
@@ -179,7 +187,7 @@ class Workflow:
             run = await self.agent(task, Role.VALIDATOR, evidence)
             if run is None:
                 return
-            current = await self.sync(task["id"])
+            current = await self.confirm(task)
             result = json.loads(run["result"])
             if result["conclusion"] == "revise":
                 self.revision(current, result)
@@ -187,7 +195,9 @@ class Workflow:
             if result["conclusion"] != "ready":
                 return
             await self.remote.ready(current)
-            current = await self.sync(task["id"])
+            current = await self.confirm(task)
+            if self.cached_run(current, Role.VALIDATOR) is None:
+                raise UncertainWrite("Validation evidence became invalid during readiness update")
             final = await self.github.gates(current)
             state, reason = ci_gate(current, final, self.config.ci_workflows)
             if state == State.COMPLETED and (
