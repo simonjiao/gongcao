@@ -71,6 +71,8 @@ class GitHub:
                 {
                     "head_sha": data["head"]["sha"],
                     "base_sha": data["base"]["sha"],
+                    "base_ref": data["base"]["ref"],
+                    "base_repository": data["base"]["repo"]["full_name"],
                     "merged": data["merged"],
                     "head_repository": data["head"]["repo"]["full_name"],
                 }

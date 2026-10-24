@@ -12,6 +12,7 @@ Worktree 与真实 OS 沙箱隔离，以及状态/日志/取消。GitHub 工作�
 
 需要 Linux、Python 3.12+、uv、Git、已登录的 GitHub CLI、Bubblewrap，以及 Codex 模型认证。
 在 Ubuntu/WSL 中可通过 `sudo apt-get install bubblewrap` 安装 Bubblewrap。
+首版仅面向可信任务代码：沙箱内仍有模型认证副本并允许联网，不能用它安全执行任意不可信 PR 代码。
 
 ```bash
 uv sync --locked
@@ -52,7 +53,10 @@ run 在前台执行一次当前阶段。可在另一个终端观察日志或取�
 
 分析完成后任务进入 pending_development/queued，可再次 run 启动新的开发会话。
 开发完成后保留本地分支和 Worktree，停在 waiting_dependency，等待 PR2 的远端门禁。
-GitHub PR head 或请求正文/标题变化会使旧证据失效。Issue 的代码基线固定为登记时的本地 HEAD，
+GitHub PR head、base SHA/目标分支或请求正文/标题变化会使旧证据失效。
+关闭的对象进入 needs_human，重新打开也不会自动恢复；旧结果不能继续推进。
+PR1 尚无人工恢复命令，核对后可用新的专属 state-dir 显式登记以开始新任务，保留原记录；不要改数据库。
+Issue 的代码基线固定为登记时的本地 HEAD，
 未提交修改不会进入 Agent 上下文。PR 使用 GitHub head SHA。
 
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或

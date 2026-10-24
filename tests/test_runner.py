@@ -195,3 +195,32 @@ async def test_closing_remote_object_during_execution_stops_advancement(
     await Runner(store, Config(auth_file=auth_file), ClosingObject(snapshot)).run(task_id)
     assert store.task(task_id)["stage"] == Stage.ANALYSIS
     assert store.task(task_id)["state"] == State.HUMAN
+
+
+async def test_base_change_during_execution_rejects_old_analysis(
+    store, task_id, snapshot, auth_file, sha, monkeypatch
+):
+    class MovingBase(ReadOnlyGitHub):
+        calls = 0
+
+        async def snapshot(self, target):
+            self.calls += 1
+            return self.value | ({"base_sha": "0" * 40} if self.calls > 1 else {})
+
+    # The first base exists locally, so context creation needs no network fetch.
+    github = MovingBase(snapshot | {"base_sha": sha})
+    install_worker(monkeypatch, SUCCESS)
+    await Runner(store, Config(auth_file=auth_file), github).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.ANALYSIS
+    assert store.task(task_id)["state"] == State.RECONCILE
+    assert not store.runs(task_id)[0]["evidence_valid"]
+
+
+async def test_closed_remote_object_never_starts_a_worker(store, task_id, snapshot, auth_file):
+    runner = Runner(
+        store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot | {"state": "closed"})
+    )
+    with pytest.raises(ValueError):
+        await runner.run(task_id)
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert not store.runs(task_id)

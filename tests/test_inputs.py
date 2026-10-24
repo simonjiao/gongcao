@@ -66,6 +66,31 @@ async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
     assert snapshot["body"] == "[REDACTED]"
 
 
+async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):
+    async def read(*args):
+        return json.dumps(
+            {
+                "title": "Test PR",
+                "body": "",
+                "state": "open",
+                "updated_at": "now",
+                "merged": False,
+                "head": {"sha": "1" * 40, "repo": {"full_name": "fork/demo"}},
+                "base": {
+                    "sha": "2" * 40,
+                    "ref": "release",
+                    "repo": {"full_name": "example/demo"},
+                },
+            }
+        )
+
+    monkeypatch.setattr("gongcao.github.command", read)
+    snapshot = await GitHub().snapshot(Target.parse("https://github.com/example/demo/pull/1"))
+    assert snapshot["base_sha"] == "2" * 40
+    assert snapshot["base_ref"] == "release"
+    assert snapshot["base_repository"] == "example/demo"
+
+
 async def test_status_inspect_and_cancel_are_local(store, task_id, capsys):
     for name in ("status", "inspect", "cancel"):
         args = parser().parse_args([name, str(task_id)])

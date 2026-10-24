@@ -95,6 +95,82 @@ def test_remote_change_does_not_resume_cancelled_task(store, task_id, snapshot):
     assert store.task(task_id)["state"] == State.CANCELLED
 
 
+@pytest.mark.parametrize("field", ["base_sha", "base_ref", "base_repository"])
+@pytest.mark.parametrize("inflight", [False, True])
+def test_pr_base_change_invalidates_evidence_with_unchanged_head(
+    store, task_id, snapshot, sha, field, inflight
+):
+    original = snapshot | {
+        "head_sha": sha,
+        "base_sha": "1" * 40,
+        "base_ref": "main",
+        "base_repository": "example/demo",
+    }
+    store.sync(task_id, original)
+    run_id = store.begin_run(task_id, Role.ANALYST)
+    if not inflight:
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ok")
+    changed = "2" * 40 if field == "base_sha" else "different-target"
+    store.sync(task_id, original | {field: changed})
+    if inflight:
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late result")
+    task = store.task(task_id)
+    assert task["target_sha"] == sha
+    assert task["stage"] == Stage.ANALYSIS
+    assert task["state"] == (State.RECONCILE if inflight else State.QUEUED)
+    assert not store.runs(task_id)[0]["evidence_valid"]
+
+
+@pytest.mark.parametrize("phase", ["queued", "running", "waiting_dependency"])
+def test_closed_object_stops_progress_and_invalidates_evidence(store, task_id, snapshot, phase):
+    if phase != "queued":
+        run_id = store.begin_run(task_id, Role.ANALYST)
+        if phase == "waiting_dependency":
+            store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.WAITING_DEPENDENCY, "ok")
+    store.sync(task_id, snapshot | {"state": "closed"})
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert all(not run["evidence_valid"] for run in store.runs(task_id))
+    if phase == "running":
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late result")
+        assert store.task(task_id)["state"] == State.HUMAN
+        assert store.task(task_id)["stage"] == Stage.ANALYSIS
+    with pytest.raises(ValueError):
+        store.begin_run(task_id, Role.ANALYST)
+
+
+@pytest.mark.parametrize("inflight", [False, True])
+def test_reopened_object_needs_manual_handling_and_cannot_reuse_old_result(
+    store, task_id, snapshot, inflight
+):
+    run_id = store.begin_run(task_id, Role.ANALYST)
+    if not inflight:
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ok")
+    store.sync(task_id, snapshot | {"state": "closed"})
+    store.sync(task_id, snapshot | {"title": "Reopened request"})
+    # A later content update must not implicitly clear the manual handling state either.
+    store.sync(task_id, snapshot | {"title": "Updated reopened request"})
+    if inflight:
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late result")
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert store.task(task_id)["stage"] == Stage.ANALYSIS
+    assert not store.runs(task_id)[0]["evidence_valid"]
+
+
+def test_registering_closed_object_never_queues_it(store, repo, sha, snapshot):
+    task_id = store.register(snapshot["url"], repo, sha, snapshot | {"state": "closed"})
+    assert store.task(task_id)["state"] == State.HUMAN
+    with pytest.raises(ValueError):
+        store.begin_run(task_id, Role.ANALYST)
+    assert not store.runs(task_id)
+
+
+def test_cancelled_object_stays_cancelled_across_close_and_reopen(store, task_id, snapshot):
+    store.cancel(task_id)
+    store.sync(task_id, snapshot | {"state": "closed"})
+    store.sync(task_id, snapshot | {"body": "Changed after reopening"})
+    assert store.task(task_id)["state"] == State.CANCELLED
+
+
 def test_result_requires_version_and_evidence(sha):
     with pytest.raises(ValueError):
         AgentResult.model_validate(json.loads(result(sha).model_dump_json()) | {"basis": []})

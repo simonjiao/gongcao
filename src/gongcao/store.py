@@ -64,17 +64,20 @@ class Store:
         ]
 
     def register(self, url: str, repo_path: Path, sha: str, snapshot: dict[str, Any]) -> int:
+        is_open = snapshot.get("state") == "open"
         with self.db:
             self.db.execute(
                 "INSERT OR IGNORE INTO tasks "
-                "(url,repo_path,stage,state,target_sha,snapshot,updated) VALUES (?,?,?,?,?,?,?)",
+                "(url,repo_path,stage,state,target_sha,snapshot,reason,updated) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     url,
                     str(repo_path.resolve()),
                     Stage.ANALYSIS,
-                    State.QUEUED,
+                    State.QUEUED if is_open else State.HUMAN,
                     sha,
                     json.dumps(snapshot),
+                    "" if is_open else "GitHub object is closed; manual handling required",
                     time.time(),
                 ),
             )
@@ -89,31 +92,50 @@ class Store:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
             sha = snapshot.get("head_sha") or task["target_sha"]
-            content_changed = any(
-                snapshot.get(key) != task["snapshot"].get(key) for key in ("title", "body")
-            )
-            if sha != task["target_sha"] or content_changed:
-                self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,))
-                self.db.execute(
-                    "UPDATE tasks SET stage=?,state=?,reason=? WHERE id=?",
-                    (
-                        Stage.ANALYSIS,
-                        State.CANCELLED
-                        if task["cancel_requested"]
-                        else (State.RECONCILE if task["state"] == State.RUNNING else State.QUEUED),
-                        "GitHub head or request changed; previous evidence is invalid",
-                        task_id,
-                    ),
+            version_changed = sha != task["target_sha"] or any(
+                snapshot.get(key) != task["snapshot"].get(key)
+                for key in (
+                    "title",
+                    "body",
+                    "base_sha",
+                    "base_ref",
+                    "base_repository",
+                    "head_repository",
                 )
+            )
+            lifecycle_changed = snapshot.get("state") != task["snapshot"].get("state")
+            stage, state, reason = task["stage"], task["state"], task["reason"]
+            if version_changed or lifecycle_changed:
+                self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,))
+            if version_changed:
+                stage = Stage.ANALYSIS
+                active = self.db.execute(
+                    "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
+                ).fetchone()
+                # Human intervention cannot be cleared by a later remote content edit.
+                if state != State.HUMAN:
+                    state = State.RECONCILE if active else State.QUEUED
+                    reason = "GitHub head, base or request changed; previous evidence is invalid"
+            if snapshot.get("state") != "open":
+                state = State.HUMAN
+                reason = "GitHub object is closed; manual handling required"
+            elif lifecycle_changed:
+                stage, state = Stage.ANALYSIS, State.HUMAN
+                reason = "GitHub object reopened; manual handling required before a new run"
+            if task["cancel_requested"]:
+                state, reason = State.CANCELLED, "Cancelled by user"
             self.db.execute(
-                "UPDATE tasks SET snapshot=?,target_sha=?,updated=? WHERE id=?",
-                (json.dumps(snapshot), sha, time.time(), task_id),
+                "UPDATE tasks SET stage=?,state=?,reason=?,snapshot=?,target_sha=?,updated=? "
+                "WHERE id=?",
+                (stage, state, reason, json.dumps(snapshot), sha, time.time(), task_id),
             )
 
     def begin_run(self, task_id: int, role: Role) -> str:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
+            if task["snapshot"].get("state") != "open" or task["cancel_requested"]:
+                raise ValueError("Closed or cancelled tasks cannot run")
             if task["state"] not in {State.QUEUED, State.FAILED, State.WAITING_ENVIRONMENT}:
                 raise ValueError(f"Task cannot run in state {task['state']}")
             expected = {Stage.ANALYSIS: Role.ANALYST, Stage.DEVELOPMENT: Role.DEVELOPER}
@@ -168,6 +190,9 @@ class Store:
                 run_state = task_state = State.CANCELLED
                 stage = Stage(task["stage"])
                 reason = "Cancelled by user"
+            elif task["snapshot"].get("state") != "open" or task["state"] == State.HUMAN:
+                stage, task_state = Stage(task["stage"]), State.HUMAN
+                reason = task["reason"] or "GitHub object is closed; manual handling required"
             elif task["target_sha"] != run["target_sha"] or not run["evidence_valid"]:
                 stage = Stage(task["stage"])
                 task_state = State.RECONCILE
