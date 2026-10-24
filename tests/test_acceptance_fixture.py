@@ -12,6 +12,14 @@ spec.loader.exec_module(module)
 
 
 class ClampScoreTests(unittest.TestCase):
+    def test_negative_values(self) -> None:
+        for value in (-100, -1):
+            with self.subTest(value=value):
+                self.assertEqual(module.clamp_score(value), 0)
+
+    def test_zero(self) -> None:
+        self.assertEqual(module.clamp_score(0), 0)
+
     def test_positive_in_range(self) -> None:
         for value in (1, 25, 50, 99):
             with self.subTest(value=value):
