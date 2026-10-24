@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -94,7 +95,7 @@ async def test_developer_can_run_uv_project_checks(tmp_path, repo, sha, auth_fil
             "run",
             "--offline",
             "--python",
-            "/usr/bin/python3.12",
+            str(Path(sys.base_prefix) / "bin/python3"),
             "python",
             "-c",
             "from pathlib import Path; assert Path('sample.txt').read_text() == 'original\\n'",

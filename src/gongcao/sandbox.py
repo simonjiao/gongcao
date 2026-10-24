@@ -114,9 +114,10 @@ class Sandbox:
         ):
             if Path(mount).exists():
                 args += ["--ro-bind", mount, mount]
-        prefix = Path(sys.prefix).resolve()
-        if not prefix.is_relative_to("/usr"):
-            args += ["--ro-bind", str(prefix), str(prefix)]
+        # uv-managed Python and CI interpreters may live outside /usr; include only their roots.
+        for prefix in {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}:
+            if not prefix.is_relative_to("/usr"):
+                args += ["--ro-bind", str(prefix), str(prefix)]
         args += [
             "--ro-bind",
             uv.find_uv_bin(),
