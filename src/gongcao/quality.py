@@ -10,7 +10,7 @@ from typing import Any
 from .config import Config
 from .events import Redactor
 from .model import Role, Stage, State
-from .processes import stop
+from .processes import launch, stop
 from .sandbox import Sandbox
 from .store import Store
 from .workspace import worktree
@@ -47,11 +47,8 @@ class Quality:
                 )
                 for arg in argv
             ]
-            process = await asyncio.create_subprocess_exec(
+            process = await launch(
                 *sandbox.argv("/usr/bin/env", "-u", "PYTHONPATH", *expanded),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
             )
 
             async def output(stream: asyncio.StreamReader | None) -> dict[str, Any]:

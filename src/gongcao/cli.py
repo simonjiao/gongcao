@@ -12,6 +12,8 @@ from typing import Any
 from .config import Config
 from .github import GitHub, Target, command
 from .model import State
+from .recovery import Recovery, diagnose
+from .scheduler import Scheduler
 from .store import Store
 from .workflow import Workflow
 from .workspace import repository
@@ -21,20 +23,38 @@ def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
-async def logs(store: Store, task_id: int, follow: bool) -> None:
+async def logs(
+    store: Store,
+    task_id: int,
+    follow: bool,
+    *,
+    run_id: str | None = None,
+    kind: str | None = None,
+    contains: str | None = None,
+) -> None:
     runs = store.runs(task_id)
     if not runs:
         output({"task_id": task_id, "message": "No runs recorded"})
         return
-    run_id = runs[-1]["id"]
+    if run_id is not None and run_id not in {r["id"] for r in runs}:
+        raise ValueError("Run does not belong to this task")
+    run_id = run_id or runs[-1]["id"]
     path = store.root / "logs" / f"{run_id}.jsonl"
     seen: tuple[int, int] | None = None
     stream = None
+
+    def emit(line: str) -> None:
+        if (kind is None or json.loads(line)["kind"] == kind) and (
+            contains is None or contains in line
+        ):
+            print(line, end="", flush=True)
+
     try:
         # Replay the retained rotated file, then tail the latest file, tracking inode changes.
         rotated = path.with_suffix(".jsonl.1")
         if rotated.exists():
-            print(rotated.read_text(), end="", flush=True)
+            for line in rotated.read_text().splitlines(keepends=True):
+                emit(line)
         while True:
             if path.exists():
                 stat = path.stat()
@@ -45,8 +65,15 @@ async def logs(store: Store, task_id: int, follow: bool) -> None:
                     stream = path.open()
                     seen = identity
                 assert stream is not None
-                for line in stream:
-                    print(line, end="", flush=True)
+                while True:
+                    position = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        stream.seek(position)
+                        break
+                    emit(line)
             active = any(
                 r["id"] == run_id and r["state"] == State.RUNNING for r in store.runs(task_id)
             )
@@ -94,6 +121,10 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                         "cancel_requested",
                     )
                 }
+                | {
+                    "dependencies": store.dependencies(task["id"]),
+                    "runtime": diagnose(store, task["id"]),
+                }
                 for task in tasks
             ]
         )
@@ -101,20 +132,53 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         task = store.task(args.task)
         task["runs"] = store.runs(args.task)
         task["evidence"] = store.evidence(args.task)
+        task["runtime"] = diagnose(store, args.task)
         output(task)
     elif args.command == "cancel":
         store.cancel(args.task)
         output(store.task(args.task))
     elif args.command == "logs":
         store.task(args.task)
-        await logs(store, args.task, args.follow)
-    elif args.command == "run":
+        await logs(
+            store,
+            args.task,
+            args.follow,
+            run_id=args.run_id,
+            kind=args.kind,
+            contains=args.contains,
+        )
+    elif args.command == "depend":
+        store.depend(args.task, args.on, clear=args.clear)
+        output(store.dependencies(args.task))
+    elif args.command == "diagnose":
+        output(diagnose(store, args.task))
+    elif args.command in {"recover", "retry"}:
+        recovery = Recovery(store, github)
+        result = (
+            await recovery.retry(
+                args.task, reset_revisions=args.reset_revisions, refresh_base=args.refresh_base
+            )
+            if args.command == "retry"
+            else await recovery.recover(args.task)
+        )
+        output(result)
+        return 0 if result["recovered"] else 1
+    elif args.command in {"run", "serve"}:
         current = asyncio.current_task()
         assert current is not None
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, current.cancel)
         try:
+            if args.command == "serve":
+                await Scheduler(store, Config.load(args.config), github, args.concurrency).serve(
+                    once=args.once, poll=args.poll
+                )
+                output(store.tasks())
+                return 0
             run_ids = await Workflow(store, Config.load(args.config), github).run(args.task)
+        except asyncio.CancelledError:
+            output(store.tasks())
+            return 130
         finally:
             loop.remove_signal_handler(signal.SIGTERM)
         task = store.task(args.task)
@@ -138,11 +202,36 @@ def parser() -> argparse.ArgumentParser:
     register = commands.add_parser("register", help="Register exactly one GitHub Issue/PR")
     register.add_argument("url")
     register.add_argument("--repo", type=Path, default=Path.cwd())
-    for name in ("sync", "status", "inspect", "cancel", "logs", "run"):
+    serve = commands.add_parser("serve", help="Poll registered tasks with bounded concurrency")
+    serve.add_argument("--config", type=Path)
+    serve.add_argument("--concurrency", type=int, choices=(1, 2, 3), default=1)
+    serve.add_argument("--poll", type=float, default=5)
+    serve.add_argument("--once", action="store_true")
+    for name in (
+        "sync",
+        "status",
+        "inspect",
+        "cancel",
+        "logs",
+        "run",
+        "recover",
+        "retry",
+        "depend",
+        "diagnose",
+    ):
         sub = commands.add_parser(name)
         sub.add_argument("task", type=int, nargs="?" if name in {"sync", "status"} else None)
         if name == "logs":
             sub.add_argument("--follow", action="store_true")
+            sub.add_argument("--run", dest="run_id")
+            sub.add_argument("--kind")
+            sub.add_argument("--contains")
+        if name == "depend":
+            sub.add_argument("--on", type=int, action="append", default=[])
+            sub.add_argument("--clear", action="store_true")
+        if name == "retry":
+            sub.add_argument("--reset-revisions", action="store_true")
+            sub.add_argument("--refresh-base", action="store_true")
         if name == "run":
             sub.add_argument("--config", type=Path)
     return cli

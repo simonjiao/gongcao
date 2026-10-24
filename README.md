@@ -6,9 +6,9 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 实现计划与验收边界见 [Issue #1](https://github.com/simonjiao/gongcao/issues/1)。
 
 基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
-当前第二阶段是 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4)。
+第二阶段已在 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4) 合并。
 支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
-租约、后台调度与重启恢复属于第三阶段。
+第三阶段补充前台轮询、有限并发、依赖与安全恢复，见 [执行契约](docs/stage3.md)。
 
 ## 安装与检查
 
@@ -47,6 +47,15 @@ uv run gongcao status 1
 uv run gongcao inspect 1
 uv run gongcao logs 1 --follow
 uv run gongcao cancel 1
+
+# 只轮询已登记的任务；最多 1–3 个并发，共享同一个 state-dir。
+uv run gongcao serve --config gongcao.example.yaml --concurrency 2
+uv run gongcao serve --config gongcao.example.yaml --once
+uv run gongcao depend 2 --on 1
+uv run gongcao diagnose 2
+uv run gongcao recover 2
+uv run gongcao retry 2
+uv run gongcao logs 2 --run RUN_ID --kind error --contains TEXT
 ```
 
 命令返回 JSON；任务编号由 register 返回，示例中的 1 需替换为实际编号。
@@ -64,13 +73,17 @@ GitHub Actions workflow 文件名；需要真实验证时设置 require_real_che
 同身份 Agent 的 COMMENT 不算 GitHub 正式批准，GitHub 的保护规则仍必须满足。
 GitHub PR head、base SHA/目标分支或请求正文/标题变化会使旧证据失效。
 关闭的对象进入 needs_human，重新打开也不会自动恢复；旧结果不能继续推进。
-尚无重启恢复/人工恢复命令；无法确认写入结果时进入待核对，不重放副作用。不要改数据库绕过状态。
+recover 先核对进程、会话引用、工作区和远端事实；无法确认时仍待核对，不重放副作用。
+retry 是显式人工重试，检查/审查证据重新建立，旧工作区保留；不要修改数据库绕过状态。
+serve 启动时核对遗留执行，连续三次执行/环境失败后转人工处理，普通 CI 等待不计失败。
+依赖须由 GitHub 确认已合并。未发布 Issue 基线过旧时，可用 retry --refresh-base 从当前默认分支重建计划；
+仅显式 retry --reset-revisions 重置修订预算。未知启动/后代清理不明时不会只凭 PID 或日志静默恢复。
 Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远端默认分支。PR 使用 GitHub head SHA。
 未提交修改不会进入初始上下文；开发内容仅在分配的 Worktree 中产生。
 
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
 请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
-旧 PR1 SQLite 在事务内升级到模式版本 1；新版本数据库会被拒绝打开，不静默降级。
+旧 SQLite 在事务内依次升级到模式版本 2；更高版本数据库会被拒绝打开，不静默降级。
 运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
 验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。

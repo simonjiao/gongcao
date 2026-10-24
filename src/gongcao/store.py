@@ -17,9 +17,10 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(self.root / "gongcao.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
+        self.owners: dict[int, str] = {}
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 1:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 2:
             self.db.close()
             raise ValueError("Database schema is newer than this Gongcao version")
         self.db.executescript("""
@@ -65,6 +66,26 @@ class Store:
                     "payload TEXT NOT NULL, state TEXT NOT NULL, response TEXT)"
                 )
                 self.db.execute("PRAGMA user_version=1")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == 1:
+                self.db.execute("ALTER TABLE runs ADD COLUMN owner_token TEXT")
+                for statement in (
+                    "CREATE TABLE leases (task_id INTEGER PRIMARY KEY REFERENCES tasks(id), "
+                    "owner TEXT NOT NULL, pid INTEGER NOT NULL, identity TEXT NOT NULL, "
+                    "resource TEXT NOT NULL UNIQUE, object TEXT NOT NULL UNIQUE, "
+                    "expires REAL NOT NULL)",
+                    "CREATE TABLE processes (id TEXT PRIMARY KEY, task_id INTEGER NOT NULL "
+                    "REFERENCES tasks(id), owner TEXT NOT NULL, label TEXT NOT NULL, "
+                    "pid INTEGER, identity TEXT, state TEXT NOT NULL)",
+                    "CREATE TABLE dependencies (task_id INTEGER REFERENCES tasks(id), "
+                    "requires INTEGER REFERENCES tasks(id), PRIMARY KEY(task_id,requires))",
+                    "CREATE TABLE retries (task_id INTEGER PRIMARY KEY REFERENCES tasks(id), "
+                    "failures INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', "
+                    "next_at REAL NOT NULL DEFAULT 0)",
+                    "CREATE INDEX events_run_kind ON events(run_id,kind,id)",
+                    "CREATE INDEX processes_task_state ON processes(task_id,state)",
+                ):
+                    self.db.execute(statement)
+                self.db.execute("PRAGMA user_version=2")
 
     def close(self) -> None:
         self.db.close()
@@ -80,6 +101,36 @@ class Store:
     def tasks(self) -> list[dict[str, Any]]:
         return [self.task(row[0]) for row in self.db.execute("SELECT id FROM tasks ORDER BY id")]
 
+    def dependencies(self, task_id: int) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT t.id,t.url,t.stage,t.state,t.reason FROM dependencies d "
+                "JOIN tasks t ON t.id=d.requires WHERE d.task_id=? ORDER BY t.id",
+                (task_id,),
+            )
+        ]
+
+    def depend(self, task_id: int, requires: list[int], *, clear: bool = False) -> None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.task(task_id)
+            if self.db.execute("SELECT 1 FROM leases WHERE task_id=?", (task_id,)).fetchone():
+                raise ValueError("Cannot edit dependencies of an occupied task")
+            if clear:
+                self.db.execute("DELETE FROM dependencies WHERE task_id=?", (task_id,))
+            for other in requires:
+                self.task(other)
+                self.db.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)", (task_id, other))
+            cycle = self.db.execute(
+                "WITH RECURSIVE edges(id) AS (SELECT requires FROM dependencies WHERE task_id=? "
+                "UNION SELECT d.requires FROM dependencies d JOIN edges e ON d.task_id=e.id) "
+                "SELECT 1 FROM edges WHERE id=?",
+                (task_id, task_id),
+            ).fetchone()
+            if cycle:
+                raise ValueError("Task dependency cycle is not allowed")
+
     def runs(self, task_id: int) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -91,6 +142,16 @@ class Store:
     def register(self, url: str, repo_path: Path, sha: str, snapshot: dict[str, Any]) -> int:
         is_open = snapshot.get("state") == "open"
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.db.execute(
+                "SELECT id,repo_path FROM tasks WHERE lower(url)=lower(?)", (url,)
+            ).fetchone()
+            if existing:
+                if existing["repo_path"] != str(repo_path.resolve()):
+                    raise ValueError(
+                        "Task is already registered against a different local repository"
+                    )
+                return int(existing["id"])
             self.db.execute(
                 "INSERT OR IGNORE INTO tasks "
                 "(url,repo_path,stage,state,target_sha,snapshot,reason,updated,pr_number) "
@@ -165,6 +226,8 @@ class Store:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
+            if task_id in self.owners:
+                self.guard(task)
             if expected_snapshot is not None and task["snapshot"] != expected_snapshot:
                 raise ValueError("GitHub snapshot changed before claim; sync and retry")
             if task["snapshot"].get("state") != "open" or task["cancel_requested"]:
@@ -182,8 +245,8 @@ class Store:
                 raise ValueError("The requested role does not match the current stage")
             run_id = uuid.uuid4().hex
             self.db.execute(
-                "INSERT INTO runs (id,task_id,role,state,target_sha,owner_pid,started) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO runs (id,task_id,role,state,target_sha,owner_pid,started,owner_token) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     task_id,
@@ -192,6 +255,7 @@ class Store:
                     task["target_sha"],
                     os.getpid(),
                     time.time(),
+                    self.owners.get(task_id),
                 ),
             )
             self.db.execute(
@@ -225,6 +289,16 @@ class Store:
             run = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             assert run is not None
             task = self.task(run["task_id"])
+            lease_ok = (
+                not run["owner_token"]
+                or self.db.execute(
+                    "SELECT 1 FROM leases WHERE task_id=? AND owner=? AND expires>=?",
+                    (task["id"], run["owner_token"], time.time()),
+                ).fetchone()
+                is not None
+            )
+            if not lease_ok:
+                run_state, result = State.RECONCILE, None
             if task["cancel_requested"]:
                 run_state = task_state = State.CANCELLED
                 stage = Stage(task["stage"])
@@ -235,13 +309,31 @@ class Store:
             elif task["snapshot"].get("state") != "open" or task["state"] == State.HUMAN:
                 stage, task_state = Stage(task["stage"]), State.HUMAN
                 reason = task["reason"] or "GitHub object is closed; manual handling required"
+            elif not lease_ok:
+                stage, run_state, task_state = (
+                    Stage(task["stage"]),
+                    State.RECONCILE,
+                    State.RECONCILE,
+                )
+                reason, result = "Execution lease lost; late result rejected", None
+                self.db.execute("UPDATE runs SET evidence_valid=0 WHERE id=?", (run_id,))
             elif task["target_sha"] != run["target_sha"] or not run["evidence_valid"]:
                 stage = Stage(task["stage"])
                 task_state = State.RECONCILE
                 reason = "Target changed during execution; result cannot advance the stage"
             self.db.execute(
-                "UPDATE runs SET state=?,result=?,error=?,ended=? WHERE id=? AND state=?",
-                (run_state, result, reason, time.time(), run_id, State.RUNNING),
+                "UPDATE runs SET state=?,result=?,error=?,ended=?,"
+                "evidence_valid=CASE WHEN ? THEN evidence_valid ELSE 0 END "
+                "WHERE id=? AND state=?",
+                (
+                    run_state,
+                    result,
+                    reason,
+                    time.time(),
+                    run_state == State.COMPLETED and result is not None,
+                    run_id,
+                    State.RUNNING,
+                ),
             )
             self.db.execute(
                 "UPDATE tasks SET stage=?,state=?,reason=?,updated=? WHERE id=?",
@@ -272,6 +364,13 @@ class Store:
 
     def guard(self, expected: dict[str, Any]) -> dict[str, Any]:
         task = self.task(expected["id"])
+        if owner := self.owners.get(task["id"]):
+            lease = self.db.execute(
+                "SELECT 1 FROM leases WHERE task_id=? AND owner=? AND expires>=?",
+                (task["id"], owner, time.time()),
+            ).fetchone()
+            if lease is None:
+                raise ValueError("Execution lease lost; evidence cannot advance")
         if task["stage"] == Stage.MERGED:
             raise ValueError("Merged tasks are terminal")
         if task["cancel_requested"] or task["state"] in {
