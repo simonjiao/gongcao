@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -50,18 +51,26 @@ class Runner:
             raise ValueError("This stage is not executable in PR1")
         run_id = self.store.begin_run(task_id, role)
         run_dir = self.store.root / "runs" / run_id
-        run_dir.mkdir(parents=True, mode=0o700)
-        journal = Journal(self.store, run_id, self.config.max_log_bytes, Redactor())
-        journal.emit(
-            "started", {"task_id": task_id, "role": role, "target_sha": task["target_sha"]}
-        )
+        journal: Journal | None = None
         process: asyncio.subprocess.Process | None = None
         consumers: list[asyncio.Task[Any]] = []
         started = time.monotonic()
         stage = Stage(task["stage"])
         try:
+            run_dir.mkdir(parents=True, mode=0o700)
+            journal = Journal(self.store, run_id, self.config.max_log_bytes, Redactor())
+            journal.emit(
+                "started", {"task_id": task_id, "role": role, "target_sha": task["target_sha"]}
+            )
             if task["snapshot"]["state"] != "open":
-                raise IsolationError("Registered GitHub object is closed; manual handling required")
+                self.store.finish(
+                    run_id,
+                    State.HUMAN,
+                    stage,
+                    State.HUMAN,
+                    "GitHub object is closed; manual handling required",
+                )
+                return run_id
             repo = Path(task["repo_path"])
             workspace = self.store.root / "worktrees" / run_id
             await worktree(repo, workspace, task["target_sha"], role, run_id)
@@ -124,8 +133,15 @@ class Runner:
                     f"Agent exited without a valid result (exit={process.returncode})"
                 )
             # A fresh remote read is required before accepting any version-bound artifact.
-            self.store.sync(task_id, await self.github.snapshot(Target.parse(task["url"])))
+            latest = await self.github.snapshot(Target.parse(task["url"]))
+            self.store.sync(task_id, latest)
             next_stage, state, reason = after_run(stage, role, result, task["target_sha"])
+            if latest["state"] != "open":
+                next_stage, state, reason = (
+                    stage,
+                    State.HUMAN,
+                    "GitHub object closed during execution",
+                )
             self.store.finish(
                 run_id,
                 State.COMPLETED,
@@ -143,8 +159,13 @@ class Runner:
                 if isinstance(exc, (IsolationError, OSError)) and not isinstance(exc, TimeoutError)
                 else State.FAILED
             )
-            message = journal.redactor.text(f"{type(exc).__name__}: {exc}")
-            journal.emit("error", message)
+            redactor = journal.redactor if journal is not None else Redactor()
+            message = redactor.text(f"{type(exc).__name__}: {exc}")
+            if journal is not None:
+                try:
+                    journal.emit("error", message)
+                except (OSError, sqlite3.Error):
+                    pass  # The SQLite execution record must survive a failed log sink.
             self.store.finish(run_id, state, stage, state, message)
         finally:
             if process is not None:
@@ -154,14 +175,18 @@ class Runner:
                     consumer.cancel()
             if consumers:
                 await asyncio.gather(*consumers, return_exceptions=True)
-            journal.emit(
-                "ended",
-                {
-                    "task_id": task_id,
-                    "duration_seconds": round(time.monotonic() - started, 3),
-                    "state": self.store.runs(task_id)[-1]["state"],
-                },
-            )
+            if journal is not None:
+                try:
+                    journal.emit(
+                        "ended",
+                        {
+                            "task_id": task_id,
+                            "duration_seconds": round(time.monotonic() - started, 3),
+                            "state": self.store.runs(task_id)[-1]["state"],
+                        },
+                    )
+                except (OSError, sqlite3.Error):
+                    pass
         return run_id
 
     async def receive(

@@ -9,7 +9,7 @@
 | SQLite 状态转换 | WAL；阶段与执行状态分列；事务领取；版本变化使旧证据失效 |
 | Codex 单 Agent 独立上下文 | 官方 openai-codex SDK；每次全新 thread、独立 HOME 和 CODEX_HOME |
 | 首次写入使用 Worktree | controller 先创建固定 SHA 的 Worktree；开发使用独立本地分支 |
-| 可追溯上下文 | Issue/PR 快照、固定 SHA 的 AGENTS.md、角色配置、已确认分析；保存上下文哈希 |
+| 可追溯上下文 | Issue/PR 快照、PR base→head Diff、固定 SHA 的 AGENTS.md、角色配置、已确认分析与上下文哈希 |
 | 权限隔离 | Bubblewrap 新根目录、用户/PID/挂载命名空间；真实访问探测；失败禁止启动 |
 | 日志与运行记录 | SDK 事件、工具输出、错误、结束时间、耗时、SDK 可提供的 Token 用量 |
 | status / logs --follow / inspect / cancel | 本地 CLI；取消停止整个 Agent 进程组，结果不能覆盖取消 |
@@ -22,13 +22,16 @@
 
 - Linux + Bubblewrap 是本版运行条件，不能验证命名空间和挂载权限时没有无沙箱回退。
 - 宿主 HOME、GitHub CLI 授权文件、SSH agent、Git credential helper 配置、宿主 /proc
-  和源仓库 .git 均不可见。Agent 不继承宿主环境变量。
+  和源仓库 .git 均不可见。Agent 环境清空后仅保留显式参数与无认证的联网代理配置。
 - 仅挂载只读系统运行时、只读 Gongcao 代码、角色权限下的 Worktree，以及专属运行 HOME。
   /tmp 和专属 HOME 是 Agent 的临时/会话存储；根文件系统只读。
 - 分析/审查/验证的工作区只读，只有开发角色允许写入分配的 Worktree；权限不能通过 YAML 更改。
 - Agent 使用 OpenAI 专用认证副本，不读取宿主认证目录，不导入宿主 Codex 配置、MCP 或技能。
   副本仅允许 Codex 认证字段。它不是 GitHub 写凭据；本版应用没有任何 GitHub 写操作。
 - 网络保持可用以访问模型服务。宿主 IPC/socket 目录和宿主进程不挂载。
+  仅传递无认证的 HTTP_PROXY/HTTPS_PROXY/NO_PROXY，带用户名或密码的代理配置会拒绝启动。
+- uv 二进制作为锁定的运行依赖提供，只读挂载到 /tools/uv，开发角色可以在分配的
+  Worktree 中创建自己的环境并运行 uv 检查，不能访问宿主安装的全局配置和授权。
 - 日志对已知凭据、常见 token、Bearer 和敏感字段脱敏。每次运行保留最多两个
   max_log_bytes 大小的日志段与 1000 条 SQLite 事件摘要。会话/Worktree 由操作人保留并清理。
 

@@ -7,6 +7,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+import uv
 
 from .config import Config
 from .github import command
@@ -26,6 +29,23 @@ class Sandbox:
     def prepare(self, config: Config) -> list[str]:
         if sys.platform != "linux" or shutil.which("bwrap") is None:
             raise IsolationError("Linux and Bubblewrap are required; no unsandboxed fallback")
+        for name in ("HTTPS_PROXY", "HTTP_PROXY"):
+            if proxy := os.environ.get(name):
+                parsed = urlsplit(proxy)
+                if (
+                    parsed.username
+                    or parsed.password
+                    or parsed.scheme
+                    not in {
+                        "http",
+                        "https",
+                        "socks5",
+                        "socks5h",
+                    }
+                ):
+                    raise IsolationError(
+                        "Only unauthenticated HTTP(S)/SOCKS egress proxies supported"
+                    )
         home = self.run_dir / "home"
         codex_home = home / ".codex"
         codex_home.mkdir(parents=True, mode=0o700)
@@ -99,6 +119,9 @@ class Sandbox:
             args += ["--ro-bind", str(prefix), str(prefix)]
         args += [
             "--ro-bind",
+            uv.find_uv_bin(),
+            "/tools/uv",
+            "--ro-bind",
             str(Path(__file__).resolve().parent.parent),
             "/app",
             "--bind",
@@ -118,7 +141,7 @@ class Sandbox:
             "/home/agent/.codex",
             "--setenv",
             "PATH",
-            "/usr/bin:/bin",
+            "/tools:/usr/bin:/bin",
             "--setenv",
             "PYTHONPATH",
             "/app",
@@ -136,12 +159,16 @@ class Sandbox:
             "--chdir",
             "/workspace",
         ]
+        # Preserve only credential-free transport configuration needed for model connectivity.
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
+            if value := os.environ.get(name):
+                args += ["--setenv", name, value]
         return args + ["--", *payload]
 
     async def verify(self, host_repo: Path) -> dict[str, Any]:
         """Use the identical mounts and environment to check actual access, before starting SDK."""
         script = r"""
-import json, os, pathlib, uuid
+import json, os, pathlib, uuid, subprocess
 blocked = json.loads(__import__('sys').argv[1])
 for name in blocked:
     try:
@@ -170,8 +197,10 @@ else:
     writable = True
     probe.unlink()
 assert writable == (__import__('sys').argv[2] == 'write')
+uv_version = subprocess.check_output(['uv', '--version'], text=True).strip()
 print(json.dumps({'host_credentials': 'blocked', 'host_repository': 'blocked',
-                  'workspace_writable': writable, 'external_writes': 'blocked'}))
+                  'workspace_writable': writable, 'external_writes': 'blocked',
+                  'uv': uv_version}))
 """
         blocked = [
             str(Path.home() / ".config/gh/hosts.yml"),

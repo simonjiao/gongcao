@@ -29,6 +29,7 @@ async def test_actual_namespace_permissions(tmp_path, repo, sha, auth_file, role
     evidence = await sandbox.verify(repo)
     assert evidence["workspace_writable"] == role.writable
     assert evidence["host_credentials"] == "blocked"
+    assert evidence["uv"].startswith("uv ")
     # Verify a real, preexisting host secret, not only absent default paths.
     secret = tmp_path / "host-secret"
     secret.write_text("host-authorization-store")
@@ -77,3 +78,32 @@ def test_auth_copy_whitelists_only_model_auth(tmp_path, auth_file):
     copied = sandbox.run_dir / "home/.codex/auth.json"
     assert json.loads(copied.read_text()) == {"OPENAI_API_KEY": "model-key"}
     assert os.stat(copied).st_mode & 0o777 == 0o600
+
+
+async def test_developer_can_run_uv_project_checks(tmp_path, repo, sha, auth_file):
+    workspace = tmp_path / "worktree"
+    await worktree(repo, workspace, sha, Role.DEVELOPER, "uv-check")
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname="sandbox-check"\nversion="0.0.1"\nrequires-python=">=3.12"\n'
+    )
+    sandbox = Sandbox(workspace, tmp_path / "run", Role.DEVELOPER)
+    sandbox.prepare(Config(auth_file=auth_file))
+    await command(
+        *sandbox.argv(
+            "/tools/uv",
+            "run",
+            "--offline",
+            "--python",
+            "/usr/bin/python3.12",
+            "python",
+            "-c",
+            "from pathlib import Path; assert Path('sample.txt').read_text() == 'original\\n'",
+        )
+    )
+    assert not (repo / ".venv").exists()
+
+
+def test_authenticated_proxy_is_not_passed_to_agent(tmp_path, auth_file, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:private@proxy.invalid:80")
+    with pytest.raises(IsolationError, match="unauthenticated"):
+        Sandbox(tmp_path, tmp_path / "run", Role.DEVELOPER).prepare(Config(auth_file=auth_file))

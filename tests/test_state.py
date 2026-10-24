@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -96,3 +98,39 @@ def test_remote_change_does_not_resume_cancelled_task(store, task_id, snapshot):
 def test_result_requires_version_and_evidence(sha):
     with pytest.raises(ValueError):
         AgentResult.model_validate(json.loads(result(sha).model_dump_json()) | {"basis": []})
+
+
+def test_concurrent_cancel_cannot_be_overwritten_by_finish(store, task_id, monkeypatch):
+    run_id = store.begin_run(task_id, Role.ANALYST)
+    read = threading.Event()
+    attempted = threading.Event()
+    cancelled = threading.Event()
+    connected = threading.Event()
+    original = store.task
+
+    def pause_after_read(number):
+        task = original(number)
+        read.set()
+        assert attempted.wait(2)
+        cancelled.wait(0.2)  # Cancellation must wait for finish's SQLite write transaction.
+        return task
+
+    def cancel_in_other_connection():
+        other = Store(store.root)
+        connected.set()
+        assert read.wait(2)
+        attempted.set()
+        try:
+            other.cancel(task_id)
+            cancelled.set()
+        finally:
+            other.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cancel_in_other_connection)
+        assert connected.wait(2)
+        monkeypatch.setattr(store, "task", pause_after_read)
+        store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ok")
+        monkeypatch.setattr(store, "task", original)
+        future.result(timeout=5)
+    assert store.task(task_id)["state"] == State.CANCELLED

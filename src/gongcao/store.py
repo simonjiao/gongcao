@@ -86,6 +86,7 @@ class Store:
 
     def sync(self, task_id: int, snapshot: dict[str, Any]) -> None:
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
             sha = snapshot.get("head_sha") or task["target_sha"]
             content_changed = any(
@@ -159,6 +160,7 @@ class Store:
         result: str | None = None,
     ) -> None:
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             run = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             assert run is not None
             task = self.task(run["task_id"])
@@ -181,6 +183,7 @@ class Store:
 
     def cancel(self, task_id: int) -> None:
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
             state = State.RUNNING if task["state"] == State.RUNNING else State.CANCELLED
             self.db.execute(

@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from gongcao.config import Config
+from gongcao.events import Journal
 from gongcao.github import GitHub
 from gongcao.model import Stage, State
 from gongcao.runner import Runner
@@ -152,3 +153,45 @@ async def test_remote_read_failure_after_execution_cannot_advance(
     await Runner(store, Config(auth_file=auth_file), FailingRead(snapshot)).run(task_id)
     assert store.task(task_id)["stage"] == Stage.ANALYSIS
     assert store.task(task_id)["state"] == State.FAILED
+
+
+@pytest.mark.parametrize("failure", ["run_directory", "log_sink"])
+async def test_initialization_failures_have_terminal_records(
+    store,
+    task_id,
+    snapshot,
+    auth_file,
+    monkeypatch,
+    failure,
+):
+    if failure == "run_directory":
+        (store.root / "runs").write_text("blocking file")
+    else:
+
+        def broken_sink(*_):
+            raise PermissionError("log sink unavailable")
+
+        monkeypatch.setattr(Journal, "emit", broken_sink)
+    await Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id)
+    assert store.task(task_id)["state"] == State.WAITING_ENVIRONMENT
+    assert store.runs(task_id)[0]["ended"] is not None
+
+
+async def test_closing_remote_object_during_execution_stops_advancement(
+    store,
+    task_id,
+    snapshot,
+    auth_file,
+    monkeypatch,
+):
+    class ClosingObject(ReadOnlyGitHub):
+        calls = 0
+
+        async def snapshot(self, target):
+            self.calls += 1
+            return self.value | ({"state": "closed"} if self.calls > 1 else {})
+
+    install_worker(monkeypatch, SUCCESS)
+    await Runner(store, Config(auth_file=auth_file), ClosingObject(snapshot)).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.ANALYSIS
+    assert store.task(task_id)["state"] == State.HUMAN

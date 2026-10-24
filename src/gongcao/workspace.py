@@ -70,5 +70,19 @@ async def context(
             "Return the structured result; the controller alone owns stages and evidence gates."
         ),
     }
+    if base := task["snapshot"].get("base_sha"):
+        try:
+            await command("git", "cat-file", "-e", f"{base}^{{commit}}", cwd=str(repo))
+        except RuntimeError:
+            await command("git", "fetch", "origin", base, cwd=str(repo))
+        diff = await command(
+            "git", "diff", "--no-ext-diff", "--no-textconv", f"{base}...{sha}", "--", cwd=str(repo)
+        )
+        data["diff"] = {
+            "base_sha": base,
+            "head_sha": sha,
+            "patch": diff,
+            "sha256": hashlib.sha256(diff.encode()).hexdigest(),
+        }
     digest = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return data, digest
