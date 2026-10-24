@@ -1,0 +1,10 @@
+# Omit model to use the SDK runtime's default. Host Codex configuration is not inherited.
+timeout_seconds: 900
+max_log_bytes: 2000000
+roles:
+  analyst: >-
+    Analyze the registered request. Inspect the repository and produce a concrete plan
+    with acceptance criteria and dependencies. Do not modify files.
+  developer: >-
+    Implement only the confirmed plan. Work inside the assigned workspace and run
+    relevant tests. Report changes and test evidence, including failures.

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gongcao"
+version = "0.1.0"
+description = "Local, evidence-driven Codex task runner"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["openai-codex==0.163.0", "PyYAML>=6.0.2,<7"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.25,<2",
+    "ruff>=0.11",
+    "mypy>=1.15",
+    "types-PyYAML>=6",
+    "beartype>=0.22,<1",
+    "pytest-beartype>=0.2,<1",
+]
+
+[project.scripts]
+gongcao = "gongcao.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+beartype_packages = "gongcao"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["ASYNC240"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["gongcao"]
+mypy_path = "src"
