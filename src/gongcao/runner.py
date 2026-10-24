@@ -49,7 +49,7 @@ class Runner:
         )
         if role is None:
             raise ValueError("This stage is not executable in PR1")
-        run_id = self.store.begin_run(task_id, role)
+        run_id = self.store.begin_run(task_id, role, expected_snapshot=task["snapshot"])
         run_dir = self.store.root / "runs" / run_id
         journal: Journal | None = None
         process: asyncio.subprocess.Process | None = None

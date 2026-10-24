@@ -130,10 +130,18 @@ class Store:
                 (stage, state, reason, json.dumps(snapshot), sha, time.time(), task_id),
             )
 
-    def begin_run(self, task_id: int, role: Role) -> str:
+    def begin_run(
+        self,
+        task_id: int,
+        role: Role,
+        *,
+        expected_snapshot: dict[str, Any] | None = None,
+    ) -> str:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
+            if expected_snapshot is not None and task["snapshot"] != expected_snapshot:
+                raise ValueError("GitHub snapshot changed before claim; sync and retry")
             if task["snapshot"].get("state") != "open" or task["cancel_requested"]:
                 raise ValueError("Closed or cancelled tasks cannot run")
             if task["state"] not in {State.QUEUED, State.FAILED, State.WAITING_ENVIRONMENT}:

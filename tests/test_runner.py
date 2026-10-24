@@ -224,3 +224,20 @@ async def test_closed_remote_object_never_starts_a_worker(store, task_id, snapsh
         await runner.run(task_id)
     assert store.task(task_id)["state"] == State.HUMAN
     assert not store.runs(task_id)
+
+
+@pytest.mark.parametrize("change", [{"base_sha": "0" * 40}, {"head_sha": "1" * 40}])
+async def test_version_change_before_claim_cannot_accept_stale_context(
+    store, task_id, snapshot, auth_file, monkeypatch, change
+):
+    original = store.begin_run
+
+    def sync_before_claim(number, role, **kwargs):
+        store.sync(number, snapshot | change)
+        return original(number, role, **kwargs)
+
+    monkeypatch.setattr(store, "begin_run", sync_before_claim)
+    with pytest.raises(ValueError, match="snapshot changed before claim"):
+        await Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id)
+    assert not store.runs(task_id)
+    assert store.task(task_id)["stage"] == Stage.ANALYSIS
