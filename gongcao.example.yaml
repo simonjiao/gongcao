@@ -1,6 +1,17 @@
 # Omit model to use the SDK runtime's default. Host Codex configuration is not inherited.
 timeout_seconds: 900
 max_log_bytes: 2000000
+max_revisions: 3
+# These commands describe Gongcao itself. Replace them for the registered target repository.
+quality:
+  checks:
+    - [uv, run, --locked, ruff, check, .]
+    - [uv, run, --locked, ruff, format, --check, .]
+    - [uv, run, --locked, mypy]
+    - [uv, run, --locked, pytest, -q]
+  ci_workflows: [ci.yml]
+  require_real_checks: false
+  real_checks: []
 roles:
   analyst: >-
     Analyze the registered request. Inspect the repository and produce a concrete plan

@@ -10,7 +10,7 @@ from typing import Any
 
 from .config import Config
 from .events import Journal, Redactor
-from .github import GitHub, Target
+from .github import GitHub
 from .model import AgentResult, Role, Stage, State, after_run
 from .processes import CleanupError, stop
 from .sandbox import IsolationError, Sandbox
@@ -22,15 +22,19 @@ class Runner:
     def __init__(self, store: Store, config: Config, github: GitHub):
         self.store, self.config, self.github = store, config, github
 
-    async def run(self, task_id: int) -> str:
+    async def run(self, task_id: int, evidence: dict[str, Any] | None = None) -> str:
         task = self.store.task(task_id)
-        self.store.sync(task_id, await self.github.snapshot(Target.parse(task["url"])))
+        self.store.sync(task_id, await self.github.task_snapshot(task))
         task = self.store.task(task_id)
-        role = {Stage.ANALYSIS: Role.ANALYST, Stage.DEVELOPMENT: Role.DEVELOPER}.get(
-            Stage(task["stage"])
-        )
+        role = {
+            Stage.ANALYSIS: Role.ANALYST,
+            Stage.DEVELOPMENT: Role.DEVELOPER,
+            Stage.REVISION: Role.DEVELOPER,
+            Stage.REVIEW: Role.REVIEWER,
+            Stage.VALIDATION: Role.VALIDATOR,
+        }.get(Stage(task["stage"]))
         if role is None:
-            raise ValueError("This stage is not executable in PR1")
+            raise ValueError("This stage does not execute an agent")
         run_id = self.store.begin_run(task_id, role, expected_snapshot=task["snapshot"])
         run_dir = self.store.root / "runs" / run_id
         journal: Journal | None = None
@@ -65,7 +69,7 @@ class Runner:
             await worktree(repo, workspace, task["target_sha"], role, run_id)
             self.store.run_metadata(run_id, worktree=str(workspace))
             analysis = None
-            if role == Role.DEVELOPER:
+            if role == Role.DEVELOPER and stage == Stage.DEVELOPMENT:
                 candidates = [
                     r
                     for r in self.store.runs(task_id)
@@ -77,7 +81,11 @@ class Runner:
                 if not candidates:
                     raise ValueError("No confirmed analysis for the target revision")
                 analysis = json.loads(candidates[-1]["result"])
-            data, digest = await context(repo, task, role, self.config, analysis)
+            if stage == Stage.REVISION and (
+                not evidence or evidence.get("target_sha") != task["target_sha"]
+            ):
+                raise ValueError("Revision requires confirmed findings for the current SHA")
+            data, digest = await context(repo, task, role, self.config, analysis, evidence)
             (run_dir / "context.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
             self.store.run_metadata(run_id, context_hash=digest)
             sandbox = Sandbox(workspace, run_dir, role)
@@ -122,7 +130,7 @@ class Runner:
                     f"Agent exited without a valid result (exit={process.returncode})"
                 )
             # A fresh remote read is required before accepting any version-bound artifact.
-            latest = await self.github.snapshot(Target.parse(task["url"]))
+            latest = await self.github.task_snapshot(task)
             self.store.sync(task_id, latest)
             next_stage, state, reason = after_run(stage, role, result, task["target_sha"])
             if latest["state"] != "open":
