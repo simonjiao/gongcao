@@ -512,7 +512,10 @@ def checkout_log(number, sha):
 
 
 @pytest.mark.parametrize("valid", [True, False])
-async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, monkeypatch, valid):
+@pytest.mark.parametrize("checkout_conclusion", ["success", "missing", "failure"])
+async def test_ci_checkout_proof_requires_exact_merge_parents(
+    snapshot, sha, monkeypatch, valid, checkout_conclusion
+):
     github = GitHub()
     task = {
         "target_sha": sha,
@@ -528,7 +531,11 @@ async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, mon
             {
                 "id": 2,
                 "conclusion": "success",
-                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
+                "steps": (
+                    [{"name": "Run actions/checkout@v4", "conclusion": checkout_conclusion}]
+                    if checkout_conclusion != "missing"
+                    else []
+                ),
             }
         ]
 
@@ -545,7 +552,7 @@ async def test_ci_checkout_proof_requires_exact_merge_parents(snapshot, sha, mon
         task,
         {"id": 1, "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z", "conclusion": "success"},
     )
-    assert (result is not None) == valid
+    assert (result is not None) == (valid and checkout_conclusion != "failure")
     assert checkout_sha(log, 10) is None
     assert checkout_sha(log.replace("Run actions/checkout@v4", "Run user echo"), 9) is None
 

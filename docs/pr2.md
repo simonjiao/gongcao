@@ -25,9 +25,12 @@ quality.checks、real_checks 是 argv 数组，不通过隐式 shell 执行；�
 控制器 PYTHONPATH。输出仅保留两路各 20KB 尾部并标注截断，记录命令、退出码、时间及隔离结果。
 
 CI 通过 GitHub Actions API 获取，按仓库、目标 SHA、head 分支、pull_request 事件及指定文件匹配，
-选择最新运行；还须从 job 成功的 actions/checkout 步骤证明当前 PR merge ref 的实际 checkout SHA，
+选择最新运行；还须从 job 的 actions/checkout 日志证明当前 PR merge ref 的实际 checkout SHA，
 并通过 GitHub Commit API 核实其父提交恰为当前 base/head。缺少关联信息时等待，不能只凭 head 接纳
 其他 PR 或旧 base 的 CI；pending 等待，失败进入修订，skipped 不能满足必需 workflow。
+通常要求 checkout 步骤成功；步骤列表缺失时，仅允许整体 CI 和该 job 均成功的日志作为证明，
+仍核验 checkout 自身的 merge ref、SHA、提交父节点与 retarget 历史。显式失败步骤不能走此路径，
+失败工作流仍需失败 job 的成功 checkout 步骤，不能借用其他成功 job 或缺失步骤信息。
 base 分支名还通过完整 PR timeline 推断：原始 run.created_at 必须严格晚于最后一次
 base_ref_changed/automatic_base_change_succeeded；不使用 rerun 的新启动时间来替代事件上下文。
 这是结合当前 ref 和权威事件历史的推断；读取失败或时间相等均不通过，需要更新版本的运行。

@@ -196,9 +196,13 @@ class GitHub:
                 "timed_out",
             }:
                 continue
-            if not any(
+            steps = job.get("steps") or []
+            checkout_ok = any(
                 "actions/checkout@" in step["name"] and step["conclusion"] == "success"
-                for step in (job.get("steps") or [])
+                for step in steps
+            )
+            if not checkout_ok and not (
+                not steps and run["conclusion"] == "success" and job["conclusion"] == "success"
             ):
                 continue
             log = await command("gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs")
@@ -226,6 +230,11 @@ class GitHub:
                 "attempt": attempt,
                 "job_id": job["id"],
                 "source": "actions/checkout job log + GitHub commit parents",
+                "checkout_basis": (
+                    "successful checkout step"
+                    if checkout_ok
+                    else "successful job and checkout log; step metadata unavailable"
+                ),
                 "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
             }
             if run.get("conclusion") != "success":
