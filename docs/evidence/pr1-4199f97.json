@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "implementation_sha": "4199f9784fc2ec8f32939544bb16234fd84b8893",
+  "observed_at_utc": "2026-10-24T13:21:54.834332+00:00",
+  "versions": {
+    "gongcao": "0.1.0",
+    "openai-codex": "0.163.0",
+    "openai-codex-cli-bin": "0.163.0",
+    "uv": "0.11.33",
+    "beartype": "0.23.1",
+    "pytest-beartype": "0.3.0"
+  },
+  "github_read": {
+    "url": "https://github.com/simonjiao/gongcao/issues/1",
+    "title": "[MVP] 建立 Gongcao 本地 Agent 调度闭环（状态机、独立上下文、运行监控）",
+    "state": "open",
+    "updated_at": "2026-10-24T12:24:37Z"
+  },
+  "task": {
+    "id": 1,
+    "target_sha": "4199f9784fc2ec8f32939544bb16234fd84b8893",
+    "stage": "pending_development",
+    "state": "queued",
+    "reason": "Analysis artifact recorded; development is queued"
+  },
+  "run": {
+    "id": "d20f8a99dadf4c39bb97978c8bf909e1",
+    "state": "completed",
+    "role": "analyst",
+    "target_sha": "4199f9784fc2ec8f32939544bb16234fd84b8893",
+    "thread_id": "01a16e12-d046-75a3-a13d-d9938f611da8",
+    "context_hash": "ab51be0acb8f158f0464c14a68778db610176d5c7b1349b0b36cf2972bb359b4",
+    "started": 1792848086.905422,
+    "ended": 1792848114.8343318,
+    "evidence_valid": 1
+  },
+  "duration_seconds": 27.929,
+  "isolation_probe": {
+    "host_credentials": "blocked",
+    "host_repository": "blocked",
+    "workspace_writable": false,
+    "external_writes": "blocked",
+    "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+  },
+  "tool_executions": [
+    {
+      "command": "/bin/bash -lc \"pwd; git rev-parse HEAD; rg --files -g 'README.md' -g '*.py' -g '*accept*' -g '*evidence*' -g 'AGENTS.md'\"",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    },
+    {
+      "command": "/bin/bash -lc 'cat README.md docs/acceptance-pr1.md src/gongcao/runner.py src/gongcao/sandbox.py'",
+      "status": "completed",
+      "exitCode": 0,
+      "durationMs": 0
+    }
+  ],
+  "usage": {
+    "last": {
+      "cacheWriteInputTokens": 0,
+      "cachedInputTokens": 17024,
+      "inputTokens": 23069,
+      "outputTokens": 345,
+      "reasoningOutputTokens": 16,
+      "totalTokens": 23414
+    },
+    "modelContextWindow": 475000,
+    "total": {
+      "cacheWriteInputTokens": 0,
+      "cachedInputTokens": 33792,
+      "inputTokens": 57090,
+      "outputTokens": 463,
+      "reasoningOutputTokens": 16,
+      "totalTokens": 57553
+    }
+  },
+  "result": {
+    "conclusion": "ready",
+    "summary": "PR1 foundation is implemented; acceptance at the supplied SHA still requires controller verification of version-bound evidence.",
+    "basis": [
+      "Inspected README.md, docs/acceptance-pr1.md, src/gongcao/runner.py, and src/gongcao/sandbox.py.",
+      "PR1 supports explicit task registration, read-only GitHub synchronization, separate SQLite stages and execution states, independent Codex contexts, Worktrees, structured events, status/result inspection, and cancellation.",
+      "Runner creates the Worktree before agent execution, verifies sandbox access, records failures/cancellation, and leaves stage transitions to the controller. Bubblewrap enforces role-based workspace permissions with real OS access probes.",
+      "Existing acceptance documentation reports 43 passing tests and a successful real read-only Codex run, but binds that evidence to ee7d97bcc25d4a48f0be612a803194862c292431 rather than the supplied target SHA.",
+      "The sandbox's intentionally masked .git prevented independent checkout-SHA verification. No tests, credential access, implementation, or network mutations were performed."
+    ],
+    "target_sha": "4199f9784fc2ec8f32939544bb16234fd84b8893",
+    "next_steps": [
+      "Controller should confirm the checkout and acceptance evidence correspond to the supplied target SHA.",
+      "Verify recorded checks and a real Codex run at that SHA demonstrate stage/result/log queries, actual role and credential isolation, and explicit failure/cancellation records.",
+      "Keep PR2/PR3 capabilities outside this PR1 acceptance decision; this report does not satisfy controller gates."
+    ]
+  },
+  "event_counts": {
+    "started": 1,
+    "isolation_verified": 1,
+    "thread": 1,
+    "sdk_event": 335,
+    "result": 1,
+    "ended": 1
+  },
+  "journal_sha256": "6c6811b01cb83e6d5991bee73464a9877526f4d825ac611e840c344e99e5f139",
+  "logs_follow": {
+    "records": 340,
+    "ended_observed": true,
+    "mode": "replay after completion; live follow exercised in pr1-ee7d97b"
+  },
+  "worktree_clean": true,
+  "local_artifacts": "/tmp/gongcao-pr1-acceptance-4199f97",
+  "automated_checks": {
+    "implementation_sha": "4199f9784fc2ec8f32939544bb16234fd84b8893",
+    "pytest": "43 passed in 16.71s",
+    "ruff": "passed",
+    "format": "passed",
+    "mypy": "passed"
+  },
+  "review": {
+    "standards": "3 findings fixed and re-reviewed; no blocking findings",
+    "spec": "3 findings fixed and re-reviewed; no blocking findings"
+  }
+}
