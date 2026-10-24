@@ -8,8 +8,13 @@
   an agent's report cannot satisfy GitHub review, test, CI, or merge gates.
 - Prove sandbox boundaries with real OS access checks. Do not replace these tests
   with prompt assertions or environment-variable-only checks.
-- PR1 has read-only GitHub access. Review/validation gates and controlled remote writes
-  belong to PR2; leases, concurrency, recovery and automatic diagnosis belong to PR3.
+- The first stage (GitHub PR #2) is merged. The second stage (GitHub PR #4) adds
+  controlled remote writes and exact-SHA quality gates. Agents
+  never receive GitHub credentials; only the controller publishes commits/PRs/review comments.
+  A same-account Agent COMMENT is never a formal GitHub approval. Never auto-merge or publish.
+- Configure checks and required CI workflows for the target repository; do not hard-code
+  Gongcao's tools for other projects. Schema changes require versioned upgrade/restart tests.
+- Leases, scheduling, concurrency and restart recovery belong to the third stage.
 - Issue tracker: GitHub `simonjiao/gongcao`; see `docs/agents/issue-tracker.md`.
 
 ## PowerShell 使用规则

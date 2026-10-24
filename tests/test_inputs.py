@@ -75,7 +75,11 @@ async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):
                 "state": "open",
                 "updated_at": "now",
                 "merged": False,
-                "head": {"sha": "1" * 40, "repo": {"full_name": "fork/demo"}},
+                "head": {
+                    "sha": "1" * 40,
+                    "ref": "gongcao/task-277cd634480e",
+                    "repo": {"full_name": "fork/demo"},
+                },
                 "base": {
                     "sha": "2" * 40,
                     "ref": "release",
@@ -89,6 +93,7 @@ async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):
     assert snapshot["base_sha"] == "2" * 40
     assert snapshot["base_ref"] == "release"
     assert snapshot["base_repository"] == "example/demo"
+    assert snapshot["head_ref"] == "gongcao/task-277cd634480e"
 
 
 async def test_status_inspect_and_cancel_are_local(store, task_id, capsys):

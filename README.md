@@ -5,8 +5,10 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 
 实现计划与验收边界见 [Issue #1](https://github.com/simonjiao/gongcao/issues/1)。
 
-当前交付 **PR1：可运行基础**。支持显式登记、只读同步、Codex 分析/本地开发、
-Worktree 与真实 OS 沙箱隔离，以及状态/日志/取消。GitHub 工作闭环与恢复能力分属 PR2/PR3。
+基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
+当前第二阶段是 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4)。
+支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
+租约、后台调度与重启恢复属于第三阶段。
 
 ## 安装与检查
 
@@ -48,17 +50,27 @@ uv run gongcao cancel 1
 ```
 
 命令返回 JSON；任务编号由 register 返回，示例中的 1 需替换为实际编号。
-run 在前台执行一次当前阶段。可在另一个终端观察日志或取消；无新日志不会触发超时判断，
-只有配置中的绝对执行期限会停止任务。
+run 在前台推进已登记任务，直到外部依赖未满足、人工介入或可合并；不运行后台守护进程。
+它会由控制器提交/推送分支、创建草稿 PR、发布 COMMENT 评审并转为可审查；不会合并或发布。
+可在另一个终端观察日志或取消；没有新日志不代表超时，配置期限约束每次 Agent/检查执行。
 
-分析完成后任务进入 pending_development/queued，可再次 run 启动新的开发会话。
-开发完成后保留本地分支和 Worktree，停在 waiting_dependency，等待 PR2 的远端门禁。
+YAML 的 quality 必须按目标仓库配置：checks 为命令参数列表，ci_workflows 为必须成功的
+GitHub Actions workflow 文件名；需要真实验证时设置 require_real_checks 并提供 real_checks。
+缺少配置会等待环境，不执行 GitHub 写入。示例文件中的 Ruff/mypy/pytest 只适用于 Gongcao。
+检查使用独立 Worktree、没有模型认证的沙箱，不继承 Gongcao 的 Python 导入路径。
+
+每个角色使用独立上下文/线程；审查只读。修订最多 max_revisions 次，超限转人工。
+等待 CI 时可稍后再次 run；只读重新核验当前 SHA 的事实，不重复发布已确认的远端对象。
+同身份 Agent 的 COMMENT 不算 GitHub 正式批准，GitHub 的保护规则仍必须满足。
 GitHub PR head、base SHA/目标分支或请求正文/标题变化会使旧证据失效。
 关闭的对象进入 needs_human，重新打开也不会自动恢复；旧结果不能继续推进。
-PR1 尚无人工恢复命令，核对后可用新的专属 state-dir 显式登记以开始新任务，保留原记录；不要改数据库。
-Issue 的代码基线固定为登记时的本地 HEAD，
-未提交修改不会进入 Agent 上下文。PR 使用 GitHub head SHA。
+尚无重启恢复/人工恢复命令；无法确认写入结果时进入待核对，不重放副作用。不要改数据库绕过状态。
+Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远端默认分支。PR 使用 GitHub head SHA。
+未提交修改不会进入初始上下文；开发内容仅在分配的 Worktree 中产生。
 
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
-请使用专属目录。隔离边界、停止条件和后续能力见 [PR1 说明](docs/pr1.md)。
+请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
+旧 PR1 SQLite 在事务内升级到模式版本 1；新版本数据库会被拒绝打开，不静默降级。
+运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
+验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。

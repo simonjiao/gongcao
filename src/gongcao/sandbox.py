@@ -26,7 +26,7 @@ class Sandbox:
     run_dir: Path
     role: Role
 
-    def prepare(self, config: Config) -> list[str]:
+    def prepare(self, config: Config, *, authentication: bool = True) -> list[str]:
         if sys.platform != "linux" or shutil.which("bwrap") is None:
             raise IsolationError("Linux and Bubblewrap are required; no unsandboxed fallback")
         for name in ("HTTPS_PROXY", "HTTP_PROXY"):
@@ -51,7 +51,9 @@ class Sandbox:
         codex_home.mkdir(parents=True, mode=0o700)
         # A dedicated copy of *model* authentication, never host configuration/skills/MCP or gh.
         auth: dict[str, Any]
-        if config.auth_file.is_file():
+        if not authentication:
+            auth = {}
+        elif config.auth_file.is_file():
             raw = json.loads(config.auth_file.read_text())
             auth = {
                 key: raw[key]

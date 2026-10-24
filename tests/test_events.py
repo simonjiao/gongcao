@@ -4,6 +4,13 @@ from gongcao.events import Journal, Redactor
 from gongcao.model import Role
 
 
+def test_redaction_preserves_git_task_refs_but_masks_actual_key_tokens():
+    branch = "gongcao/task-277cd634480e"
+    redactor = Redactor()
+    assert redactor.text(branch) == branch
+    assert redactor.text("key=sk-proj-actualCredential123456") == "key=[REDACTED]"
+
+
 def test_redaction_preserves_usage_counts():
     clean = Redactor(["unique-model-credential"])
     data = clean.clean(

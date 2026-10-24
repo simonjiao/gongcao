@@ -12,8 +12,8 @@ from typing import Any
 from .config import Config
 from .github import GitHub, Target, command
 from .model import State
-from .runner import Runner
 from .store import Store
+from .workflow import Workflow
 from .workspace import repository
 
 
@@ -73,7 +73,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
     elif args.command == "sync":
         selected = [store.task(args.task)] if args.task else store.tasks()
         for task in selected:
-            snapshot = await github.snapshot(Target.parse(task["url"]))
+            snapshot = await github.task_snapshot(task)
             if snapshot.get("head_sha") != task["snapshot"].get("head_sha"):
                 await command("git", "fetch", "origin", snapshot["head_sha"], cwd=task["repo_path"])
             store.sync(task["id"], snapshot)
@@ -100,6 +100,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
     elif args.command == "inspect":
         task = store.task(args.task)
         task["runs"] = store.runs(args.task)
+        task["evidence"] = store.evidence(args.task)
         output(task)
     elif args.command == "cancel":
         store.cancel(args.task)
@@ -113,12 +114,14 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, current.cancel)
         try:
-            run_id = await Runner(store, Config.load(args.config), github).run(args.task)
+            run_ids = await Workflow(store, Config.load(args.config), github).run(args.task)
         finally:
             loop.remove_signal_handler(signal.SIGTERM)
         task = store.task(args.task)
-        output({"run_id": run_id, "task": task})
-        return 0 if task["state"] in {State.QUEUED, State.WAITING_DEPENDENCY} else 1
+        output({"run_ids": run_ids, "task": task})
+        return (
+            0 if task["state"] in {State.QUEUED, State.WAITING_DEPENDENCY, State.COMPLETED} else 1
+        )
     return 0
 
 

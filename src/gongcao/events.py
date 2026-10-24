@@ -8,7 +8,7 @@ from typing import Any
 from .store import Store
 
 TOKEN = re.compile(
-    r"(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}"
+    r"(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{12,}"
     r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]+=*)"
 )

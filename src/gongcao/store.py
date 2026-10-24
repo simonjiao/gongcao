@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .model import Role, Stage, State
+from .model import VERSION_FIELDS, Role, Stage, State
 
 
 class Store:
@@ -19,6 +19,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 1:
+            self.db.close()
+            raise ValueError("Database schema is newer than this Gongcao version")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, repo_path TEXT NOT NULL,
@@ -40,6 +43,28 @@ class Store:
                 at REAL NOT NULL, kind TEXT NOT NULL, summary TEXT NOT NULL
             );
         """)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                self.db.execute("ALTER TABLE tasks ADD COLUMN pr_number INTEGER")
+                self.db.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 0"
+                )
+                self.db.execute(
+                    "UPDATE tasks SET pr_number=json_extract(snapshot,'$.number') "
+                    "WHERE json_extract(snapshot,'$.kind')='pull'"
+                )
+                self.db.execute(
+                    "CREATE TABLE artifacts (id INTEGER PRIMARY KEY, task_id INTEGER "
+                    "NOT NULL REFERENCES tasks(id), sha TEXT NOT NULL, kind TEXT NOT NULL, "
+                    "policy TEXT NOT NULL, data TEXT NOT NULL, valid INTEGER NOT NULL DEFAULT 1)"
+                )
+                self.db.execute(
+                    "CREATE TABLE operations (id TEXT PRIMARY KEY, task_id INTEGER NOT NULL "
+                    "REFERENCES tasks(id), sha TEXT NOT NULL, kind TEXT NOT NULL, "
+                    "payload TEXT NOT NULL, state TEXT NOT NULL, response TEXT)"
+                )
+                self.db.execute("PRAGMA user_version=1")
 
     def close(self) -> None:
         self.db.close()
@@ -68,8 +93,8 @@ class Store:
         with self.db:
             self.db.execute(
                 "INSERT OR IGNORE INTO tasks "
-                "(url,repo_path,stage,state,target_sha,snapshot,reason,updated) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "(url,repo_path,stage,state,target_sha,snapshot,reason,updated,pr_number) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     url,
                     str(repo_path.resolve()),
@@ -79,6 +104,7 @@ class Store:
                     json.dumps(snapshot),
                     "" if is_open else "GitHub object is closed; manual handling required",
                     time.time(),
+                    snapshot["number"] if snapshot.get("kind") == "pull" else None,
                 ),
             )
         row = self.db.execute("SELECT id,repo_path FROM tasks WHERE url=?", (url,)).fetchone()
@@ -93,27 +119,20 @@ class Store:
             task = self.task(task_id)
             sha = snapshot.get("head_sha") or task["target_sha"]
             version_changed = sha != task["target_sha"] or any(
-                snapshot.get(key) != task["snapshot"].get(key)
-                for key in (
-                    "title",
-                    "body",
-                    "base_sha",
-                    "base_ref",
-                    "base_repository",
-                    "head_repository",
-                )
+                snapshot.get(key) != task["snapshot"].get(key) for key in VERSION_FIELDS
             )
             lifecycle_changed = snapshot.get("state") != task["snapshot"].get("state")
             stage, state, reason = task["stage"], task["state"], task["reason"]
             if version_changed or lifecycle_changed:
                 self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,))
+                self.db.execute("UPDATE artifacts SET valid=0 WHERE task_id=?", (task_id,))
             if version_changed:
                 stage = Stage.ANALYSIS
                 active = self.db.execute(
                     "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
                 ).fetchone()
                 # Human intervention cannot be cleared by a later remote content edit.
-                if state != State.HUMAN:
+                if state not in {State.HUMAN, State.RECONCILE}:
                     state = State.RECONCILE if active else State.QUEUED
                     reason = "GitHub head, base or request changed; previous evidence is invalid"
             if snapshot.get("state") != "open":
@@ -124,6 +143,12 @@ class Store:
                 reason = "GitHub object reopened; manual handling required before a new run"
             if task["cancel_requested"]:
                 state, reason = State.CANCELLED, "Cancelled by user"
+            elif snapshot.get("merged"):
+                stage, state, reason = (
+                    Stage.MERGED,
+                    State.COMPLETED,
+                    "GitHub confirms the PR was merged",
+                )
             self.db.execute(
                 "UPDATE tasks SET stage=?,state=?,reason=?,snapshot=?,target_sha=?,updated=? "
                 "WHERE id=?",
@@ -146,9 +171,15 @@ class Store:
                 raise ValueError("Closed or cancelled tasks cannot run")
             if task["state"] not in {State.QUEUED, State.FAILED, State.WAITING_ENVIRONMENT}:
                 raise ValueError(f"Task cannot run in state {task['state']}")
-            expected = {Stage.ANALYSIS: Role.ANALYST, Stage.DEVELOPMENT: Role.DEVELOPER}
+            expected = {
+                Stage.ANALYSIS: Role.ANALYST,
+                Stage.DEVELOPMENT: Role.DEVELOPER,
+                Stage.REVISION: Role.DEVELOPER,
+                Stage.REVIEW: Role.REVIEWER,
+                Stage.VALIDATION: Role.VALIDATOR,
+            }
             if expected.get(Stage(task["stage"])) != role:
-                raise ValueError("The requested role does not match the current PR1 stage")
+                raise ValueError("The requested role does not match the current stage")
             run_id = uuid.uuid4().hex
             self.db.execute(
                 "INSERT INTO runs (id,task_id,role,state,target_sha,owner_pid,started) "
@@ -198,6 +229,9 @@ class Store:
                 run_state = task_state = State.CANCELLED
                 stage = Stage(task["stage"])
                 reason = "Cancelled by user"
+            elif task["snapshot"].get("merged"):
+                stage, task_state = Stage.MERGED, State.COMPLETED
+                reason = "GitHub confirms the PR was merged"
             elif task["snapshot"].get("state") != "open" or task["state"] == State.HUMAN:
                 stage, task_state = Stage(task["stage"]), State.HUMAN
                 reason = task["reason"] or "GitHub object is closed; manual handling required"
@@ -235,3 +269,137 @@ class Store:
                 "(SELECT id FROM events WHERE run_id=? ORDER BY id DESC LIMIT 1000)",
                 (run_id, run_id),
             )
+
+    def guard(self, expected: dict[str, Any]) -> dict[str, Any]:
+        task = self.task(expected["id"])
+        if task["stage"] == Stage.MERGED:
+            raise ValueError("Merged tasks are terminal")
+        if task["cancel_requested"] or task["state"] in {
+            State.CANCELLED,
+            State.RECONCILE,
+            State.HUMAN,
+        }:
+            raise ValueError("Task is cancelled or needs manual handling")
+        if any(task[key] != expected[key] for key in ("target_sha", "snapshot", "stage")):
+            raise ValueError("Task changed; evidence cannot be applied")
+        return task
+
+    def transition(
+        self,
+        expected: dict[str, Any],
+        stage: Stage,
+        state: State,
+        reason: str,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        pr_number: int | None = None,
+        revision: bool = False,
+        invalidate: bool = False,
+    ) -> None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            task = self.guard(expected)
+            if self.db.execute(
+                "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task["id"], State.RUNNING)
+            ).fetchone():
+                raise ValueError("Task still has an active agent")
+            new = snapshot if snapshot is not None else task["snapshot"]
+            sha = new.get("head_sha") or task["target_sha"]
+            if sha != task["target_sha"] or invalidate:
+                self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task["id"],))
+                self.db.execute("UPDATE artifacts SET valid=0 WHERE task_id=?", (task["id"],))
+            self.db.execute(
+                "UPDATE tasks SET stage=?,state=?,reason=?,snapshot=?,target_sha=?,"
+                "pr_number=COALESCE(?,pr_number),revision_count=revision_count+?,"
+                "updated=? WHERE id=?",
+                (
+                    stage,
+                    state,
+                    reason,
+                    json.dumps(new),
+                    sha,
+                    pr_number,
+                    int(revision),
+                    time.time(),
+                    task["id"],
+                ),
+            )
+
+    def artifact(self, task_id: int, kind: str, policy: str) -> dict[str, Any] | None:
+        task = self.task(task_id)
+        row = self.db.execute(
+            "SELECT data FROM artifacts WHERE task_id=? AND sha=? AND kind=? "
+            "AND policy=? AND valid=1 ORDER BY id DESC LIMIT 1",
+            (task_id, task["target_sha"], kind, policy),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record(
+        self, expected: dict[str, Any], kind: str, policy: str, data: dict[str, Any]
+    ) -> None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.guard(expected)
+            self.db.execute(
+                "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
+                (expected["id"], expected["target_sha"], kind, policy, json.dumps(data)),
+            )
+
+    def operation(self, key: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM operations WHERE id=?", (key,)).fetchone()
+        return dict(row) if row else None
+
+    def intent(self, expected: dict[str, Any], key: str, kind: str, payload: str) -> bool:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.guard(expected)
+            row = self.operation(key)
+            if row:
+                if row["payload"] != payload or row["sha"] != expected["target_sha"]:
+                    raise ValueError("Operation identity conflicts with existing intent")
+                return False
+            self.db.execute(
+                "INSERT INTO operations(id,task_id,sha,kind,payload,state) VALUES(?,?,?,?,?,?)",
+                (key, expected["id"], expected["target_sha"], kind, payload, "pending"),
+            )
+            return True
+
+    def operation_result(self, key: str, state: str, response: dict[str, Any] | None) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE operations SET state=?,response=? WHERE id=?",
+                (state, json.dumps(response) if response is not None else None, key),
+            )
+
+    def halt(self, task_id: int, state: State, reason: str) -> None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            task = self.task(task_id)
+            if task["cancel_requested"]:
+                state = State.CANCELLED
+            self.db.execute(
+                "UPDATE tasks SET state=?,reason=?,updated=? WHERE id=?",
+                (state, reason, time.time(), task_id),
+            )
+
+    def evidence(self, task_id: int) -> dict[str, Any]:
+        artifacts = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM artifacts WHERE task_id=? ORDER BY id", (task_id,)
+            )
+        ]
+        operations = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM operations WHERE task_id=? ORDER BY rowid", (task_id,)
+            )
+        ]
+        for artifact in artifacts:
+            artifact["data"] = json.loads(artifact["data"])
+        for operation in operations:
+            operation["payload"] = json.loads(operation["payload"])
+            operation["response"] = (
+                json.loads(operation["response"]) if operation["response"] else None
+            )
+        return {"artifacts": artifacts, "operations": operations}
