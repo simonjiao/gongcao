@@ -150,6 +150,8 @@ def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -
         latest = max(candidates, key=lambda run: (run["id"], run.get("run_attempt", 1)))
         if latest["status"] != "completed":
             return State.WAITING_DEPENDENCY, f"CI {name} is {latest['status']}"
+        if latest["conclusion"] not in {"success", "failure", "timed_out"}:
+            return State.WAITING_DEPENDENCY, f"CI {name} concluded {latest['conclusion']}"
         proof = latest.get("target_proof") or {}
         if any(
             proof.get(key) != value

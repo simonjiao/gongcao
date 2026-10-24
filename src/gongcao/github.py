@@ -168,6 +168,8 @@ class GitHub:
     async def checkout_proof(
         self, task: dict[str, Any], run: dict[str, Any]
     ) -> dict[str, Any] | None:
+        if run.get("conclusion") not in {"success", "failure", "timed_out"}:
+            return None
         repository = task["snapshot"]["repository"]
         attempt = run.get("run_attempt", 1)
         timeline = await self.pages(

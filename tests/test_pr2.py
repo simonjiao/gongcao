@@ -408,6 +408,8 @@ def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot)
     facts["workflows"][0]["conclusion"] = "failure"
     facts["workflows"][0]["target_proof"]["failure_tail"] = "Confirmed test failure"
     assert ci_gate(task, facts, ["ci.yml"])[0] == State.FAILED
+    facts["workflows"][0]["conclusion"] = "cancelled"
+    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
 
 
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
@@ -601,7 +603,10 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
     assert "--slurp" not in calls[0]
 
 
-async def test_failed_ci_carries_bound_and_redacted_failure_log(snapshot, sha, monkeypatch):
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+async def test_failed_ci_carries_bound_and_redacted_failure_log(
+    snapshot, sha, monkeypatch, conclusion
+):
     github = GitHub()
     task = {
         "pr_number": 9,
@@ -637,8 +642,11 @@ async def test_failed_ci_carries_bound_and_redacted_failure_log(snapshot, sha, m
     monkeypatch.setattr("gongcao.github.command", logs)
     proof = await github.checkout_proof(
         task,
-        {"id": 1, "run_attempt": 1, "conclusion": "failure", "created_at": "2026-01-01T00:00:00Z"},
+        {"id": 1, "run_attempt": 1, "conclusion": conclusion, "created_at": "2026-01-01T00:00:00Z"},
     )
+    if conclusion == "cancelled":
+        assert proof is None
+        return
     assert "ModuleNotFoundError" in proof["failure_tail"]
     assert "PRIVATESEGMENT" not in proof["failure_tail"]
     assert proof["pr_number"] == 9 and proof["head_sha"] == sha
