@@ -4,11 +4,21 @@ max_log_bytes: 2000000
 max_revisions: 3
 # These commands describe Gongcao itself. Replace them for the registered target repository.
 quality:
+  # Gongcao's tests start nested sandboxes. Keep their HOME/runtime outside /workspace;
+  # retain wheels under the ignored .venv directory between these isolated commands.
   checks:
-    - [uv, run, --locked, ruff, check, .]
-    - [uv, run, --locked, ruff, format, --check, .]
-    - [uv, run, --locked, mypy]
-    - [uv, run, --locked, pytest, -q]
+    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
+       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
+       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, check, .]
+    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
+       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
+       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, format, --check, .]
+    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
+       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
+       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", mypy]
+    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
+       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
+       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", pytest, -q]
   ci_workflows: [ci.yml]
   require_real_checks: false
   real_checks: []

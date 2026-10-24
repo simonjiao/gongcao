@@ -8,7 +8,7 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
 当前第二阶段是 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4)。
 支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
-租约、后台调度与重启恢复属于 PR3。
+租约、后台调度与重启恢复属于第三阶段。
 
 ## 安装与检查
 
@@ -72,4 +72,5 @@ Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
 请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
 旧 PR1 SQLite 在事务内升级到模式版本 1；新版本数据库会被拒绝打开，不静默降级。
-运行边界见 [PR1 说明](docs/pr1.md) 和 [PR2 说明](docs/pr2.md)。
+运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
+验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。
