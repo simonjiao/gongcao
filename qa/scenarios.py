@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 1
+VERSION = 2
 SCENARIOS = ("smoke", "loop", "recover", "cancel")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -21,8 +21,11 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
         "Execute /usr/bin/sleep 20 after your first inspection command, for the cancel probe. "
         "Return ready and the exact context target_sha. No long tests or credential access.",
         "developer": scope + requirement + " On initial development (confirmed_findings is null) "
-        "implement the explicitly authorized missing-lower-bound defect. On revision "
-        "(confirmed_findings is provided), implement the complete contract. "
+        "implement the explicitly authorized missing-lower-bound defect. "
+        "For technical check failures (findings with commands or ci), fix only the reported "
+        "technical problem and preserve the current algorithm. Implement the complete contract "
+        "after independent reviewer findings (conclusion=revise with basis) "
+        "reject the lower bound. "
         "Keep imports at the top, Python style clean, and run the relevant stdlib unittest: "
         "uv run --offline --no-project --python /usr/bin/python3.12 python -B -m unittest "
         f"discover -s tests -p test_{module}.py -v. "

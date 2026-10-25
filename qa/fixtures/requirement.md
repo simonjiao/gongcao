@@ -11,7 +11,9 @@ in-range, 100 and greater-than-100 cases in the final revision.
 This is an explicitly authorized QA fault exercise: the first developer round
 must deliberately implement only `min(value, 100)`, with positive/upper-bound
 tests. The independent reviewer must find the missing lower bound from the
-actual requirement and diff. On revision implement and test the full contract.
+actual requirement and diff. After that review, implement and test the full contract.
+Before that review, fix technical check failures without removing the deliberate
+algorithm defect; a format-only correction does not satisfy this exercise.
 Do not change any other files or project configuration. Do not commit, push,
 create GitHub objects, access credentials, merge or release. The controller
 alone publishes the two fixture files to a dedicated unmerged QA PR.

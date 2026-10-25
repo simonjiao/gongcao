@@ -229,7 +229,7 @@ async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
     }
     facts = await fixture_github.gates(task)
     assert evaluate(task, policy, facts)["revision_count"] == 1
-    for failure in ("stale", "old", "real", "ci", "pending", "ready", "argv"):
+    for failure in ("stale", "old", "real", "ci", "pending", "ready", "argv", "no_reject"):
         changed, remote = copy.deepcopy(task), copy.deepcopy(facts)
         if failure == "stale":
             changed["target_sha"] = "0" * 40
@@ -247,6 +247,12 @@ async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
             for artifact in changed["evidence"]["artifacts"]:
                 if artifact["kind"] == "checks" and artifact["valid"]:
                     artifact["data"]["commands"][0]["argv"] = ["true"]
+        elif failure == "no_reject":
+            for role in changed["runs"]:
+                if role["role"] == "reviewer":
+                    result = json.loads(role["result"])
+                    result["conclusion"] = "ready"
+                    role["result"] = json.dumps(result)
         else:
             changed["stage"] = "pending_validation"
         with pytest.raises((ValueError, Unconfirmed)):

@@ -69,6 +69,8 @@ Runs queue. `--repeat N` repeats each listed scenario with new owned resources;
   revision, old-SHA invalidation, all four project checks, real boundary checks,
   exact-SHA CI, validator and human-merge readiness. Repeating the completed native
   task must create no sessions, operations or review comments.
+  Technical-only corrections preserve the staged algorithm until the independent
+  reviewer rejects it; a format-only revision cannot satisfy the review exercise.
 - `recover`: the same loop, with a scoped SIGKILL after a real successful review
   COMMENT is observed but before its local acknowledgement. Native `serve --once`
   reconciles the pending intent and completes using fresh evidence as required.
