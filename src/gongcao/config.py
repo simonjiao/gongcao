@@ -21,6 +21,41 @@ PROMPTS = {
 }
 
 
+def _load_yaml(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        raw: Any = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML configuration: {exc}") from exc
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or raw.keys() - {
+        "model",
+        "timeout_seconds",
+        "max_log_bytes",
+        "auth_file",
+        "roles",
+        "quality",
+        "max_revisions",
+        "scheduler",
+        "qa",
+    }:
+        raise ValueError("Invalid configuration keys")
+    return raw
+
+
+def _jobs(raw: dict[str, Any], section: str, default: int, maximum: int | None = None) -> int:
+    settings = raw.get(section, {})
+    if not isinstance(settings, dict) or settings.keys() - {"jobs"}:
+        raise ValueError(f"{section} must be a mapping containing only jobs")
+    value = settings.get("jobs", default)
+    if type(value) is not int or value < 1 or (maximum is not None and value > maximum):
+        bound = f"an integer between 1 and {maximum}" if maximum else "a positive integer"
+        raise ValueError(f"{section}.jobs must be {bound}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     model: str | None = None
@@ -33,6 +68,8 @@ class Config:
     ci_workflows: list[str] = field(default_factory=list)
     require_real_checks: bool = False
     max_revisions: int = 3
+    scheduler_jobs: int = 1
+    qa_jobs: int = 2
 
     @property
     def policy_hash(self) -> str:
@@ -52,19 +89,7 @@ class Config:
 
     @classmethod
     def load(cls, path: Path | None) -> "Config":
-        if path is None:
-            return cls()
-        raw: Any = yaml.safe_load(path.read_text()) or {}
-        if not isinstance(raw, dict) or raw.keys() - {
-            "model",
-            "timeout_seconds",
-            "max_log_bytes",
-            "auth_file",
-            "roles",
-            "quality",
-            "max_revisions",
-        }:
-            raise ValueError("Invalid configuration keys")
+        raw = _load_yaml(path)
         prompts = dict(PROMPTS)
         roles = raw.get("roles", {})
         if not isinstance(roles, dict):
@@ -121,4 +146,11 @@ class Config:
             workflows,
             real,
             revisions,
+            _jobs(raw, "scheduler", 1, 3),
+            _jobs(raw, "qa", 2),
         )
+
+    @classmethod
+    def load_qa_jobs(cls, path: Path | None) -> int:
+        """Read only QA parallelism; scene quality/role policies are generated separately."""
+        return _jobs(_load_yaml(path), "qa", 2)

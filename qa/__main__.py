@@ -29,7 +29,8 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("scenarios", nargs="+", choices=SCENARIOS)
     run.add_argument("--repeat", type=int, default=1)
-    run.add_argument("--jobs", type=int, default=2)
+    run.add_argument("--config", type=Path, help="YAML configuration (only qa.jobs is used)")
+    run.add_argument("--jobs", type=int, help="Parallel Runs (YAML or 2; positive integer)")
     run.add_argument("--real", action="store_true")
     run.add_argument("--repo")
     run.add_argument("--model")
@@ -54,10 +55,14 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "run":
         if args.repeat < 1:
             raise ValueError("--repeat must be positive")
+        configured_jobs = Config.load_qa_jobs(args.config)
+        jobs = args.jobs if args.jobs is not None else configured_jobs
+        if jobs < 1:
+            raise ValueError("--jobs must be a positive integer")
         return await batch(
             args.data_dir,
             args.scenarios * args.repeat,
-            jobs=args.jobs,
+            jobs=jobs,
             real=args.real,
             repository=args.repo.lower() if args.repo else None,
             model=args.model,

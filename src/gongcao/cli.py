@@ -170,9 +170,9 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         loop.add_signal_handler(signal.SIGTERM, current.cancel)
         try:
             if args.command == "serve":
-                await Scheduler(store, Config.load(args.config), github, args.concurrency).serve(
-                    once=args.once, poll=args.poll
-                )
+                config = Config.load(args.config)
+                jobs = args.jobs if args.jobs is not None else config.scheduler_jobs
+                await Scheduler(store, config, github, jobs).serve(once=args.once, poll=args.poll)
                 output(store.tasks())
                 return 0
             run_ids = await Workflow(store, Config.load(args.config), github).run(args.task)
@@ -204,8 +204,8 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--repo", type=Path, default=Path.cwd())
     serve = commands.add_parser("serve", help="Poll registered tasks with bounded concurrency")
     serve.add_argument("--config", type=Path)
-    serve.add_argument("--concurrency", type=int, choices=(1, 2, 3), default=1)
-    serve.add_argument("--poll", type=float, default=5)
+    serve.add_argument("--jobs", type=int, choices=(1, 2, 3), help="Parallel tasks (YAML or 1)")
+    serve.add_argument("--poll", type=float, default=5.0)
     serve.add_argument("--once", action="store_true")
     for name in (
         "sync",

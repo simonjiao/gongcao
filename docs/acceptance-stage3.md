@@ -52,7 +52,8 @@ Spec：3 项发现全部修复并复核，剩余 0。重点为逃逸后代清理
 其中 pytest 为 120 passed、9 个 subtests，39.65 秒；必要真实检查的八个边界输入全部通过。
 
 第二次故障发生在 COMMENT 的 HTTP 写入已经成功且读取确认、SQLite intent 尚为 pending 时。
-`serve --once --concurrency 2` 启动后自动只读对账，将同一 intent 记为 succeeded；前后 GitHub
+`serve --once --concurrency 2`（当时参数；当前命令使用 `serve --once --jobs 2`）
+启动后自动只读对账，将同一 intent 记为 succeeded；前后 GitHub
 评审 ID 和正文完全一致，没有重复发布该评审。完成独立验证后再次达到 mergeable / completed。
 最终七项受控操作全部成功，重复轮询没有新增模型运行或远端操作。
 

@@ -2,6 +2,11 @@
 timeout_seconds: 900
 max_log_bytes: 2000000
 max_revisions: 3
+# Independent task limits; an explicit CLI --jobs overrides the corresponding value.
+scheduler:
+  jobs: 2  # 1-3; defaults to 1 when omitted.
+qa:
+  jobs: 2  # Positive integer; defaults to 2 when omitted.
 # These commands describe Gongcao itself. Replace them for the registered target repository.
 quality:
   # Gongcao's tests start nested sandboxes. Keep their HOME/runtime outside /workspace;
