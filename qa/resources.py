@@ -1,5 +1,6 @@
 """Run-owned GitHub resources: persist intent, observe, and never replay an unknown write."""
 
+import asyncio
 import hashlib
 import json
 import shutil
@@ -7,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode
 
+from gongcao.events import Redactor
 from gongcao.github import GitHub, Target, command
 from gongcao.workspace import repository as validate_repository
 
@@ -62,7 +64,7 @@ async def action(
                 cwd=str(run.root / "source"),
             )
         else:
-            await command(
+            response = await command(
                 "gh",
                 "api",
                 "--method",
@@ -72,13 +74,26 @@ async def action(
                 "-",
                 input_data=json.dumps(payload),
             )
-    except (OSError, RuntimeError, TimeoutError):
+            if key == "create-issue":
+                row = json.loads(response)
+                actions[key]["response_hint"] = {"number": row["number"]}
+                run.save()
+    except (OSError, RuntimeError, TimeoutError) as exc:
         # The request might have reached GitHub. Only a read can confirm its result.
-        pass
-    try:
-        observed = await observe()
-    except (OSError, RuntimeError, TimeoutError):
-        observed = None
+        actions[key]["write_error"] = Redactor().text(f"{type(exc).__name__}: {exc}")
+        run.save()
+    # GitHub list endpoints may lag a successful creation. Retry only observations,
+    # never the write, and keep a returned issue number as an untrusted lookup hint.
+    observed = None
+    for delay in (0, 0.5, 1, 2):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            observed = await observe()
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            actions[key]["observation_error"] = Redactor().text(str(exc))
+        if observed is not None:
+            break
     if observed is None:
         actions[key]["state"] = "unknown"
         run.save()
@@ -96,10 +111,22 @@ async def create_issue(run: Run, requirement: str, github: GitHub) -> dict[str, 
     }
 
     async def observe() -> Any:
-        query = urlencode({"state": "all", "creator": run.value["github_login"], "per_page": 100})
-        rows = await github.pages(f"repos/{repository}/issues?{query}")
+        hint = run.value["actions"].get("create-issue", {}).get("response_hint")
+        if hint:
+            row = await optional(github, f"repos/{repository}/issues/{int(hint['number'])}")
+            rows = [row] if row else []
+        else:
+            query = urlencode(
+                {"state": "all", "creator": run.value["github_login"], "per_page": 100}
+            )
+            rows = await github.pages(f"repos/{repository}/issues?{query}")
         matches = [
-            r for r in rows if r.get("body") == payload["body"] and r["title"] == payload["title"]
+            r
+            for r in rows
+            if r.get("body") == payload["body"]
+            and r["title"] == payload["title"]
+            and r.get("user", {}).get("login") == run.value["github_login"]
+            and "pull_request" not in r
         ]
         if len(matches) > 1:
             raise Unconfirmed("Duplicate QA issue markers; manual reconciliation required")

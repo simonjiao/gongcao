@@ -17,7 +17,7 @@ from gongcao.store import Store
 from gongcao.workflow import Workflow
 from qa.evidence import evaluate, probe, verify_archived, verify_batch, verify_recovery
 from qa.ledger import Run, digest, write_json
-from qa.resources import Unconfirmed, action, cleanup
+from qa.resources import Unconfirmed, action, cleanup, create_issue
 from qa.runner import batch, execute, model_activity, verify_implementation
 
 
@@ -99,6 +99,36 @@ async def test_confirmed_cleanup_drift_is_not_replayed_or_reported_clean(tmp_pat
             reopened,
         )
     assert not writes and run.value["actions"]["close-issue"]["state"] == "unknown"
+
+
+async def test_issue_confirmation_uses_verified_response_hint_when_list_lags(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+    posted = []
+    reads = []
+
+    class Remote(GitHub):
+        async def pages(self, path, field=None):
+            return []  # Cached/stale issue listing even after a successful POST.
+
+        async def read(self, path):
+            reads.append(path)
+            if len(reads) == 1:
+                raise RuntimeError("HTTP 404")
+            return {
+                **posted[0],
+                "number": 41,
+                "html_url": "https://github.com/example/demo/issues/41",
+                "user": {"login": "qa"},
+            }
+
+    async def mutate(*args, **kwargs):
+        posted.append(json.loads(kwargs["input_data"]))
+        return json.dumps({"number": 41})
+
+    monkeypatch.setattr("qa.resources.command", mutate)
+    issue = await create_issue(run, "versioned requirement", Remote())
+    assert issue["number"] == 41 and len(posted) == 1 and len(reads) == 2
+    assert run.value["actions"]["create-issue"]["state"] == "confirmed"
 
 
 @pytest.mark.parametrize("foreign", ["issue", "branch", "task", "unknown", "active"])
