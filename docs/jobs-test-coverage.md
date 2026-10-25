@@ -16,7 +16,7 @@
 `tests/test_jobs.py` 现有 **22 个内部用例 + 3 条离线 E2E 路径**：
 
 1. QA 默认/YAML/覆盖 → 3 个批次、各 3 个 smoke Run → verify-batch → 篡改证据被拒绝。
-2. 正式默认/YAML/覆盖 → 实际 serve 进程、SQLite 和既有调度器 → 1–3 并发及排队 → 关闭目标阻断 Agent。
+2. 正式默认/YAML/覆盖 → 实际 serve 进程、SQLite 和既有调度器 → 释放屏障前由实际 status 核验活动租约数及控制器 PID → 1–3 并发及排队 → 关闭目标阻断 Agent。
 3. 两 CLI 的非法配置 → 明确错误和退出码 → 无 GH API 请求、无正式任务、无 QA 批次。
 
 三个 E2E 测试共用一次本地干净 clone，使用现有命令入口，没有新增测试框架。

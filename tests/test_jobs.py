@@ -239,6 +239,10 @@ def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(checkout, tmp_path):
                 ):
                     time.sleep(0.01)
                 assert len(events(gate)) == jobs  # Others cannot read until a slot releases.
+                status = run_cli(checkout, env, GONGCAO, "--state-dir", str(state), "status")
+                occupied = [t for t in status if t["runtime"]["lease"] is not None]
+                assert len(status) == 4 and len(occupied) == jobs
+                assert all(t["runtime"]["lease"]["pid"] == process.pid for t in occupied)
             finally:
                 (gate / "release").touch()
                 try:
