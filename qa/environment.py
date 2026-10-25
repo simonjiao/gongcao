@@ -1,4 +1,4 @@
-"""Check capabilities without importing host credentials into a sandbox or a report."""
+"""Sandbox capability checks and a trusted controller account-metadata probe."""
 
 import asyncio
 import importlib.metadata
@@ -60,14 +60,21 @@ async def check(*, real: bool = False, repository: str | None = None) -> dict[st
         }
         result["github_login"] = (await github.read("user"))["login"]
         result["model_authorized"] = await model_authorized()
+        result["model_authorization_probe"] = {
+            "scope": "trusted_controller",
+            "environment": "allowlisted",
+            "filesystem_isolated": False,
+        }
         if not result["model_authorized"]:
             raise ValueError("Codex account is unavailable; log in before real QA")
     return result
 
 
 async def model_authorized() -> bool:
+    """Read account metadata on the trusted host; this is not an Agent sandbox probe."""
     # The SDK merges its environment with os.environ. Probe in a separate process
-    # with a whitelist so GitHub/SSH credentials never reach the SDK app-server.
+    # with a whitelist to remove GitHub/SSH environment variables. HOME/CODEX_HOME
+    # retain host filesystem access for normal model authorization; no tools/turns run.
     script = """
 import asyncio
 from openai_codex import AsyncCodex, CodexConfig

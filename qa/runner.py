@@ -22,8 +22,8 @@ from gongcao.store import Store
 from . import NATIVE_MODULE
 from .environment import check
 from .evidence import command_activity, require, verify_live
-from .ledger import Run, digest, write_json
-from .resources import cleanup, create_issue, settled
+from .ledger import Run, RunCancelled, digest, write_json
+from .resources import Unconfirmed, cleanup, create_issue, settled
 from .scenarios import VERSION, fixture, version_digest
 
 
@@ -41,6 +41,9 @@ def inspect(run: Run) -> dict[str, Any]:
 
 
 async def core(run: Run, *args: str, fault: bool = False) -> int:
+    executing = args[0] in {"run", "serve"}
+    if executing:
+        run.check_cancelled()
     await verify_implementation(run)
     name = uuid.uuid4().hex
     argv = [
@@ -62,9 +65,23 @@ async def core(run: Run, *args: str, fault: bool = False) -> int:
         start_new_session=True,
     )
     started = time.time()
+    pending = asyncio.create_task(process.communicate())
+    cancel_sent = False
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 1800)
+        async with asyncio.timeout(1800):
+            while not pending.done():
+                if executing and not cancel_sent and (run.root / "cancel-requested").exists():
+                    require(
+                        await core(run, "cancel", str(run.value["task_id"])) == 0,
+                        "Native cancel failed",
+                    )
+                    run.event("cancel-requested", real_model_command_seen=model_activity(run))
+                    cancel_sent = True
+                await asyncio.wait({pending}, timeout=0.2)
+            stdout, stderr = pending.result()
     finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
         await stop(process)
     write_json(
         run.root / f"command-{name}.json",
@@ -131,13 +148,7 @@ async def drive(
                 for peer in peers
             )
             if not cancelled and (
-                (run.root / "cancel-requested").exists()
-                or (
-                    cancel_probe
-                    and task["state"] == "running"
-                    and model_activity(run)
-                    and peer_active
-                )
+                cancel_probe and task["state"] == "running" and model_activity(run) and peer_active
             ):
                 require(await core(run, "cancel", task_id) == 0, "Native cancel failed")
                 run.event("cancel-requested", real_model_command_seen=model_activity(run))
@@ -151,6 +162,7 @@ async def drive(
 
 
 async def prepare(run: Run, github: GitHub, model: str | None) -> None:
+    run.check_cancelled()
     requirement, config = fixture(run.id, model)
     config_path = run.root / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=True))
@@ -178,7 +190,9 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
         require(
             (source / path).is_file(), "This fixture requires a Gongcao-compatible test repository"
         )
+    run.check_cancelled()
     issue = await create_issue(run, requirement, github)
+    run.check_cancelled()
     require(
         await core(run, "register", issue["url"], "--repo", str(source)) == 0, "Registration failed"
     )
@@ -190,14 +204,17 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     finally:
         store.close()
     run.save()
+    run.check_cancelled()
 
 
 async def missing_gate(run: Run) -> None:
+    run.check_cancelled()
     config = yaml.safe_load((run.root / "config.yaml").read_text())
     config["quality"] = {}
     path = run.root / "missing-gate.yaml"
     path.write_text(yaml.safe_dump(config))
     await core(run, "run", str(run.value["task_id"]), "--config", str(path))
+    run.check_cancelled()
     task = inspect(run)
     require(
         task["state"] == "waiting_environment"
@@ -207,6 +224,7 @@ async def missing_gate(run: Run) -> None:
     )
     before = signature(task)
     await core(run, "run", str(run.value["task_id"]), "--config", str(path))
+    run.check_cancelled()
     require(signature(inspect(run)) == before, "Blocked repeat created new effects")
     run.archive("missing-gate", task)
     run.event("missing-gate-blocked", repeat_unchanged=True)
@@ -220,8 +238,10 @@ async def execute(
         run.event("started")
         github = GitHub()
         try:
+            run.check_cancelled()
             if run.value["scenario"] == "smoke":
                 run.archive("environment", await check())
+                run.check_cancelled()
                 verdict: dict[str, Any] = {
                     "passed": True,
                     "at": time.time(),
@@ -234,6 +254,7 @@ async def execute(
                 injected = False
                 deadline = time.monotonic() + 3600
                 for _ in range(120):
+                    run.check_cancelled()
                     require(time.monotonic() < deadline, "QA workflow deadline exceeded")
                     fault = run.value["scenario"] == "recover" and not injected
                     code = await drive(
@@ -243,6 +264,7 @@ async def execute(
                         peers=peers,
                     )
                     task = inspect(run)
+                    run.check_cancelled()
                     if run.value["scenario"] == "cancel":
                         require(
                             not task["evidence"]["operations"],
@@ -351,8 +373,24 @@ async def execute(
                 run.value["resources"]["pr_number"] = task["pr_number"]
                 run.archive("task", inspect(run))
             await verify_implementation(run)
+            run.check_cancelled()
             run.archive("verdict", verdict)
             run.value["status"] = "passed"
+        except RunCancelled:
+            try:
+                if run.value.get("task_id"):
+                    require(
+                        await core(run, "cancel", str(run.value["task_id"])) == 0,
+                        "Native cancel failed",
+                    )
+                    task = inspect(run)
+                    settled(task)
+                    run.archive("cancelled-task", task)
+                else:
+                    run.archive("cancelled-inventory", run.value["resources"])
+                run.value["status"] = "cancelled"
+            except (OSError, RuntimeError, ValueError) as exc:
+                run.value.update(status="needs_reconciliation", failure=Redactor().text(str(exc)))
         except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
             run.value.update(
                 status="failed", failure=Redactor().text(f"{type(exc).__name__}: {exc}")
@@ -361,11 +399,14 @@ async def execute(
                 run.archive("failed-task", inspect(run))
         finally:
             run.event("finished", status=run.value["status"])
-        if clean and run.value["scenario"] != "smoke":
+        if clean:
             try:
                 await cleanup(run, inspect(run) if run.value.get("task_id") else None, github)
             except (OSError, RuntimeError, ValueError) as exc:
-                run.value.update(status="failed", cleanup_failure=Redactor().text(str(exc)))
+                run.value.update(
+                    status="needs_reconciliation" if isinstance(exc, Unconfirmed) else "failed",
+                    cleanup_failure=Redactor().text(str(exc)),
+                )
                 run.save()
 
 

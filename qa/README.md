@@ -43,8 +43,12 @@ generic policy for arbitrary repositories.
 Prepare GitHub CLI/SSH access and Codex model authorization through their normal
 login tools. QA neither copies keys nor writes them to manifests. The production
 sandbox owns its existing isolated model-auth lifecycle. `check --real` probes the
-account using the installed SDK with GitHub/SSH credentials removed; actual model
-inference is demonstrated by the real scenario. Do not place secrets in arguments.
+account metadata using the installed SDK on the trusted controller. Its environment
+allowlist removes GitHub/SSH variables, while HOME/CODEX_HOME retain host filesystem
+access for normal authorization. This account read has no Agent tools/turns and is
+not a filesystem-isolation proof. Agent isolation is verified separately by the
+production Sandbox; actual inference is demonstrated by the real scenario.
+Do not place secrets in arguments.
 
 ```bash
 uv run python -m qa check --real --repo simonjiao/gongcao
@@ -112,6 +116,12 @@ uv run python -m qa reconcile RUN_ID
 uv run python -m qa cleanup RUN_ID
 ```
 
+Cancellation is checked before starting a queued scene, creating its remote issue,
+or launching native execution, and is forwarded to native `cancel` during preparation
+checks as well as the main loop. A user-cancelled Run ends as `cancelled`; it cannot
+count as a passing loop/smoke scenario. Existing resources still use controlled
+cleanup. Cancelling an already finished Run returns `cancel_requested=false`.
+
 `reconcile` performs read-only observation/adoption and invokes native `recover`
 for the recorded task. It never resends an uncertain write or clears an uncertain
 process reservation. If observation cannot establish what happened, it fails for
@@ -125,6 +135,10 @@ ownership, closes only the owned issue and unmerged PR, and deletes only the
 owned controller branch with an exact-SHA compare-and-delete. It validates the
 source repository and uses the canonical target URL rather than an unchecked
 push URL. Reopened/recreated resources invalidate the old cleanup confirmation.
+Close confirmations reject merged PRs. Cleanup rechecks the fixed default branch
+name/SHA, closed/unmerged PR and resource state before removing local work and
+reporting completion. A conflicting observation preserves evidence and ends as
+`needs_reconciliation`; it never retries an uncertain write.
 It preserves manifests, SQLite, logs and contexts while
 removing that Run's clone/worktrees and isolated model-auth copies. It refuses an
 active Run, unknown write, foreign commit or uncertain descendant cleanup. It

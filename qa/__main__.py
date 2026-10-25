@@ -67,8 +67,7 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "verify-batch":
         return verify_batch(args.data_dir, args.run_id, require_isolation=args.require_isolation)
     if args.command == "cancel":
-        (run.root / "cancel-requested").touch(mode=0o600)
-        return {"run_id": run.id, "cancel_requested": True}
+        return run.request_cancel()
     with run.lock():
         if args.command == "verify":
             archived = verify_archived(run)

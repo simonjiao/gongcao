@@ -22,7 +22,23 @@ from qa.runner import batch, core, execute, model_activity, verify_implementatio
 
 
 def new_run(tmp_path, scenario="loop"):
-    return Run.create(tmp_path, scenario, "a" * 40, repository="example/demo", github_login="qa")
+    return Run.create(
+        tmp_path,
+        scenario,
+        "a" * 40,
+        repository="example/demo",
+        github_login="qa",
+        base_branch="main",
+        base_sha="a" * 40,
+    )
+
+
+def base_response(run, path):
+    if path == "repos/example/demo":
+        return {"default_branch": run.value["base_branch"]}
+    if path == "repos/example/demo/git/ref/heads/main":
+        return {"object": {"sha": run.value["base_sha"]}}
+    return None
 
 
 def test_manifest_locks_paths_redaction_and_archive_tamper(tmp_path):
@@ -161,6 +177,8 @@ async def test_cleanup_rejects_foreign_or_unsettled_resources_before_writes(
 
     class Remote(GitHub):
         async def read(self, path):
+            if row := base_response(run, path):
+                return row
             return {
                 "body": "foreign" if foreign == "issue" else run.marker,
                 "user": {"login": "qa"},
@@ -192,6 +210,8 @@ async def test_cleanup_is_owned_archived_idempotent_and_keeps_other_run(tmp_path
 
     class Remote(GitHub):
         async def read(self, path):
+            if row := base_response(run, path):
+                return row
             if "/git/ref/" in path:
                 raise RuntimeError("HTTP 404")
             return {"number": 19, "body": run.marker, "user": {"login": "qa"}, "state": state}
@@ -550,6 +570,8 @@ async def test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl(
 
     class Remote(GitHub):
         async def read(self, path):
+            if row := base_response(run, path):
+                return row
             if "/git/ref/" in path:
                 if not ref_exists:
                     raise RuntimeError("HTTP 404")

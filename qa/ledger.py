@@ -15,6 +15,10 @@ from typing import Any
 from gongcao.events import Redactor
 
 
+class RunCancelled(Exception):
+    """A user cancellation stops new scene work, while owned cleanup remains available."""
+
+
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -78,6 +82,22 @@ class Run:
 
     def save(self) -> None:
         write_json(self.path, self.value)
+
+    def request_cancel(self) -> dict[str, Any]:
+        current = json.loads(self.path.read_text())
+        if current["status"] not in {"queued", "running"}:
+            return {"run_id": self.id, "cancel_requested": False, "status": current["status"]}
+        (self.root / "cancel-requested").touch(mode=0o600)
+        current = json.loads(self.path.read_text())
+        return {
+            "run_id": self.id,
+            "cancel_requested": current["status"] in {"queued", "running"},
+            "status": current["status"],
+        }
+
+    def check_cancelled(self) -> None:
+        if (self.root / "cancel-requested").exists():
+            raise RunCancelled("QA Run cancelled by user")
 
     def event(self, kind: str, **data: Any) -> None:
         self.value["events"].append({"at": time.time(), "kind": kind, **data})

@@ -19,6 +19,11 @@ class Unconfirmed(RuntimeError):
     pass
 
 
+def require_unmerged(pull: dict[str, Any]) -> None:
+    if pull.get("merged") or pull.get("merged_at"):
+        raise Unconfirmed("Test PR was merged during cleanup; manual reconciliation required")
+
+
 async def optional(github: GitHub, path: str) -> Any:
     try:
         return await github.read(path)
@@ -50,6 +55,8 @@ async def action(
         previous["state"] = "unknown"
         run.save()
         raise Unconfirmed(f"Unconfirmed QA action {key}; refusing replay")
+    if key == "create-issue":
+        run.check_cancelled()
     actions[key] = {"intent": intent, "state": "pending"}
     run.save()
     try:
@@ -90,6 +97,10 @@ async def action(
             await asyncio.sleep(delay)
         try:
             observed = await observe()
+        except Unconfirmed as exc:
+            actions[key].update(state="unknown", observation_error=str(exc))
+            run.save()
+            raise
         except (OSError, RuntimeError, TimeoutError) as exc:
             actions[key]["observation_error"] = Redactor().text(str(exc))
         if observed is not None:
@@ -172,6 +183,15 @@ def cleanup_local(run: Run) -> None:
 
 
 async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None:
+    try:
+        await _cleanup(run, task, github)
+    except Unconfirmed as exc:
+        run.value.update(status="needs_reconciliation", cleanup_failure=str(exc))
+        run.event("cleanup-blocked", reason=str(exc))
+        raise
+
+
+async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None:
     """Caller owns Run.lock; archive first, then verify all ownership before any mutation."""
     run.value["cleaned"] = False
     run.save()
@@ -198,6 +218,19 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
     ):
         raise Unconfirmed("Task is outside this QA Run")
     prefix = f"repos/{repo}"
+
+    async def unchanged_base() -> dict[str, Any]:
+        metadata = await github.read(prefix)
+        if metadata.get("default_branch") != run.value["base_branch"]:
+            raise Unconfirmed("Default branch changed during cleanup; reconcile before continuing")
+        current = await github.read(f"{prefix}/git/ref/heads/{run.value['base_branch']}")
+        if current["object"]["sha"] != run.value["base_sha"]:
+            raise Unconfirmed(
+                "Default branch SHA changed during cleanup; reconcile before continuing"
+            )
+        return {"branch": run.value["base_branch"], "sha": current["object"]["sha"]}
+
+    await unchanged_base()
     issue = await github.read(f"{prefix}/issues/{resources['issue']['number']}")
     if (
         run.marker not in (issue.get("body") or "")
@@ -218,12 +251,13 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
     if pull and (
         not task
         or pull["number"] != task["pr_number"]
-        or pull["merged_at"]
         or pull["head"]["repo"]["full_name"].lower() != repo
         or pull["user"]["login"] != run.value["github_login"]
         or f"Implements {resources['issue']['url']}" not in (pull.get("body") or "")
     ):
-        raise Unconfirmed("PR ownership is unconfirmed or the test PR was merged")
+        raise Unconfirmed("PR ownership is unconfirmed")
+    if pull:
+        require_unmerged(pull)
     ref_path = f"{prefix}/git/ref/heads/{branch}"
     ref = await optional(github, ref_path)
     owned_shas = (
@@ -251,16 +285,26 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
 
     async def closed(path: str) -> Any:
         row = await github.read(path)
+        if path == pull_path:
+            require_unmerged(row)
+        await unchanged_base()
         return {"state": "closed"} if row["state"] == "closed" else None
 
+    pull_path = f"{prefix}/pulls/{pull['number']}" if pull else None
     if pull:
-        path = f"{prefix}/pulls/{pull['number']}"
-        await action(run, "close-pull", "PATCH", path, {"state": "closed"}, lambda: closed(path))
+        assert pull_path is not None
+        await action(
+            run, "close-pull", "PATCH", pull_path, {"state": "closed"}, lambda: closed(pull_path)
+        )
     issue_path = f"{prefix}/issues/{issue['number']}"
     await action(
         run, "close-issue", "PATCH", issue_path, {"state": "closed"}, lambda: closed(issue_path)
     )
     if ref:
+        if pull_path:
+            if await closed(pull_path) is None:
+                raise Unconfirmed("Test PR reopened during cleanup")
+        await unchanged_base()
 
         async def deleted() -> Any:
             return {"deleted": True} if await optional(github, ref_path) is None else None
@@ -273,6 +317,22 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
             {"expected_sha": ref["object"]["sha"]},
             deleted,
         )
+    if pull_path and await closed(pull_path) is None:
+        raise Unconfirmed("Test PR reopened during cleanup")
+    if await closed(issue_path) is None or await optional(github, ref_path) is not None:
+        raise Unconfirmed("Owned remote resources changed during cleanup")
+    base = await unchanged_base()
+    run.archive(
+        "cleanup-confirmed",
+        {
+            "base": base,
+            "pull": {"number": pull["number"], "state": "closed", "merged": False}
+            if pull
+            else None,
+            "issue_closed": True,
+            "branch_deleted": True,
+        },
+    )
     # Keep logs, contexts, SQLite and manifests; remove only this Run's clone/worktrees
     # and production's dedicated model-auth copies after their processes have stopped.
     cleanup_local(run)
@@ -296,6 +356,8 @@ async def reconcile(run: Run, github: GitHub) -> None:
                 return {"deleted": True} if await optional(github, path) is None else None
             if key in {"close-issue", "close-pull"}:
                 row = await github.read(intent["path"])
+                if key == "close-pull":
+                    require_unmerged(row)
                 return {"state": "closed"} if row["state"] == "closed" else None
             raise Unconfirmed("Unknown QA action; manual inspection required")
 
