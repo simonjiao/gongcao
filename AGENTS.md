@@ -3,7 +3,7 @@
 - Use Python 3.12+ and `uv`. Manage metadata, dependencies and tool configuration in
   `pyproject.toml`; commit `uv.lock` and keep CI on `uv sync --locked`.
 - Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`, and
-  `uv run pytest -q` before proposing a change. pytest enables beartype for `gongcao`.
+  `uv run pytest -q` before proposing a change. pytest enables beartype for `gongcao` and `qa`.
 - Keep stages separate from execution states. Only the controller changes either;
   an agent's report cannot satisfy GitHub review, test, CI, or merge gates.
 - Prove sandbox boundaries with real OS access checks. Do not replace these tests
@@ -18,6 +18,8 @@
   uncertain descendant cleanup or another owner's resource reservation to force progress.
   Recovery preserves interrupted work and creates fresh sessions; see docs/stage3.md.
 - Issue tracker: GitHub `simonjiao/gongcao`; see `docs/agents/issue-tracker.md`.
+- Maintain `qa/` scenarios when changing workflow, security or quality gates. Default CI
+  uses offline QA only; remote/model acceptance requires an explicit authorized `--real` run.
 
 ## PowerShell 使用规则
 
