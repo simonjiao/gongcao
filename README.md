@@ -50,7 +50,7 @@ uv run gongcao logs 1 --follow
 uv run gongcao cancel 1
 
 # 只轮询已登记的任务；最多 1–3 个并发，共享同一个 state-dir。
-uv run gongcao serve --config gongcao.example.yaml --concurrency 2
+uv run gongcao serve --config gongcao.example.yaml --jobs 2
 uv run gongcao serve --config gongcao.example.yaml --once
 uv run gongcao depend 2 --on 1
 uv run gongcao diagnose 2
@@ -77,6 +77,10 @@ GitHub PR head、base SHA/目标分支或请求正文/标题变化会使旧证�
 recover 先核对进程、会话引用、工作区和远端事实；无法确认时仍待核对，不重放副作用。
 retry 是显式人工重试，检查/审查证据重新建立，旧工作区保留；不要修改数据库绕过状态。
 serve 启动时核对遗留执行，连续三次执行/环境失败后转人工处理，普通 CI 等待不计失败。
+并行数统一使用 `--jobs`；正式 `serve` 取命令行显式值、YAML `scheduler.jobs`、默认 1
+中优先级最高的一项，且只接受整数 1–3。旧选项 `--concurrency` 已移除。
+同一 YAML 的 `qa.jobs` 只控制 QA 批次，默认 2，接受任意正整数；两类任务额度独立。
+例如 `scheduler: {jobs: 2}` 和 `qa: {jobs: 3}` 可分别配置正式与 QA 并行数。
 依赖须由 GitHub 确认已合并。未发布 Issue 基线过旧时，可用 retry --refresh-base 从当前默认分支重建计划；
 仅显式 retry --reset-revisions 重置修订预算。未知启动/后代清理不明时不会只凭 PID 或日志静默恢复。
 Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远端默认分支。PR 使用 GitHub head SHA。

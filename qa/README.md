@@ -17,6 +17,8 @@ uv sync --locked
 uv run python -m qa check --offline
 uv run pytest -q tests/test_qa.py
 uv run python -m qa run smoke --repeat 3 --jobs 2
+# Read qa.jobs from the shared YAML (an explicit --jobs still takes precedence):
+uv run python -m qa run smoke --config gongcao.example.yaml
 ```
 
 Run a reviewed, committed checkout: every batch records its fixed implementation
@@ -53,7 +55,7 @@ Do not place secrets in arguments.
 ```bash
 uv run python -m qa check --real --repo simonjiao/gongcao
 uv run python -m qa run cancel loop recover --jobs 2 --real \
-  --repo simonjiao/gongcao --model gpt-6.1-sol --cleanup
+  --repo simonjiao/gongcao --config gongcao.example.yaml --model gpt-6.1-sol --cleanup
 # Copy the batch_id / Run IDs from the JSON result:
 uv run python -m qa verify-batch BATCH_ID --require-isolation
 uv run python -m qa verify RUN_ID
@@ -65,7 +67,13 @@ Directories and JSON files are private. Each Run gets a UUID, independent clone,
 SQLite, logs, configuration, dynamic fixture filenames, issue, controller branch,
 PR and resource inventory. Same-process batches default to two slots; excess
 Runs queue. `--repeat N` repeats each listed scenario with new owned resources;
-`--jobs N` changes the bound. This does not provide cross-process/global scheduling.
+`--jobs N` changes the bound. The effective limit is the explicit CLI `--jobs`,
+then `qa.jobs` in the optional `--config PATH` YAML, then the default 2; it must be
+a positive integer. For example, `qa: {jobs: 3}` selects three QA slots.
+`scheduler.jobs` configures production `serve` separately (1–3, default 1).
+QA reads only the QA parallel setting: model/roles/quality for each scene retain
+their existing generated policies; production `quality` is never used as a scene gate.
+This does not provide cross-process/global scheduling.
 
 - `smoke`: offline capability checks with an archived verdict; no model or remote writes.
 - `loop`: native missing-gate block and unchanged blocked repeat, then real analysis,
