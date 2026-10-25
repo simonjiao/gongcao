@@ -9,12 +9,18 @@ The second stage was merged in https://github.com/simonjiao/gongcao/pull/4 at
 `82eafb9a00f8fc06556539b73314791ecb76dfb9`, following explicit user authorization.
 The third stage was merged in https://github.com/simonjiao/gongcao/pull/14 at
 `35ca3609a5c84bd15ed37729a3ecb6563584c455`, following explicit user authorization.
-The current delivery is the native QA sub-issue https://github.com/simonjiao/gongcao/issues/13.
-QA implementation PR: https://github.com/simonjiao/gongcao/pull/17.
+The native QA sub-issue is https://github.com/simonjiao/gongcao/issues/13.
+QA implementation PR https://github.com/simonjiao/gongcao/pull/17 was merged at
+`e5a6080c03ec4075c98503b9c4f435a9680a3b30`.
 Feature-branch acceptance: `docs/acceptance-qa.md` (implementation `3c3357c`).
+Final merged-main acceptance: `docs/acceptance-final-main.md` and
+`docs/evidence/final-main-e5a6080.json` (implementation and target `e5a6080`).
+The complete real cancel/loop/recover batch and independent isolation verification passed;
+both successful and failed batches retain their original results and cleanup records.
 Stage numbers are independent of GitHub's PR numbers.
 
-Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.
+Close the native QA child #13 before parent #1 after final-main evidence is archived.
+GitHub remains authoritative for closure; independent TTL issue #41 stays separate.
 The product
 workflow never merges or releases automatically. The user may explicitly authorize a
 maintenance merge in this conversation, as for GitHub PR #2 and #4.
