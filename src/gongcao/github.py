@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from .events import Redactor
-from .processes import stop
+from .processes import completed, launch, stop
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class Target:
         )
         if not match:
             raise ValueError("Expected https://github.com/OWNER/REPO/issues/N or /pull/N")
-        return cls(match[1], match[2], int(match[3]))
+        return cls(match[1].lower(), match[2], int(match[3]))
 
     @property
     def url(self) -> str:
@@ -33,12 +33,9 @@ class Target:
 
 
 async def command(*args: str, cwd: str | None = None, input_data: str | None = None) -> str:
-    process = await asyncio.create_subprocess_exec(
+    process = await launch(
         *args,
         cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
         stdin=asyncio.subprocess.PIPE if input_data is not None else None,
     )
     try:
@@ -48,10 +45,13 @@ async def command(*args: str, cwd: str | None = None, input_data: str | None = N
     except BaseException:
         await stop(process)
         raise
+    completed(process)
     if process.returncode:
-        message = Redactor().text(stderr.decode(errors="replace")[-2000:])
+        message = Redactor().text(stderr.decode(errors="replace"))[-2000:]
         if args[0] == "gh" and ("HTTP 403" in message or "HTTP 401" in message):
             raise PermissionError(message)
+        if args[0] == "gh" and re.search(r"HTTP 5\d\d", message):
+            raise ConnectionError(message)
         raise RuntimeError(message)
     return stdout.decode()
 

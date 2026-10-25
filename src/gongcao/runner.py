@@ -12,7 +12,7 @@ from .config import Config
 from .events import Journal, Redactor
 from .github import GitHub
 from .model import AgentResult, Role, Stage, State, after_run, same_version
-from .processes import CleanupError, stop
+from .processes import CleanupError, launch, lease_lost, stop
 from .sandbox import IsolationError, Sandbox
 from .store import Store
 from .workspace import context, worktree
@@ -98,12 +98,9 @@ class Runner:
             sandbox = Sandbox(workspace, run_dir, role)
             journal.redactor = Redactor(sandbox.prepare(self.config))
             journal.emit("isolation_verified", await sandbox.verify(repo))
-            process = await asyncio.create_subprocess_exec(
+            process = await launch(
                 *sandbox.argv(sys.executable, "-m", "gongcao.worker"),
                 stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
                 limit=1_048_576,
             )
             assert process.stdin is not None
@@ -154,8 +151,11 @@ class Runner:
                 journal.redactor.text(result.model_dump_json()),
             )
         except asyncio.CancelledError:
-            self.store.cancel(task_id)
-            outcome = (State.CANCELLED, stage, State.CANCELLED, "Cancelled by user", None)
+            if lease_lost():
+                outcome = (State.RECONCILE, stage, State.RECONCILE, "Execution lease lost", None)
+            else:
+                self.store.cancel(task_id)
+                outcome = (State.CANCELLED, stage, State.CANCELLED, "Cancelled by user", None)
         except Exception as exc:
             state = (
                 State.RECONCILE
@@ -177,8 +177,23 @@ class Runner:
                 try:
                     await stop(process, consumers)
                 except asyncio.CancelledError:
-                    self.store.cancel(task_id)
-                    outcome = (State.CANCELLED, stage, State.CANCELLED, "Cancelled by user", None)
+                    if lease_lost():
+                        outcome = (
+                            State.RECONCILE,
+                            stage,
+                            State.RECONCILE,
+                            "Execution lease lost",
+                            None,
+                        )
+                    else:
+                        self.store.cancel(task_id)
+                        outcome = (
+                            State.CANCELLED,
+                            stage,
+                            State.CANCELLED,
+                            "Cancelled by user",
+                            None,
+                        )
                 except CleanupError as exc:
                     message = str(exc)
                     outcome = (State.RECONCILE, stage, State.RECONCILE, message, None)

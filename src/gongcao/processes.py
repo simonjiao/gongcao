@@ -4,7 +4,67 @@ import asyncio
 import os
 import signal
 from collections.abc import Sequence
-from typing import Any, cast
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+
+class Observer(Protocol):
+    lost: bool
+
+    def intent(self, label: str) -> str: ...
+    def attached(self, key: str, pid: int) -> None: ...
+    def aborted(self, key: str) -> None: ...
+    def stopped(self, pid: int) -> None: ...
+    def uncertain(self, pid: int) -> None: ...
+
+
+observer: ContextVar[Observer | None] = ContextVar("process_observer", default=None)
+
+
+def lease_lost() -> bool:
+    current = observer.get()
+    return current is not None and current.lost
+
+
+def completed(process: asyncio.subprocess.Process) -> None:
+    if current := observer.get():
+        current.stopped(process.pid)
+
+
+async def launch(
+    *args: str, cwd: str | None = None, stdin: int | None = None, limit: int = 65536
+) -> asyncio.subprocess.Process:
+    current = observer.get()
+    label = (
+        "pid-sandbox"
+        if Path(args[0]).name == "bwrap" and "--unshare-pid" in args and "--die-with-parent" in args
+        else Path(args[0]).name
+    )
+    key = current.intent(label) if current else ""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=limit,
+        )
+    except OSError:
+        # asyncio/Popen settles a failed exec before raising OSError. A hard crash
+        # or cancellation before attachment leaves the durable pending intent intact.
+        if current:
+            current.aborted(key)
+        raise
+    if current:
+        try:
+            current.attached(key, process.pid)
+        except BaseException:
+            await stop(process)
+            raise
+    return process
 
 
 class CleanupError(RuntimeError):
@@ -81,6 +141,11 @@ async def stop(
             except asyncio.CancelledError:
                 cancelled = True
         cleanup_task.result()
+        completed(process)
+    except CleanupError:
+        if current := observer.get():
+            current.uncertain(process.pid)
+        raise
     finally:
         if cancelled:
             raise asyncio.CancelledError

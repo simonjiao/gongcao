@@ -19,7 +19,7 @@ async def repository(path: Path, target: Target) -> tuple[Path, str]:
         f"https://github.com/{target.repository}.git",
         f"https://github.com/{target.repository}",
     }
-    if origin not in names:
+    if origin.lower() not in {name.lower() for name in names}:
         raise ValueError("The local origin does not match the registered GitHub repository")
     sha = (await command("git", "rev-parse", "HEAD^{commit}", cwd=str(root))).strip()
     return root.resolve(), sha

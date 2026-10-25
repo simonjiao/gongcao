@@ -1,13 +1,13 @@
 """Foreground PR2 controller. GitHub facts and exact-version evidence own every gate."""
 
 import asyncio
-import fcntl
 import json
 from typing import Any
 
 from .config import Config
 from .events import Redactor
 from .github import GitHub
+from .leases import Lease
 from .model import Role, Stage, State, same_version
 from .quality import Quality, ci_gate
 from .remote import Controlled, UncertainWrite
@@ -22,6 +22,7 @@ class Workflow:
         self.runner = Runner(store, config, github)
         self.quality = Quality(store, config)
         self.remote = Controlled(store, config, github)
+        self.lease: Lease | None = None
 
     async def sync(self, task_id: int) -> dict[str, Any]:
         task = self.store.task(task_id)
@@ -42,6 +43,9 @@ class Workflow:
             and run["state"] == State.COMPLETED
             and run["evidence_valid"]
             and run["target_sha"] == task["target_sha"]
+            and run["result"] is not None
+            and json.loads(run["result"]).get("target_sha") == task["target_sha"]
+            and json.loads(run["result"]).get("conclusion") in {"ready", "revise"}
         ]
         return rows[-1] if rows else None
 
@@ -225,9 +229,10 @@ class Workflow:
             )
 
     async def run(self, task_id: int) -> list[str]:
-        lock_path = self.store.root / f"task-{task_id}.lock"
-        with lock_path.open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        async with Lease(self.store, task_id) as lease:
+            self.lease = lease
+            if not lease.acquired:
+                return []
             before = {run["id"] for run in self.store.runs(task_id)}
             try:
                 task = await self.sync(task_id)
@@ -236,7 +241,18 @@ class Workflow:
                     or task["stage"] == Stage.MERGED
                 ):
                     return []
+                blockers = [
+                    d["id"] for d in self.store.dependencies(task_id) if d["stage"] != Stage.MERGED
+                ]
+                if blockers and task["stage"] != Stage.MERGED and not task["cancel_requested"]:
+                    self.store.halt(
+                        task_id,
+                        State.WAITING_DEPENDENCY,
+                        f"Waiting for merged dependencies: {blockers}",
+                    )
+                    return []
                 for _ in range(2 * self.config.max_revisions + 8):
+                    lease.bind_resource()
                     task = await self.sync(task_id)
                     if (
                         task["state"]
@@ -266,8 +282,11 @@ class Workflow:
                         "No bounded workflow progress; manual handling required",
                     )
             except asyncio.CancelledError:
-                self.store.cancel(task_id)
-                self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
+                if lease.lost:
+                    self.store.halt(task_id, State.RECONCILE, "Execution lease lost")
+                else:
+                    self.store.cancel(task_id)
+                    self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
             except Exception as exc:
                 if self.store.task(task_id)["stage"] == Stage.MERGED:
                     return [
