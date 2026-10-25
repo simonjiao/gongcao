@@ -18,7 +18,7 @@ from gongcao.workflow import Workflow
 from qa.evidence import evaluate, probe, verify_archived, verify_batch, verify_recovery
 from qa.ledger import Run, digest, write_json
 from qa.resources import Unconfirmed, action, cleanup, create_issue
-from qa.runner import batch, execute, model_activity, verify_implementation
+from qa.runner import batch, core, execute, model_activity, verify_implementation
 
 
 def new_run(tmp_path, scenario="loop"):
@@ -427,6 +427,20 @@ async def test_changed_implementation_cannot_start_or_pass(tmp_path, monkeypatch
     monkeypatch.setattr("qa.runner.command", command)
     with pytest.raises(ValueError, match="Implementation changed"):
         await verify_implementation(run)
+
+
+async def test_qa_launches_actual_native_cli_without_remote_credentials(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+
+    async def fixed(run):
+        pass  # The protocol fixture has no implementation checkout; test the real CLI launch.
+
+    monkeypatch.setattr("qa.runner.verify_implementation", fixed)
+    assert await core(run, "status") == 0
+    records = list(run.root.glob("command-*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert json.loads(record["stdout"]) == [] and not record["stderr"]
 
 
 def test_recovery_verifier_requires_pending_to_confirmed_exact_comment(tmp_path):

@@ -16,11 +16,14 @@ from gongcao.model import Role
 from gongcao.processes import stop
 from gongcao.sandbox import Sandbox
 
+from . import NATIVE_MODULE
+
 
 async def check(*, real: bool = False, repository: str | None = None) -> dict[str, Any]:
     if sys.platform != "linux" or sys.version_info < (3, 12):
         raise ValueError("QA requires Linux/WSL and Python >=3.12")
     versions = {"python": sys.version.split()[0]}
+    await command(sys.executable, "-m", NATIVE_MODULE, "--help")
     for name in ("uv", "git", "gh", "bwrap"):
         if shutil.which(name) is None:
             raise ValueError(f"Missing {name}; see qa/README.md")

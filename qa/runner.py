@@ -19,6 +19,7 @@ from gongcao.processes import stop
 from gongcao.recovery import diagnose
 from gongcao.store import Store
 
+from . import NATIVE_MODULE
 from .environment import check
 from .evidence import command_activity, require, verify_live
 from .ledger import Run, digest, write_json
@@ -45,7 +46,7 @@ async def core(run: Run, *args: str, fault: bool = False) -> int:
     argv = [
         sys.executable,
         "-m",
-        "qa.fault" if fault else "gongcao",
+        "qa.fault" if fault else NATIVE_MODULE,
         "--state-dir",
         str(run.root / "state"),
         *args,
