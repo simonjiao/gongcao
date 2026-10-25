@@ -24,10 +24,13 @@ dev = [
 [project.scripts]
 gongcao = "gongcao.cli:main"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/gongcao", "qa"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-beartype_packages = "gongcao"
+beartype_packages = ["gongcao", "qa"]
 filterwarnings = [
     "error::pytest.PytestUnraisableExceptionWarning",
     "error::ResourceWarning",
@@ -43,5 +46,5 @@ ignore = ["ASYNC240"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["gongcao"]
+packages = ["gongcao", "qa"]
 mypy_path = "src"
