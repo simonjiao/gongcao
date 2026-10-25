@@ -21,6 +21,71 @@ def require(condition: Any, reason: str) -> None:
         raise ValueError(reason)
 
 
+def command_activity(run: Run) -> list[dict[str, Any]]:
+    """Facts emitted by the SDK after an actual model command, not a thread-start claim."""
+    commands = []
+    for path in (run.root / "state/logs").glob("*.jsonl*"):
+        try:
+            contents = path.read_text()
+        except FileNotFoundError:
+            continue
+        for line in contents.splitlines(keepends=True):
+            if not line.endswith("\n"):
+                continue
+            event = json.loads(line)
+            data = event.get("data", {})
+            item = data.get("payload", {}).get("item", {}) if isinstance(data, dict) else {}
+            if (
+                event["kind"] == "sdk_event"
+                and data.get("method") == "item/started"
+                and item.get("type") == "commandExecution"
+            ):
+                commands.append(
+                    {
+                        "at": event["at"],
+                        "run_id": event["run_id"],
+                        "method": data["method"],
+                        "item_id": item["id"],
+                        "type": item["type"],
+                    }
+                )
+    return sorted(commands, key=lambda row: (row["at"], row["run_id"], row["item_id"]))
+
+
+def verify_recovery(run: Run, task: dict[str, Any], reviews: list[dict[str, Any]]) -> None:
+    interrupted = json.loads((run.root / "interrupted.json").read_text())
+    recovered = json.loads((run.root / "recovered.json").read_text())
+    witness = interrupted["witness"]
+    require(
+        witness["point"] == "COMMENT observed before local operation_result",
+        "Wrong recovery fault point",
+    )
+    key = witness["operation"]
+    before = [o for o in interrupted["task"]["evidence"]["operations"] if o["id"] == key]
+    after = [o for o in recovered["evidence"]["operations"] if o["id"] == key]
+    final = [o for o in task["evidence"]["operations"] if o["id"] == key]
+    require(len(before) == len(after) == len(final) == 1, "Recovered operation identity is missing")
+    require(
+        before[0]["kind"] == "review"
+        and before[0]["state"] == "pending"
+        and before[0]["sha"] == witness["target_sha"]
+        and after[0]["state"] == final[0]["state"] == "succeeded"
+        and after[0]["response"] == final[0]["response"] == witness["observed_response"],
+        "COMMENT was not reconciled from pending to the observed result",
+    )
+    matches = [
+        r
+        for r in reviews
+        if r["body"] == before[0]["payload"]["body"]
+        and r["commit_id"] == before[0]["payload"]["commit_id"]
+        and r["state"] == "COMMENTED"
+    ]
+    require(
+        len(matches) == 1 and matches[0]["id"] == witness["observed_response"]["id"],
+        "Recovery duplicated or lost the COMMENT",
+    )
+
+
 def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dict[str, Any]:
     settled(task)
     sha = task["target_sha"]
@@ -74,6 +139,20 @@ def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dic
             and all(c["exit_code"] == 0 for c in commands),
             f"Incomplete or failed {kind}",
         )
+        for observed, expected_argv in zip(commands, expected, strict=True):
+            actual = observed.get("argv", [])
+            require(len(actual) == len(expected_argv), f"Wrong command recorded for {kind}")
+            for argument, template in zip(actual, expected_argv, strict=True):
+                if template == "{python}":
+                    require(
+                        Path(argument).is_absolute() and Path(argument).name == "python3",
+                        "Invalid quality interpreter binding",
+                    )
+                else:
+                    require(
+                        argument == template.replace("{sha}", sha),
+                        f"Recorded {kind} command differs from configured policy",
+                    )
     state, reason = ci_gate(task, facts, config.ci_workflows)
     require(state == State.COMPLETED, reason)
     require(
@@ -208,6 +287,8 @@ async def verify_live(
                 "Review is missing or duplicated",
             )
     run.archive("github", {"snapshot": current, "facts": facts, "reviews": reviews})
+    if run.value["scenario"] == "recover":
+        verify_recovery(run, task, reviews)
     result.update(
         boundary_probe={"inputs": VECTORS, "initial": old, "final": final},
         changed_files=files,
@@ -234,9 +315,27 @@ def verify_archived(run: Run) -> dict[str, Any]:
                 task["state"] == "cancelled" and not task["evidence"]["operations"],
                 "Expected cancellation is not confirmed",
             )
+            cancellation = json.loads((run.root / "cancellation.json").read_text())
+            recorded = cancellation["commands"]
+            require(
+                recorded and recorded == command_activity(run),
+                "Cancellation has no real SDK command evidence",
+            )
+            require(
+                any(
+                    command["run_id"] == role["id"]
+                    and role["thread_id"]
+                    and role["started"] <= command["at"] <= role["ended"]
+                    for command in recorded
+                    for role in task["runs"]
+                ),
+                "Cancellation command is outside recorded SDK sessions",
+            )
         else:
             github = json.loads((run.root / "github.json").read_text())
             verified = evaluate(task, Config.load(run.root / "config.yaml"), github["facts"])
+            if run.value["scenario"] == "recover":
+                verify_recovery(run, task, github["reviews"])
             require(verified["target_sha"] == result["target_sha"], "Verdict SHA mismatch")
             repeat = json.loads((run.root / "repeat.json").read_text())
             require(
@@ -309,17 +408,25 @@ def verify_batch(data: Path, batch_id: str, *, require_isolation: bool = False) 
             if run is peer:
                 continue
             other = json.loads((peer.root / "task.json").read_text())
+            own_commands, other_commands = command_activity(run), command_activity(peer)
             overlap |= any(
                 a["thread_id"]
                 and b["thread_id"]
-                and max(a["started"], b["started"]) < min(a["ended"], b["ended"])
+                and a["id"] == own["run_id"]
+                and b["id"] == theirs["run_id"]
+                and max(own["at"], theirs["at"]) < min(a["ended"], b["ended"])
                 for a in task["runs"]
                 for b in other["runs"]
+                for own in own_commands
+                for theirs in other_commands
             )
             cleanup_isolated |= (
                 run.value["scenario"] == "cancel"
                 and any(
-                    event["kind"] == "cleaned" and starts[peer.id] < event["at"] < ends[peer.id]
+                    event["kind"] == "cleaned"
+                    and starts[peer.id]
+                    < event["at"]
+                    < min(row["at"] for row in peer.value["events"] if row["kind"] == "finished")
                     for event in run.value["events"]
                 )
                 and peer.value["scenario"] in {"loop", "recover"}

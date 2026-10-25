@@ -7,7 +7,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode
 
-from gongcao.github import GitHub, command
+from gongcao.github import GitHub, Target, command
+from gongcao.workspace import repository as validate_repository
 
 from .ledger import Run
 
@@ -38,14 +39,14 @@ async def action(
     previous = actions.get(key)
     if previous and previous["intent"] != intent:
         raise ValueError("QA action identity changed")
-    if previous and previous["state"] == "confirmed":
-        return previous["result"]
     observed = await observe()
     if observed is not None:
         actions[key] = {"intent": intent, "state": "confirmed", "result": observed}
         run.save()
         return observed
     if previous:
+        previous["state"] = "unknown"
+        run.save()
         raise Unconfirmed(f"Unconfirmed QA action {key}; refusing replay")
     actions[key] = {"intent": intent, "state": "pending"}
     run.save()
@@ -56,7 +57,7 @@ async def action(
                 "git",
                 "push",
                 f"--force-with-lease=refs/heads/{branch}:{payload['expected_sha']}",
-                "origin",
+                f"git@github.com:{run.value['repository']}.git",
                 f":refs/heads/{branch}",
                 cwd=str(run.root / "source"),
             )
@@ -129,8 +130,24 @@ def settled(task: dict[str, Any]) -> None:
         raise Unconfirmed("Production remote writes need reconciliation before cleanup")
 
 
+def cleanup_local(run: Run) -> None:
+    paths = (run.root / "source", run.root / "state/worktrees")
+    if any(path.is_symlink() or path.resolve() != path for path in paths):
+        raise Unconfirmed("Local cleanup path has been redirected")
+    for path in paths:
+        if path.exists():
+            shutil.rmtree(path)
+    for auth_path in (run.root / "state").glob("*/**/home/.codex/auth.json"):
+        if auth_path.resolve().is_relative_to(run.root):
+            auth_path.unlink()
+    run.value["cleaned"] = True
+    run.event("cleaned")
+
+
 async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None:
     """Caller owns Run.lock; archive first, then verify all ownership before any mutation."""
+    run.value["cleaned"] = False
+    run.save()
     if task:
         settled(task)
         if not (run.root / "cleanup-task.json").exists():
@@ -144,6 +161,7 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
         # A crash after POST but before recording the resource must be reconciled first.
         if "create-issue" in run.value["actions"]:
             raise Unconfirmed("QA issue has not been adopted into the inventory")
+        cleanup_local(run)
         return
     repo = run.value["repository"]
     if task and (
@@ -194,6 +212,13 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
     )
     if ref and ref["object"]["sha"] not in owned_shas:
         raise Unconfirmed("Branch contains an unconfirmed or foreign commit")
+    if ref:
+        source = run.root / "source"
+        if source.is_symlink() or source.resolve() != source:
+            raise Unconfirmed("Source clone has been redirected")
+        actual_root, _ = await validate_repository(source, Target.parse(resources["issue"]["url"]))
+        if actual_root != source:
+            raise Unconfirmed("Source clone is outside this QA Run")
     if not (run.root / "cleanup-remote.json").exists():
         run.archive("cleanup-remote", {"issue": issue, "pull": pull, "ref": ref})
 
@@ -223,16 +248,7 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
         )
     # Keep logs, contexts, SQLite and manifests; remove only this Run's clone/worktrees
     # and production's dedicated model-auth copies after their processes have stopped.
-    for local_path in (run.root / "source", run.root / "state/worktrees"):
-        if local_path.is_symlink() or local_path.resolve() != local_path:
-            raise Unconfirmed("Local cleanup path has been redirected")
-        if local_path.exists():
-            shutil.rmtree(local_path)
-    for auth_path in (run.root / "state").glob("*/**/home/.codex/auth.json"):
-        if auth_path.resolve().is_relative_to(run.root):
-            auth_path.unlink()
-    run.value["cleaned"] = True
-    run.event("cleaned")
+    cleanup_local(run)
 
 
 async def reconcile(run: Run, github: GitHub) -> None:

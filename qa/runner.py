@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+import gongcao
 from gongcao.config import Config
 from gongcao.events import Redactor
 from gongcao.github import GitHub, command
@@ -19,7 +20,7 @@ from gongcao.recovery import diagnose
 from gongcao.store import Store
 
 from .environment import check
-from .evidence import require, verify_live
+from .evidence import command_activity, require, verify_live
 from .ledger import Run, digest, write_json
 from .resources import cleanup, create_issue, settled
 from .scenarios import VERSION, fixture, version_digest
@@ -39,6 +40,7 @@ def inspect(run: Run) -> dict[str, Any]:
 
 
 async def core(run: Run, *args: str, fault: bool = False) -> int:
+    await verify_implementation(run)
     name = uuid.uuid4().hex
     argv = [
         sys.executable,
@@ -87,23 +89,22 @@ def signature(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def model_activity(run: Run) -> bool:
-    for path in (run.root / "state/logs").glob("*.jsonl*"):
-        try:
-            contents = path.read_text()
-        except FileNotFoundError:
-            continue  # Concurrent rotation; the next poll sees the retained file.
-        for line in contents.splitlines(keepends=True):
-            if not line.endswith("\n"):
-                continue
-            event = json.loads(line)
-            if event["kind"] == "sdk_event":
-                data = event["data"]
-                if (
-                    data["method"] == "item/started"
-                    and data.get("payload", {}).get("item", {}).get("type") == "commandExecution"
-                ):
-                    return True
-    return False
+    return bool(command_activity(run))
+
+
+async def verify_implementation(run: Run) -> None:
+    directory = Path(__file__).resolve().parents[1]
+    require(
+        Path(gongcao.__file__).resolve().parent == directory / "src/gongcao",
+        "Imported Gongcao is not from the recorded implementation checkout",
+    )
+    root = str(directory)
+    sha = (await command("git", "rev-parse", "HEAD", cwd=root)).strip()
+    dirty = (await command("git", "status", "--porcelain", cwd=root)).strip()
+    require(
+        sha == run.value["implementation_sha"] and not dirty,
+        "Implementation changed during QA; use the recorded clean checkout",
+    )
 
 
 async def drive(
@@ -130,7 +131,12 @@ async def drive(
             )
             if not cancelled and (
                 (run.root / "cancel-requested").exists()
-                or (cancel_probe and model_activity(run) and peer_active)
+                or (
+                    cancel_probe
+                    and task["state"] == "running"
+                    and model_activity(run)
+                    and peer_active
+                )
             ):
                 require(await core(run, "cancel", task_id) == 0, "Native cancel failed")
                 run.event("cancel-requested", real_model_command_seen=model_activity(run))
@@ -236,6 +242,11 @@ async def execute(
                         peers=peers,
                     )
                     task = inspect(run)
+                    if run.value["scenario"] == "cancel":
+                        require(
+                            not task["evidence"]["operations"],
+                            "Cancellation checkpoint missed before remote writes",
+                        )
                     if fault and code == -9:
                         witness = json.loads((run.root / "fault.json").read_text())
                         op = next(
@@ -281,8 +292,13 @@ async def execute(
                             "at": time.time(),
                             "kind": "expected-real-model-cancellation",
                         }
+                        run.archive("cancellation", {"commands": command_activity(run)})
                         break
                     if task["stage"] == "mergeable" and task["state"] == "completed":
+                        require(
+                            run.value["scenario"] != "cancel",
+                            "Cancellation checkpoint was never triggered",
+                        )
                         if run.value["scenario"] == "recover":
                             require(injected, "Recovery checkpoint was not triggered")
                         config = Config.load(run.root / "config.yaml")
@@ -333,6 +349,7 @@ async def execute(
                     raise ValueError("QA workflow exceeded bounded iterations")
                 run.value["resources"]["pr_number"] = task["pr_number"]
                 run.archive("task", inspect(run))
+            await verify_implementation(run)
             run.archive("verdict", verdict)
             run.value["status"] = "passed"
         except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
@@ -411,7 +428,13 @@ async def batch(
                     run,
                     model=model,
                     clean=clean,
-                    peers=[other for other in runs if other is not run] if jobs > 1 else None,
+                    peers=[
+                        other
+                        for other in runs
+                        if other is not run and other.value["scenario"] != "smoke"
+                    ]
+                    if jobs > 1
+                    else None,
                 )
             finally:
                 report["events"].append({"at": time.time(), "kind": "released", "run_id": run.id})

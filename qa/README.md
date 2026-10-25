@@ -21,6 +21,8 @@ uv run python -m qa run smoke --repeat 3 --jobs 2
 
 Run a reviewed, committed checkout: every batch records its fixed implementation
 SHA and refuses a dirty implementation checkout. `check` works during development.
+Every native CLI launch and the final verdict recheck that implementation and its
+imported source location; do not edit or switch the checkout while a batch runs.
 Ruff, strict mypy, pytest and beartype include `qa`. Default CI only runs offline
 checks and tests, without model authorization or GitHub writes. The SDK/GitHub
 protocol substitutes in regression tests are **not** real end-to-end evidence.
@@ -118,7 +120,10 @@ the `recover` scenario itself.
 
 Cleanup archives evidence before writes, checks marker/author/task/branch/head
 ownership, closes only the owned issue and unmerged PR, and deletes only the
-owned controller branch. It preserves manifests, SQLite, logs and contexts while
+owned controller branch with an exact-SHA compare-and-delete. It validates the
+source repository and uses the canonical target URL rather than an unchecked
+push URL. Reopened/recreated resources invalidate the old cleanup confirmation.
+It preserves manifests, SQLite, logs and contexts while
 removing that Run's clone/worktrees and isolated model-auth copies. It refuses an
 active Run, unknown write, foreign commit or uncertain descendant cleanup. It
 never merges a test PR, changes the default branch, or removes another Run.

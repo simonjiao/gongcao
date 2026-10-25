@@ -15,10 +15,10 @@ from gongcao.github import GitHub, command
 from gongcao.recovery import diagnose
 from gongcao.store import Store
 from gongcao.workflow import Workflow
-from qa.evidence import evaluate, probe, verify_archived, verify_batch
-from qa.ledger import Run, write_json
+from qa.evidence import evaluate, probe, verify_archived, verify_batch, verify_recovery
+from qa.ledger import Run, digest, write_json
 from qa.resources import Unconfirmed, action, cleanup
-from qa.runner import batch, model_activity
+from qa.runner import batch, execute, model_activity, verify_implementation
 
 
 def new_run(tmp_path, scenario="loop"):
@@ -69,6 +69,36 @@ async def test_unknown_write_is_not_replayed_even_after_restart(tmp_path, monkey
         "number": 19
     }
     assert len(calls) == 1
+
+
+async def test_confirmed_cleanup_drift_is_not_replayed_or_reported_clean(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+    writes = []
+
+    async def command(*args, **kwargs):
+        writes.append(args)
+        return ""
+
+    async def closed():
+        return {"state": "closed"}
+
+    async def reopened():
+        return None
+
+    monkeypatch.setattr("qa.resources.command", command)
+    await action(
+        run, "close-issue", "PATCH", "repos/example/demo/issues/19", {"state": "closed"}, closed
+    )
+    with pytest.raises(Unconfirmed, match="refusing replay"):
+        await action(
+            run,
+            "close-issue",
+            "PATCH",
+            "repos/example/demo/issues/19",
+            {"state": "closed"},
+            reopened,
+        )
+    assert not writes and run.value["actions"]["close-issue"]["state"] == "unknown"
 
 
 @pytest.mark.parametrize("foreign", ["issue", "branch", "task", "unknown", "active"])
@@ -169,7 +199,7 @@ async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
     }
     facts = await fixture_github.gates(task)
     assert evaluate(task, policy, facts)["revision_count"] == 1
-    for failure in ("stale", "old", "real", "ci", "pending", "ready"):
+    for failure in ("stale", "old", "real", "ci", "pending", "ready", "argv"):
         changed, remote = copy.deepcopy(task), copy.deepcopy(facts)
         if failure == "stale":
             changed["target_sha"] = "0" * 40
@@ -183,6 +213,10 @@ async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
             remote["workflows"][0]["target_proof"]["base_sha"] = "0" * 40
         elif failure == "pending":
             changed["evidence"]["operations"][0]["state"] = "pending"
+        elif failure == "argv":
+            for artifact in changed["evidence"]["artifacts"]:
+                if artifact["kind"] == "checks" and artifact["valid"]:
+                    artifact["data"]["commands"][0]["argv"] = ["true"]
         else:
             changed["stage"] = "pending_validation"
         with pytest.raises((ValueError, Unconfirmed)):
@@ -279,6 +313,22 @@ def test_partial_sdk_log_never_counts_thread_start_as_inference(tmp_path):
     assert not model_activity(run)
 
 
+async def test_cleanup_partial_clone_before_remote_intent_and_symlink_refusal(tmp_path):
+    run = new_run(tmp_path)
+    source = run.root / "source"
+    source.mkdir()
+    (source / "partial.txt").write_text("partial clone")
+    await cleanup(run, None, GitHub())
+    assert run.value["cleaned"] and not source.exists()
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "keep.txt").write_text("keep")
+    source.symlink_to(foreign, target_is_directory=True)
+    with pytest.raises(Unconfirmed, match="redirected"):
+        await cleanup(run, None, GitHub())
+    assert (foreign / "keep.txt").read_text() == "keep"
+
+
 async def test_fault_kills_only_owned_controller_before_local_ack(tmp_path, repo, sha, snapshot):
     run = new_run(tmp_path, "recover")
     run.value["resources"]["issue"] = {"url": snapshot["url"]}
@@ -289,6 +339,7 @@ async def test_fault_kills_only_owned_controller_before_local_ack(tmp_path, repo
         store.intent(store.task(task_id), "owned-op", "review", "{}")
     finally:
         store.close()
+
     script = """
 from pathlib import Path
 from gongcao.store import Store
@@ -317,3 +368,163 @@ fault.main()
         assert store.operation("owned-op")["state"] == "pending"
     finally:
         store.close()
+
+
+async def test_cancel_scenario_must_not_pass_a_normal_loop(tmp_path, monkeypatch):
+    run = new_run(tmp_path, "cancel")
+    task = {"stage": "mergeable", "state": "completed", "evidence": {"operations": []}}
+
+    async def prepare(run, github, model):
+        run.value["task_id"] = 1
+
+    async def drive(run, **kwargs):
+        return 0
+
+    monkeypatch.setattr("qa.runner.prepare", prepare)
+    monkeypatch.setattr("qa.runner.drive", drive)
+    monkeypatch.setattr("qa.runner.inspect", lambda run: task)
+    await execute(run, model=None, clean=False)
+    assert run.value["status"] == "failed"
+    assert "never triggered" in run.value["failure"]
+
+
+async def test_changed_implementation_cannot_start_or_pass(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+
+    async def command(*args, **kwargs):
+        return "b" * 40 if args[:3] == ("git", "rev-parse", "HEAD") else ""
+
+    monkeypatch.setattr("qa.runner.command", command)
+    with pytest.raises(ValueError, match="Implementation changed"):
+        await verify_implementation(run)
+
+
+def test_recovery_verifier_requires_pending_to_confirmed_exact_comment(tmp_path):
+    run = new_run(tmp_path, "recover")
+    op = {
+        "id": "review-1",
+        "kind": "review",
+        "state": "pending",
+        "sha": "a" * 40,
+        "payload": {"body": "owned marker", "commit_id": "a" * 40},
+        "response": None,
+    }
+    before = {"evidence": {"operations": [op]}}
+    witness = {
+        "point": "COMMENT observed before local operation_result",
+        "operation": "review-1",
+        "target_sha": "a" * 40,
+        "observed_response": {"id": 31},
+    }
+    confirmed = op | {"state": "succeeded", "response": {"id": 31}}
+    final = {"evidence": {"operations": [confirmed]}}
+    reviews = [{"id": 31, "body": "owned marker", "commit_id": "a" * 40, "state": "COMMENTED"}]
+    with pytest.raises(FileNotFoundError):
+        verify_recovery(run, final, reviews)
+    run.archive("interrupted", {"task": before, "witness": witness})
+    run.archive("recovered", final)
+    verify_recovery(run, final, reviews)
+    with pytest.raises(ValueError, match="duplicated"):
+        verify_recovery(run, final, reviews * 2)
+
+
+def test_cancel_archive_requires_real_command_evidence(tmp_path):
+    run = new_run(tmp_path, "cancel")
+    url = "https://github.com/example/demo/issues/19"
+    run.value.update(status="passed", config_digest=digest({}))
+    run.value["resources"]["issue"] = {"url": url}
+    run.archive("configuration", {})
+    run.archive(
+        "task",
+        {
+            "url": url,
+            "state": "cancelled",
+            "runs": [],
+            "runtime": {"lease": None, "processes": []},
+            "evidence": {"operations": []},
+        },
+    )
+    run.archive("verdict", {"passed": True, "at": 1})
+    with pytest.raises(FileNotFoundError):
+        verify_archived(run)
+    run.archive("cancellation", {"commands": []})
+    with pytest.raises(ValueError, match="real SDK command"):
+        verify_archived(run)
+
+
+@pytest.mark.parametrize("foreign_origin", [True, False])
+async def test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl(
+    tmp_path, repo, sha, monkeypatch, foreign_origin
+):
+    run = new_run(tmp_path)
+    source = run.root / "source"
+    await command("git", "clone", "-q", str(repo), str(source))
+    await command(
+        "git",
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/foreign/demo.git"
+        if foreign_origin
+        else "https://github.com/example/demo.git",
+        cwd=str(source),
+    )
+    await command(
+        "git",
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://github.com/foreign/demo.git",
+        cwd=str(source),
+    )
+    issue = {"url": "https://github.com/example/demo/issues/19", "number": 19}
+    branch = "gongcao/work-" + hashlib.sha256(issue["url"].encode()).hexdigest()[:12]
+    run.value.update(base_branch="main")
+    run.value["resources"] = {"issue": issue, "branch": branch}
+    task = {
+        "url": issue["url"],
+        "repo_path": str(source),
+        "snapshot": {"repository": "example/demo"},
+        "pr_number": None,
+        "runtime": {"lease": None, "processes": []},
+        "runs": [],
+        "evidence": {
+            "operations": [
+                {"kind": "push", "state": "succeeded", "payload": {"branch": branch, "sha": sha}}
+            ]
+        },
+    }
+    ref_exists, state = True, "open"
+    writes = []
+
+    class Remote(GitHub):
+        async def read(self, path):
+            if "/git/ref/" in path:
+                if not ref_exists:
+                    raise RuntimeError("HTTP 404")
+                return {"object": {"sha": sha}}
+            return {"number": 19, "body": run.marker, "user": {"login": "qa"}, "state": state}
+
+        async def pages(self, path, field=None):
+            return []
+
+    async def mutate(*args, **kwargs):
+        nonlocal ref_exists, state
+        writes.append(args)
+        if args[:2] == ("git", "push"):
+            assert "git@github.com:example/demo.git" in args
+            assert f"--force-with-lease=refs/heads/{branch}:{sha}" in args
+            ref_exists = False
+        else:
+            state = "closed"
+        return ""
+
+    monkeypatch.setattr("qa.resources.command", mutate)
+    if foreign_origin:
+        with pytest.raises(ValueError, match="origin"):
+            await cleanup(run, task, Remote())
+        assert not writes
+    else:
+        await cleanup(run, task, Remote())
+        assert run.value["cleaned"] and not ref_exists and len(writes) == 2
