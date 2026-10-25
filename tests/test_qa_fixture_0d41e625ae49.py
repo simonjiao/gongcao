@@ -2,7 +2,6 @@ import importlib.util
 import unittest
 from pathlib import Path
 
-
 MODULE_PATH = Path(__file__).resolve().parents[1] / "qa_fixture_0d41e625ae49.py"
 SPEC = importlib.util.spec_from_file_location("qa_fixture_0d41e625ae49", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -11,8 +10,9 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ClampScoreTests(unittest.TestCase):
-    def test_positive_and_upper_bound_values(self) -> None:
-        for value, expected in ((1, 1), (50, 50), (99, 99), (100, 100), (101, 100)):
+    def test_clamps_scores_to_inclusive_bounds(self) -> None:
+        cases = ((-100, 0), (-1, 0), (0, 0), (1, 1), (50, 50), (99, 99), (100, 100), (101, 100))
+        for value, expected in cases:
             with self.subTest(value=value):
                 self.assertEqual(MODULE.clamp_score(value), expected)
 
