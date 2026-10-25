@@ -90,6 +90,10 @@ def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dic
     settled(task)
     sha = task["target_sha"]
     require(task["stage"] == "mergeable" and task["state"] == "completed", "Task is not mergeable")
+    require(
+        task["snapshot"]["state"] == "open" and not task["snapshot"].get("merged"),
+        "QA issue/PR is closed or merged",
+    )
     require(task["revision_count"] >= 1, "Deliberate defect was not revised")
     runs = task["runs"]
     old_reviews = [r for r in runs if r["role"] == "reviewer" and r["target_sha"] != sha]
@@ -227,6 +231,9 @@ async def verify_live(
     run: Run, task: dict[str, Any], config: Config, github: GitHub
 ) -> dict[str, Any]:
     current = await github.task_snapshot(task)
+    require(
+        current["state"] == "open" and not current.get("merged"), "QA issue/PR is closed or merged"
+    )
     require(
         same_version(task, task | {"snapshot": current, "target_sha": current.get("head_sha")}),
         "GitHub target/version changed; archived evidence is stale",
