@@ -2626,7 +2626,12 @@
       "post_cleanup_remote": {
         "issue_state": "closed",
         "branch_http_status": 404,
-        "pull": null
+        "pull": {
+          "number": 45,
+          "state": "closed",
+          "merged": false,
+          "merge_commit_sha": "3eac1e5603b364cbc59358205bdea8eb5bcae9ad"
+        }
       },
       "local_cleanup": {
         "source_removed": true,
@@ -3096,7 +3101,12 @@
       "post_cleanup_remote": {
         "issue_state": "closed",
         "branch_http_status": 404,
-        "pull": null
+        "pull": {
+          "number": 46,
+          "state": "closed",
+          "merged": false,
+          "merge_commit_sha": "3046f1ba3161a6b602a788574d536f8370a3ba10"
+        }
       },
       "local_cleanup": {
         "source_removed": true,
