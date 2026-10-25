@@ -8,6 +8,7 @@ PR1 (https://github.com/simonjiao/gongcao/pull/2) was merged at
 The second stage was merged in https://github.com/simonjiao/gongcao/pull/4 at
 `82eafb9a00f8fc06556539b73314791ecb76dfb9`, following explicit user authorization.
 The current delivery is **第三阶段 · 运行可靠性与项目跟踪**, based on that merge commit.
+Implementation PR: https://github.com/simonjiao/gongcao/pull/14.
 Stage numbers are independent of GitHub's PR numbers.
 
 Keep the parent issue open until the third stage is accepted and merged. The product

@@ -8,7 +8,8 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
 第二阶段已在 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4) 合并。
 支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
-第三阶段补充前台轮询、有限并发、依赖与安全恢复，见 [执行契约](docs/stage3.md)。
+第三阶段在 [PR #14](https://github.com/simonjiao/gongcao/pull/14) 补充前台轮询、有限并发、依赖与安全恢复，
+见 [执行契约](docs/stage3.md) 和 [验收记录](docs/acceptance-stage3.md)。
 
 ## 安装与检查
 
