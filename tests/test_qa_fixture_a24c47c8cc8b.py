@@ -10,8 +10,18 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ClampScoreTests(unittest.TestCase):
-    def test_positive_and_upper_bound_values(self) -> None:
-        for value, expected in ((1, 1), (42, 42), (99, 99), (100, 100), (101, 100)):
+    def test_clamps_to_inclusive_bounds(self) -> None:
+        cases = (
+            (-100, 0),
+            (-1, 0),
+            (0, 0),
+            (1, 1),
+            (42, 42),
+            (99, 99),
+            (100, 100),
+            (101, 100),
+        )
+        for value, expected in cases:
             with self.subTest(value=value):
                 self.assertEqual(MODULE.clamp_score(value), expected)
 
