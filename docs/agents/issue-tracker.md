@@ -10,6 +10,8 @@ The second stage was merged in https://github.com/simonjiao/gongcao/pull/4 at
 The third stage was merged in https://github.com/simonjiao/gongcao/pull/14 at
 `35ca3609a5c84bd15ed37729a3ecb6563584c455`, following explicit user authorization.
 The current delivery is the native QA sub-issue https://github.com/simonjiao/gongcao/issues/13.
+QA implementation PR: https://github.com/simonjiao/gongcao/pull/17.
+Feature-branch acceptance: `docs/acceptance-qa.md` (implementation `3c3357c`).
 Stage numbers are independent of GitHub's PR numbers.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.

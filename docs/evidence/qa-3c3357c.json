@@ -1,0 +1,1802 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-25T02:35:48.152331+00:00",
+  "scope": "QA PR branch acceptance; final merged-main integration remains pending",
+  "implementation_sha": "3c3357cc4413e647fcc78b672a47604cd2ac6f68",
+  "target_main_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+  "model": "gpt-6.1-sol",
+  "environment": {
+    "versions": {
+      "python": "3.12.3",
+      "uv": "0.11.33",
+      "git": "git version 2.43.0",
+      "gh": "gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)",
+      "bwrap": "bubblewrap 0.9.0",
+      "openai-codex": "0.163.0",
+      "PyYAML": "6.0.3"
+    },
+    "isolation": {
+      "host_credentials": "blocked",
+      "host_repository": "blocked",
+      "workspace_writable": false,
+      "external_writes": "blocked",
+      "uv": "uv 0.11.33 (x86_64-unknown-linux-gnu)"
+    },
+    "real": true,
+    "repository": {
+      "full_name": "simonjiao/gongcao",
+      "default_branch": "main",
+      "ssh_url": "git@github.com:simonjiao/gongcao.git"
+    },
+    "github_login": "simonjiao",
+    "model_authorized": true
+  },
+  "source_sha256": {
+    ".github/workflows/ci.yml": "0f237be63b5622ae9702778306cb64a53dca9fda18f0bcae91244323071aec0b",
+    "pyproject.toml": "b4367b51c0a9d506d8cc221f38cea46e1ef27a50b0ef85d08061c42ba2645a63",
+    "qa/README.md": "b490749e0eb4395da5449bedec47e5c7634c2dcb84e9e2e9cc697f2fc3b26a64",
+    "qa/__init__.py": "c329fc99754d4dea5c574c775a32a1a5318cb6cd731ace4d824c7c84667b0ff9",
+    "qa/__main__.py": "40edc6ef4b6375a1149825e41c47583b1518fef71ed10120831e292168637ce2",
+    "qa/environment.py": "c80ddba71c3ac32cf66a0a91d500c9a336382d82583de13ea57c9216b0619263",
+    "qa/evidence.py": "ec2e7db24a74ec2e0a04bc0aad010eaf84287b788d30433534efca1d5377c68d",
+    "qa/fault.py": "d2b7f73b573a90618a74f97a77ca200267f7c04de5628ac4e6f5c4ff2eb244ce",
+    "qa/fixtures/requirement.md": "f77ca1372b96051b7bf0a1b400398597d376888b4bca3a6c2c2a81e4b3b0b4ee",
+    "qa/ledger.py": "459dcff1e4113b43f1770fb271f999240c15fc0f8da2df980fd860bd61eaeef2",
+    "qa/resources.py": "ee781c3171520488d3e410dc2707218cb4dcac4bb387a8f3480035bdd47c2c4e",
+    "qa/runner.py": "885e64180af4cb4347bf0bd5e698b37fb5fb381b906ac48ab7bf6aa119696b90",
+    "qa/scenarios.py": "f9c02c6a1a793dffd0d4d007265d15eb9355267cdd47211cb22234c1a2c93a29",
+    "src/gongcao/__init__.py": "433a3242d21128ba0b537f2bcae055f6a4ee9fff98ea82aad9c852ecd74a2106",
+    "src/gongcao/cli.py": "2feddd6978005f0373e69730c00c36b3de6b2aa6a0c1efee41de311995771fd0",
+    "src/gongcao/config.py": "d44c693f9b93b0c3a824a8f827537073e073514c8345d17592beb307003227f3",
+    "src/gongcao/events.py": "a145c967fd1e2859273f3b86755ad2cd8ef59114d943278c31d415d58b9af063",
+    "src/gongcao/github.py": "6fc2ae3800b4ad73de2c04829f5499e645123d65259af5aef997d2affb7fdb8e",
+    "src/gongcao/leases.py": "487a0cb986f72548892284518a698acbbc44331260d94af20af8af7608f158be",
+    "src/gongcao/model.py": "18787378abd685dd0072d6197c037efaec5d6958f7db536d09dde6ed91ed14cd",
+    "src/gongcao/processes.py": "936c94bce94643bcfeb5f81964736b76b540bdfdbde794a3a5aeaef426030753",
+    "src/gongcao/quality.py": "35fe46ecf63bc8d0e55914516ba8278417f3a6c42af6ee7c3136cd6be4a9b7cc",
+    "src/gongcao/recovery.py": "50ebfba6dc411eaef977b7ad4fb7126a5e14886a202c99bf28f93c72b4f2aa52",
+    "src/gongcao/remote.py": "95ad957494466e17a0cd2a7caede9eab1362854dadadf4b398da328fe19d8613",
+    "src/gongcao/runner.py": "1acd95e5e7e124653d4d3502d06a07b4020a345753e93856da3578551b558500",
+    "src/gongcao/sandbox.py": "f348fb8da8f2265f818dd6eea10d07c2542ce0ef6d213d35ea2419ea8f67e902",
+    "src/gongcao/scheduler.py": "2150d81e43e289707472a5771dda0e909eaaf621bc2c10f216906b2a359a8956",
+    "src/gongcao/store.py": "c242eb1cc4a899f029b749ae2151236ab328fe304c28d24e2eeb54594cc81d44",
+    "src/gongcao/worker.py": "6e9acc4104e39d4ab3e0ffd065c61f15ad6164836a93d17cb7c3ea5c2aa4e84d",
+    "src/gongcao/workflow.py": "e0baa6e0aae239e203c1f5f24b57f7b5b92570ab474cb874f0c1011118486dae",
+    "src/gongcao/workspace.py": "e0f777639f07329c8c312b350335304d8464a258e4f2e9631bb607ad5c93505d",
+    "tests/test_qa.py": "507617fa0f7b414612c244013f765b501869f061136a4e96a3a8b5b0a2731e59",
+    "uv.lock": "3738d338d542b80da5fa8d094bfab38fc110ffba9140db3eb9916ec96e2f4d30"
+  },
+  "batch": {
+    "schema": 1,
+    "id": "7c81464fa0ec4a67bad79c9fefcbd2c5",
+    "jobs": 2,
+    "runs": [
+      "7c81464fa0ec4a67bad79c9fefcbd2c5",
+      "942e0369a8f349e8b71f1a8f05daa986",
+      "a24c47c8cc8b48c0a2a571a966cee317"
+    ],
+    "events": [
+      {
+        "at": 1792895066.3926356,
+        "kind": "started",
+        "run_id": "7c81464fa0ec4a67bad79c9fefcbd2c5"
+      },
+      {
+        "at": 1792895066.4369278,
+        "kind": "started",
+        "run_id": "942e0369a8f349e8b71f1a8f05daa986"
+      },
+      {
+        "at": 1792895092.5925672,
+        "kind": "released",
+        "run_id": "7c81464fa0ec4a67bad79c9fefcbd2c5"
+      },
+      {
+        "at": 1792895092.6040983,
+        "kind": "started",
+        "run_id": "a24c47c8cc8b48c0a2a571a966cee317"
+      },
+      {
+        "at": 1792895607.5914323,
+        "kind": "released",
+        "run_id": "942e0369a8f349e8b71f1a8f05daa986"
+      },
+      {
+        "at": 1792895631.2646923,
+        "kind": "released",
+        "run_id": "a24c47c8cc8b48c0a2a571a966cee317"
+      }
+    ],
+    "results": [
+      {
+        "run_id": "7c81464fa0ec4a67bad79c9fefcbd2c5",
+        "scenario": "cancel",
+        "status": "passed",
+        "cleaned": true,
+        "failure": null,
+        "cleanup_failure": null
+      },
+      {
+        "run_id": "942e0369a8f349e8b71f1a8f05daa986",
+        "scenario": "loop",
+        "status": "passed",
+        "cleaned": true,
+        "failure": null,
+        "cleanup_failure": null
+      },
+      {
+        "run_id": "a24c47c8cc8b48c0a2a571a966cee317",
+        "scenario": "recover",
+        "status": "passed",
+        "cleaned": true,
+        "failure": null,
+        "cleanup_failure": null
+      }
+    ],
+    "passed": true
+  },
+  "batch_verification": {
+    "passed": true,
+    "batch_id": "7c81464fa0ec4a67bad79c9fefcbd2c5",
+    "peak_runs": 2,
+    "queued": true,
+    "real_model_overlap": true,
+    "cancel_cleanup_isolated": true,
+    "runs": [
+      "7c81464fa0ec4a67bad79c9fefcbd2c5",
+      "942e0369a8f349e8b71f1a8f05daa986",
+      "a24c47c8cc8b48c0a2a571a966cee317"
+    ]
+  },
+  "runs": [
+    {
+      "id": "7c81464fa0ec4a67bad79c9fefcbd2c5",
+      "scenario": "cancel",
+      "scenario_version": 2,
+      "scenario_digest": "b1f036c8949cc4c043b260e98ba0b010962c7340556542f588ed4e15c559410e",
+      "implementation_sha": "3c3357cc4413e647fcc78b672a47604cd2ac6f68",
+      "config_digest": "5c0c2064d7bd813745803094f287766ea6f4e820a0a7e4622dec1b30a7743d0f",
+      "base_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+      "base_branch": "main",
+      "resources": {
+        "issue": {
+          "number": 30,
+          "url": "https://github.com/simonjiao/gongcao/issues/30"
+        },
+        "branch": "gongcao/work-5089db6c54a0",
+        "pr_number": null
+      },
+      "status": "passed",
+      "cleaned": true,
+      "events": [
+        {
+          "at": 1792895066.4028442,
+          "kind": "started"
+        },
+        {
+          "at": 1792895076.0403407,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "queued",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895078.7459915,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "running",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895087.6333973,
+          "kind": "cancel-requested",
+          "real_model_command_seen": true
+        },
+        {
+          "at": 1792895087.8522341,
+          "kind": "finished",
+          "status": "passed"
+        },
+        {
+          "at": 1792895092.580235,
+          "kind": "cleaned"
+        }
+      ],
+      "policy_hash": "40c2d9fbd6067c928db21b4e51bed5c22b6f5983d60ae142ee7f51f4fbcc81e3",
+      "verdict": {
+        "passed": true,
+        "at": 1792895087.7888138,
+        "kind": "expected-real-model-cancellation"
+      },
+      "verification": {
+        "run_id": "7c81464fa0ec4a67bad79c9fefcbd2c5",
+        "passed": true,
+        "as_of": 1792895087.7888138,
+        "cleaned": true,
+        "evidence": "archived, digest-checked"
+      },
+      "archive_sha256": {
+        "configuration.json": "e48e24a3a6d59fd8c1ebbdf17a90616c50e9d02b4b755a16fb98164c7e9b32d3",
+        "cancellation.json": "46c7a099ca5b990cc7d7ee54ce7016826c967157ba1deb667cb1491647a81751",
+        "task.json": "e492d08e32318145bc5fd7725449470214585661c21c313dc72a30915ba172a9",
+        "verdict.json": "69a293b1cdc6983dad95983b65123ed143a4c155d4b026115a640e5ec40d2c56",
+        "cleanup-task.json": "e492d08e32318145bc5fd7725449470214585661c21c313dc72a30915ba172a9",
+        "cleanup-remote.json": "e8080f729e7027fd678c4f6436d5969c0ba84d883df0c96b1c66aff7ba4a9a41"
+      },
+      "remote_after_cleanup": {
+        "issue": {
+          "number": 30,
+          "state": "closed",
+          "url": "https://github.com/simonjiao/gongcao/issues/30"
+        },
+        "branch_deleted": true
+      },
+      "sessions": [
+        {
+          "id": "156adc681fe446a5954526ed77729693",
+          "role": "analyst",
+          "state": "cancelled",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170df-d870-7e22-a974-260e9f35b54a",
+          "context_hash": "d20df5bb04408e0389060aa07c39b62b69c34d8a0a13d109fe9c735d1cd476cd",
+          "evidence_valid": 0,
+          "started": 1792895078.436754,
+          "ended": 1792895087.6954584,
+          "conclusion": null,
+          "files": {
+            "runs/156adc681fe446a5954526ed77729693/context.json": "4e50ad4ee3118977b9b50ffb5bd7e00ef13c85a849f258b16c994730099717cf",
+            "logs/156adc681fe446a5954526ed77729693.jsonl": "d9bc77e6b063b5d6d3cebf17eec88498ce3c19886f06fcfa3faaf08477055a15"
+          }
+        }
+      ],
+      "quality": [],
+      "operations": [],
+      "runtime": {
+        "lease_present": false,
+        "active_processes": []
+      },
+      "local_cleanup": {
+        "source_removed": true,
+        "worktrees_removed": true,
+        "model_auth_copies_remaining": 0
+      }
+    },
+    {
+      "id": "942e0369a8f349e8b71f1a8f05daa986",
+      "scenario": "loop",
+      "scenario_version": 2,
+      "scenario_digest": "b1f036c8949cc4c043b260e98ba0b010962c7340556542f588ed4e15c559410e",
+      "implementation_sha": "3c3357cc4413e647fcc78b672a47604cd2ac6f68",
+      "config_digest": "8bbfaf89c97500faf9de892b53f3dda2383654743b125ba1c073384bc61b1110",
+      "base_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+      "base_branch": "main",
+      "resources": {
+        "issue": {
+          "number": 29,
+          "url": "https://github.com/simonjiao/gongcao/issues/29"
+        },
+        "branch": "gongcao/work-6d7e51993879",
+        "pr_number": 32
+      },
+      "status": "passed",
+      "cleaned": true,
+      "events": [
+        {
+          "at": 1792895066.444794,
+          "kind": "started"
+        },
+        {
+          "at": 1792895116.0163684,
+          "kind": "missing-gate-blocked",
+          "repeat_unchanged": true
+        },
+        {
+          "at": 1792895116.0277934,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "waiting_environment",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895118.061675,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "queued",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895118.5760653,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "running",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895153.969505,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "queued",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895155.5238545,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "running",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895178.4770734,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "waiting_dependency",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895203.1077561,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895204.6438208,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895336.76093,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895338.327032,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895357.5689003,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "waiting_dependency",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895367.3424926,
+          "kind": "controller-state",
+          "stage": "pending_revision",
+          "state": "queued",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895370.9381099,
+          "kind": "controller-state",
+          "stage": "pending_revision",
+          "state": "running",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895391.7321467,
+          "kind": "controller-state",
+          "stage": "pending_revision",
+          "state": "waiting_dependency",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+        },
+        {
+          "at": 1792895409.251522,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895410.801282,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895492.3818672,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895493.9331262,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895512.6133618,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "waiting_dependency",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895521.9211178,
+          "kind": "controller-state",
+          "stage": "pending_validation",
+          "state": "queued",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895530.699613,
+          "kind": "controller-state",
+          "stage": "pending_validation",
+          "state": "running",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895545.511008,
+          "kind": "controller-state",
+          "stage": "pending_validation",
+          "state": "waiting_dependency",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+        },
+        {
+          "at": 1792895593.7202768,
+          "kind": "finished",
+          "status": "passed"
+        },
+        {
+          "at": 1792895607.5716004,
+          "kind": "cleaned"
+        }
+      ],
+      "policy_hash": "0e54c2a97899b0bd30245a6e7f8982367f0fecc39c4ada7b0d1f164972cc46ea",
+      "verdict": {
+        "passed": true,
+        "at": 1792895593.6669927,
+        "kind": "real-loop",
+        "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+        "revision_count": 1,
+        "initial_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+        "ci_runs": [
+          {
+            "id": 40154675784,
+            "run_attempt": 1,
+            "head_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+            "path": ".github/workflows/ci.yml",
+            "conclusion": "success",
+            "target_proof": {
+              "pr_number": 32,
+              "repository": "simonjiao/gongcao",
+              "base_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+              "head_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+              "base_ref": "main",
+              "base_ref_basis": "current ref + complete retarget history before run creation",
+              "run_created_at": "2026-10-25T02:30:07Z",
+              "last_base_change": null,
+              "timeline_sha256": "513b8f5e43206d2869d16fbbd40a13584660b8b944e9ea3d0ca6579be21aa638",
+              "checkout_sha": "abd94760d3620cfcae15811dbce51644a2a203f6",
+              "run_id": 40154675784,
+              "attempt": 1,
+              "job_id": 121053399312,
+              "source": "actions/checkout job log + GitHub commit parents",
+              "checkout_basis": "successful checkout step",
+              "log_sha256": "9a25cf61cb1a40d250170c48147abc23f3d7855db7c80443db47db8a47049b69"
+            }
+          }
+        ],
+        "sessions": [
+          {
+            "id": "fd13bdda60db4eae8efdeca0a854d7ef",
+            "role": "analyst",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170df-d7f0-7781-8825-4fcc6337f87f",
+            "evidence_valid": 0
+          },
+          {
+            "id": "bb88a4c5a0e148fa908a77d3bcd5ba21",
+            "role": "analyst",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170e0-72b4-7930-8058-da6f4df441de",
+            "evidence_valid": 0
+          },
+          {
+            "id": "1a4ae893b2ff43c8a8e014f0c669a035",
+            "role": "developer",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170e1-0251-7480-93d0-0411d5c407b0",
+            "evidence_valid": 0
+          },
+          {
+            "id": "c82f0d9bdbf14a539a2e369d08b6745a",
+            "role": "reviewer",
+            "state": "completed",
+            "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+            "thread_id": "01a170e3-ce35-7570-a4b3-dce365301fdf",
+            "evidence_valid": 0
+          },
+          {
+            "id": "e59e6bec799a451f9382b9cd5b12ee42",
+            "role": "developer",
+            "state": "completed",
+            "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+            "thread_id": "01a170e4-4e45-7240-8003-100c651b5628",
+            "evidence_valid": 0
+          },
+          {
+            "id": "afcd05e63eb54a5ebecac8456e485743",
+            "role": "reviewer",
+            "state": "completed",
+            "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+            "thread_id": "01a170e6-2c9a-7132-91c5-bd8a6fa10540",
+            "evidence_valid": 1
+          },
+          {
+            "id": "76f67f1aa3e442a9b4f5087afe39f43f",
+            "role": "validator",
+            "state": "completed",
+            "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+            "thread_id": "01a170e6-bd36-7692-bb90-972cda879689",
+            "evidence_valid": 1
+          }
+        ],
+        "stale_sha_rejected": true,
+        "boundary_probe": {
+          "inputs": [
+            -500,
+            -1,
+            0,
+            1,
+            99,
+            100,
+            101,
+            500
+          ],
+          "initial": [
+            -500,
+            -1,
+            0,
+            1,
+            99,
+            100,
+            100,
+            100
+          ],
+          "final": [
+            0,
+            0,
+            0,
+            1,
+            99,
+            100,
+            100,
+            100
+          ]
+        },
+        "changed_files": [
+          "qa_fixture_942e0369a8f3.py",
+          "tests/test_qa_fixture_942e0369a8f3.py"
+        ],
+        "review_ids": [
+          5641173488,
+          5641183095
+        ],
+        "repeat_unchanged": true
+      },
+      "verification": {
+        "run_id": "942e0369a8f349e8b71f1a8f05daa986",
+        "passed": true,
+        "as_of": 1792895593.6669927,
+        "cleaned": true,
+        "evidence": "archived, digest-checked"
+      },
+      "archive_sha256": {
+        "configuration.json": "b893125fd94028eb8bf78b165a7725c86429591b9267aca8162ba80a645cef61",
+        "missing-gate.json": "f930f0ae0625bac57a9fc21b955af4d002de8ffc2d0ab3e5903d6d497a582ebd",
+        "github.json": "5da23c766a45ba1b02946f0afd7a06f598e2c4cc67064253a82854987cf0d3cb",
+        "repeat.json": "5b0af05370cee216f797c34eeba63471b2b87bb42a0cd593e3353ce532a95210",
+        "task.json": "061a87b26e6b25a720cce527dd3a132c2339179ea88cc1838b72462bfd9f6743",
+        "verdict.json": "35b5095e0b5230b433e941bbf7f0aac3d56c5f05b7bd3993767f0c45979db2e6",
+        "cleanup-task.json": "061a87b26e6b25a720cce527dd3a132c2339179ea88cc1838b72462bfd9f6743",
+        "cleanup-remote.json": "fa882ea44f8745427439e21d1a72c710ca94a8ec460cc5fde7f5a6ed6447455b"
+      },
+      "remote_after_cleanup": {
+        "issue": {
+          "number": 29,
+          "state": "closed",
+          "url": "https://github.com/simonjiao/gongcao/issues/29"
+        },
+        "pull": {
+          "number": 32,
+          "state": "closed",
+          "merged": false,
+          "head_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "url": "https://github.com/simonjiao/gongcao/pull/32"
+        },
+        "branch_deleted": true
+      },
+      "sessions": [
+        {
+          "id": "fd13bdda60db4eae8efdeca0a854d7ef",
+          "role": "analyst",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170df-d7f0-7781-8825-4fcc6337f87f",
+          "context_hash": "966e6bb507b3661a5ea14d10ffd50f80c3f006153b9152d132b026302279731b",
+          "evidence_valid": 0,
+          "started": 1792895078.3345804,
+          "ended": 1792895113.5339258,
+          "conclusion": "ready",
+          "files": {
+            "runs/fd13bdda60db4eae8efdeca0a854d7ef/context.json": "2bde46225f9ea474fece39b30819ca3bb0987bb5645b48dfa078ea4e9429e3a0",
+            "logs/fd13bdda60db4eae8efdeca0a854d7ef.jsonl": "caec8c1215f12e5af3ac65f25c0bc2b0e59a5c03f2fa49fb32ef28541021b1e7"
+          }
+        },
+        {
+          "id": "bb88a4c5a0e148fa908a77d3bcd5ba21",
+          "role": "analyst",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170e0-72b4-7930-8058-da6f4df441de",
+          "context_hash": "966e6bb507b3661a5ea14d10ffd50f80c3f006153b9152d132b026302279731b",
+          "evidence_valid": 0,
+          "started": 1792895118.3283343,
+          "ended": 1792895153.6797838,
+          "conclusion": "ready",
+          "files": {
+            "runs/bb88a4c5a0e148fa908a77d3bcd5ba21/context.json": "2bde46225f9ea474fece39b30819ca3bb0987bb5645b48dfa078ea4e9429e3a0",
+            "logs/bb88a4c5a0e148fa908a77d3bcd5ba21.jsonl": "d8c8ab13fa3bc9fab278a9920579e359806a5a630aadb0016c5bb8772b58d485"
+          }
+        },
+        {
+          "id": "1a4ae893b2ff43c8a8e014f0c669a035",
+          "role": "developer",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170e1-0251-7480-93d0-0411d5c407b0",
+          "context_hash": "dcbae3e12798b72b157a8b63e67d84fb4279c8c88686d9e41f4b25eb874c1d9a",
+          "evidence_valid": 0,
+          "started": 1792895155.0500512,
+          "ended": 1792895178.3759866,
+          "conclusion": "ready",
+          "files": {
+            "runs/1a4ae893b2ff43c8a8e014f0c669a035/context.json": "d54e383fad66a036a3ea9efa50f843c64fe87675eb5e2b1b763031278b2be7f4",
+            "logs/1a4ae893b2ff43c8a8e014f0c669a035.jsonl": "f9b3e5477e41af5ee28ad552bfcae8f1e7a6690ebbe684fbd82b027e764bd083"
+          }
+        },
+        {
+          "id": "c82f0d9bdbf14a539a2e369d08b6745a",
+          "role": "reviewer",
+          "state": "completed",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+          "thread_id": "01a170e3-ce35-7570-a4b3-dce365301fdf",
+          "context_hash": "1246c25837a9fd53df6236cc389d4c837f6efe2eecf800c11d14535943cd9b11",
+          "evidence_valid": 0,
+          "started": 1792895337.8362238,
+          "ended": 1792895357.3095224,
+          "conclusion": "revise",
+          "files": {
+            "runs/c82f0d9bdbf14a539a2e369d08b6745a/context.json": "41ec0f163fc606f9b96374bbed9e9a079ec609e564a6b3a932e3b2f6ac5cb12a",
+            "logs/c82f0d9bdbf14a539a2e369d08b6745a.jsonl": "6b9ec68dd2d0ec8210db4a9c25e0370878693bfcab7ea973fcbe6056ceac430c"
+          }
+        },
+        {
+          "id": "e59e6bec799a451f9382b9cd5b12ee42",
+          "role": "developer",
+          "state": "completed",
+          "target_sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+          "thread_id": "01a170e4-4e45-7240-8003-100c651b5628",
+          "context_hash": "037c1d117690aeb98970e19b33d5ffa0d3d3509b017309c1865697794dc11730",
+          "evidence_valid": 0,
+          "started": 1792895370.5666668,
+          "ended": 1792895391.6308725,
+          "conclusion": "ready",
+          "files": {
+            "runs/e59e6bec799a451f9382b9cd5b12ee42/context.json": "631c8db263b4c94e8cb9d56a6cf235be9e002f3ea92a380b739c6f43118eb9f6",
+            "logs/e59e6bec799a451f9382b9cd5b12ee42.jsonl": "9ed2cfc14cb5f5826b66270831d07696bedd86cc6766a87255fdfe8685d68f7a"
+          }
+        },
+        {
+          "id": "afcd05e63eb54a5ebecac8456e485743",
+          "role": "reviewer",
+          "state": "completed",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "thread_id": "01a170e6-2c9a-7132-91c5-bd8a6fa10540",
+          "context_hash": "0ec346655531d113bac4f6d408cabbd47facfc3f363b98519e4a4d8168c883db",
+          "evidence_valid": 1,
+          "started": 1792895493.692688,
+          "ended": 1792895512.6004364,
+          "conclusion": "ready",
+          "files": {
+            "runs/afcd05e63eb54a5ebecac8456e485743/context.json": "aed3b9fded3858047824e2d39b475d94e49677892098c4e63195bda1e6ba6437",
+            "logs/afcd05e63eb54a5ebecac8456e485743.jsonl": "c6567e6b12334f9893190ef63fb6c1f6c672cfe39a02f1418329f50b28b41ead"
+          }
+        },
+        {
+          "id": "76f67f1aa3e442a9b4f5087afe39f43f",
+          "role": "validator",
+          "state": "completed",
+          "target_sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "thread_id": "01a170e6-bd36-7692-bb90-972cda879689",
+          "context_hash": "ec2357d12f3272b994747cd35d9f6efe269b26e228f3a83c5913bd3318b9b059",
+          "evidence_valid": 1,
+          "started": 1792895530.491877,
+          "ended": 1792895545.0389986,
+          "conclusion": "ready",
+          "files": {
+            "runs/76f67f1aa3e442a9b4f5087afe39f43f/context.json": "9db5cc4cd30c57b7afb675dbaab182b9a7146be911dd69c513345a8b0d8bcbc0",
+            "logs/76f67f1aa3e442a9b4f5087afe39f43f.jsonl": "222eaccec4afc93a24ee87a1a2f4d366ca6d921f292d61bd7c150b0804c667bc"
+          }
+        }
+      ],
+      "quality": [
+        {
+          "kind": "checks",
+          "sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+          "policy": "0e54c2a97899b0bd30245a6e7f8982367f0fecc39c4ada7b0d1f164972cc46ea",
+          "valid": 0,
+          "passed": true,
+          "command_exit_codes": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "kind": "checks",
+          "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "policy": "0e54c2a97899b0bd30245a6e7f8982367f0fecc39c4ada7b0d1f164972cc46ea",
+          "valid": 1,
+          "passed": true,
+          "commands": [
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "ruff",
+                "check",
+                "."
+              ],
+              "exit_code": 0,
+              "stdout_tail": "All checks passed!\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "ruff",
+                "format",
+                "--check",
+                "."
+              ],
+              "exit_code": 0,
+              "stdout_tail": "39 files already formatted\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "mypy"
+              ],
+              "exit_code": 0,
+              "stdout_tail": "Success: no issues found in 18 source files\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "pytest",
+                "-q"
+              ],
+              "exit_code": 0,
+              "stdout_tail": "........................................................................................................................................ [ 93%]\n..........                                                               [100%]\n146 passed, 8 subtests passed in 61.95s (0:01:01)\n"
+            }
+          ]
+        },
+        {
+          "kind": "real",
+          "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "policy": "0e54c2a97899b0bd30245a6e7f8982367f0fecc39c4ada7b0d1f164972cc46ea",
+          "valid": 1,
+          "passed": true,
+          "commands": [
+            {
+              "argv": [
+                "uv",
+                "run",
+                "--offline",
+                "--no-project",
+                "--python",
+                "/usr/bin/python3",
+                "python",
+                "-B",
+                "-c",
+                "import runpy; clamp=runpy.run_path('qa_fixture_942e0369a8f3.py')['clamp_score']; values=(-500, -1, 0, 1, 99, 100, 101, 500); assert all(clamp(x)==max(0,min(100,x)) for x in values)"
+              ],
+              "exit_code": 0,
+              "stdout_tail": ""
+            }
+          ]
+        }
+      ],
+      "operations": [
+        {
+          "id": "1f8ede9e77ce4ecf605cf7e3ccde8836714a282b2b62927206fe288eeb68528d",
+          "kind": "push",
+          "sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "state": "succeeded",
+          "response": {
+            "sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+            "branch": "gongcao/work-6d7e51993879"
+          },
+          "payload_sha256": "326937654166346f3f84e570887c1489a3ff9eb6a4471ab60ba2de4cb0219025",
+          "payload_fields": {
+            "branch": "gongcao/work-6d7e51993879",
+            "sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244"
+          }
+        },
+        {
+          "id": "d73b02d89aa7305d012699b5803bd5e2e5692e9e53ea44d51de743fbeffc3469",
+          "kind": "pull",
+          "sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "state": "succeeded",
+          "response": {
+            "number": 32
+          },
+          "payload_sha256": "2a124f7fc162b9acc65e1270da1caa435e38e1a52c4f1e63bec576e19b05a127",
+          "payload_fields": {
+            "base": "main",
+            "draft": true,
+            "head": "gongcao/work-6d7e51993879",
+            "title": "[QA 942e0369a8f3] clamp_score (loop)"
+          },
+          "body_sha256": "1c8e2dfe2eb9fb553388aa635d5994711f8a5f4ea1246ed0101c7a4b6f54a2f9"
+        },
+        {
+          "id": "df157f4efd559875e76117188521ff51aec0ecee4661924c6e9451a284ae66b1",
+          "kind": "review",
+          "sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+          "state": "succeeded",
+          "response": {
+            "id": 5641173488
+          },
+          "payload_sha256": "2371243f96f489cae2c725b4461a4a162f30e2dff8c3726c67f94c55279e78f4",
+          "payload_fields": {
+            "commit_id": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+            "event": "COMMENT"
+          },
+          "body_sha256": "3d9e5379fe8202519b5fd4abc4b71358f7651e72eb6e565a279177259e022638"
+        },
+        {
+          "id": "7f3a2edd27382fefbf996b3261dc65c6b39273e08e847b4d5fb920080a82f9ab",
+          "kind": "push",
+          "sha": "e7e713ba427b8954ffe07a20d89055ddcb5ef244",
+          "state": "succeeded",
+          "response": {
+            "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+            "branch": "gongcao/work-6d7e51993879"
+          },
+          "payload_sha256": "08bb4d5eabd26d1a76e76c8f38f6502aaebdacdf5825c5b56cad208aede9b9a7",
+          "payload_fields": {
+            "branch": "gongcao/work-6d7e51993879",
+            "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+          }
+        },
+        {
+          "id": "ff4db4f1b5af5dcb431004de88f4fb8322e2480aaf08aae730bd6ff57645e8d9",
+          "kind": "review",
+          "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "state": "succeeded",
+          "response": {
+            "id": 5641183095
+          },
+          "payload_sha256": "b56fbeccdb2b2fae0d323ce9f776a0a57ed6fe384311b76240a8affed7610c41",
+          "payload_fields": {
+            "commit_id": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+            "event": "COMMENT"
+          },
+          "body_sha256": "dc46ebf968e4bac0a15e6d95b60cdc502fb4fd6c9062c6fa1cea0a1ee7419f83"
+        },
+        {
+          "id": "32c46901ad449e78900a130ef34bed5482c382d6fbd00fc2dac49135cc640286",
+          "kind": "ready",
+          "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0",
+          "state": "succeeded",
+          "response": {
+            "ready": true
+          },
+          "payload_sha256": "aacc26a6d6a51bd28da7bc20f2098b26d446d669deb849c71d95b3dc590acd6c",
+          "payload_fields": {
+            "sha": "64419c084b3f690870dd8613bf9035f4e5669fd0"
+          }
+        }
+      ],
+      "runtime": {
+        "lease_present": false,
+        "active_processes": []
+      },
+      "local_cleanup": {
+        "source_removed": true,
+        "worktrees_removed": true,
+        "model_auth_copies_remaining": 0
+      }
+    },
+    {
+      "id": "a24c47c8cc8b48c0a2a571a966cee317",
+      "scenario": "recover",
+      "scenario_version": 2,
+      "scenario_digest": "b1f036c8949cc4c043b260e98ba0b010962c7340556542f588ed4e15c559410e",
+      "implementation_sha": "3c3357cc4413e647fcc78b672a47604cd2ac6f68",
+      "config_digest": "09785848bdf7c3553720cb89517cb53d18deb436e0e09d1956e3477b1bacd1c3",
+      "base_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+      "base_branch": "main",
+      "resources": {
+        "issue": {
+          "number": 31,
+          "url": "https://github.com/simonjiao/gongcao/issues/31"
+        },
+        "branch": "gongcao/work-fcf37fd636ea",
+        "pr_number": 33
+      },
+      "status": "passed",
+      "cleaned": true,
+      "events": [
+        {
+          "at": 1792895092.6139846,
+          "kind": "started"
+        },
+        {
+          "at": 1792895144.2012572,
+          "kind": "missing-gate-blocked",
+          "repeat_unchanged": true
+        },
+        {
+          "at": 1792895144.2093859,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "waiting_environment",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895146.247932,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "queued",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895146.7848125,
+          "kind": "controller-state",
+          "stage": "pending_analysis",
+          "state": "running",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895183.2243748,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "queued",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895184.7502685,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "running",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895206.5849922,
+          "kind": "controller-state",
+          "stage": "pending_development",
+          "state": "waiting_dependency",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455"
+        },
+        {
+          "at": 1792895231.084879,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+        },
+        {
+          "at": 1792895232.6256607,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+        },
+        {
+          "at": 1792895337.7617724,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "queued",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+        },
+        {
+          "at": 1792895339.321249,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "running",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+        },
+        {
+          "at": 1792895360.094174,
+          "kind": "controller-state",
+          "stage": "pending_review",
+          "state": "waiting_dependency",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+        },
+        {
+          "at": 1792895584.1065967,
+          "kind": "remote-write-recovered",
+          "operation": "a053ebd00e1cd05dbf2174d3933ffe9afe3ef00590a973c5853e451e62f399a8"
+        },
+        {
+          "at": 1792895617.9776797,
+          "kind": "finished",
+          "status": "passed"
+        },
+        {
+          "at": 1792895631.2330658,
+          "kind": "cleaned"
+        }
+      ],
+      "policy_hash": "895159735d06576f8f7c2b1dca1447f2e2d8b463e720975ee947784bef52ade4",
+      "verdict": {
+        "passed": true,
+        "at": 1792895617.915491,
+        "kind": "real-loop",
+        "target_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+        "revision_count": 1,
+        "initial_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+        "ci_runs": [
+          {
+            "id": 40154701929,
+            "run_attempt": 1,
+            "head_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+            "path": ".github/workflows/ci.yml",
+            "conclusion": "success",
+            "target_proof": {
+              "pr_number": 33,
+              "repository": "simonjiao/gongcao",
+              "base_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+              "head_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+              "base_ref": "main",
+              "base_ref_basis": "current ref + complete retarget history before run creation",
+              "run_created_at": "2026-10-25T02:30:27Z",
+              "last_base_change": null,
+              "timeline_sha256": "49333eddb5aee6ebc251278fd4e0bea32e498ee3fdcd2220f2a4d638b7b6530a",
+              "checkout_sha": "59caa3240f6b005c3b5325c68def0f3200f284b7",
+              "run_id": 40154701929,
+              "attempt": 1,
+              "job_id": 121053470370,
+              "source": "actions/checkout job log + GitHub commit parents",
+              "checkout_basis": "successful checkout step",
+              "log_sha256": "c4f0a3fb73ad140a095b3bf04b8ee36613d5fd795d9ae5ba7280eb4248392b6e"
+            }
+          }
+        ],
+        "sessions": [
+          {
+            "id": "7cc51a4b48b648489f4d32bdbb9aabda",
+            "role": "analyst",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170e0-3f6d-7e11-b78b-1b9837c42a3c",
+            "evidence_valid": 0
+          },
+          {
+            "id": "77acffb4377d4aacb606ad4f5d40395f",
+            "role": "analyst",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170e0-e14e-70a2-bea5-400d4ee0c295",
+            "evidence_valid": 0
+          },
+          {
+            "id": "2426055a9087487cbb86f4d381d3114c",
+            "role": "developer",
+            "state": "completed",
+            "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+            "thread_id": "01a170e1-750c-78f3-84f6-8caeb359afca",
+            "evidence_valid": 0
+          },
+          {
+            "id": "93045a7e1bfe42658b120fbd4b415598",
+            "role": "reviewer",
+            "state": "completed",
+            "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "thread_id": "01a170e3-dbb5-7770-8e53-0bed245d941a",
+            "evidence_valid": 0
+          },
+          {
+            "id": "2418fe377cdf4429a9421af6a47d59a8",
+            "role": "developer",
+            "state": "completed",
+            "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "thread_id": "01a170e4-8dac-7302-a1b7-1576581e866a",
+            "evidence_valid": 0
+          },
+          {
+            "id": "c03bbbabe321451d98e8a2d84810262d",
+            "role": "reviewer",
+            "state": "completed",
+            "target_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+            "thread_id": "01a170e6-72e5-79e1-86fe-94a3f2dd8b97",
+            "evidence_valid": 1
+          },
+          {
+            "id": "81c755ab68c7416ebfd9142181e79c24",
+            "role": "validator",
+            "state": "completed",
+            "target_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+            "thread_id": "01a170e7-0de2-7611-900d-bdb709c7edc4",
+            "evidence_valid": 1
+          }
+        ],
+        "stale_sha_rejected": true,
+        "boundary_probe": {
+          "inputs": [
+            -500,
+            -1,
+            0,
+            1,
+            99,
+            100,
+            101,
+            500
+          ],
+          "initial": [
+            -500,
+            -1,
+            0,
+            1,
+            99,
+            100,
+            100,
+            100
+          ],
+          "final": [
+            0,
+            0,
+            0,
+            1,
+            99,
+            100,
+            100,
+            100
+          ]
+        },
+        "changed_files": [
+          "qa_fixture_a24c47c8cc8b.py",
+          "tests/test_qa_fixture_a24c47c8cc8b.py"
+        ],
+        "review_ids": [
+          5641173660,
+          5641184412
+        ],
+        "repeat_unchanged": true
+      },
+      "verification": {
+        "run_id": "a24c47c8cc8b48c0a2a571a966cee317",
+        "passed": true,
+        "as_of": 1792895617.915491,
+        "cleaned": true,
+        "evidence": "archived, digest-checked"
+      },
+      "archive_sha256": {
+        "configuration.json": "abbf70f48729e09f41f82690b47ea12233be821aac05295b07233825e5f08c1d",
+        "missing-gate.json": "eba9056de52d62f9f57d5cd753a551443f4fb824748304fbd9b2335eba62cace",
+        "interrupted.json": "033732b808045e2284ce0a6fb9ec9252767da4e507a1cf68538df9f8358d34af",
+        "recovered.json": "5216ce6d87677f56710e9f64828b228eb0a8750c34e7e7fb43ff6bbd339c3444",
+        "github.json": "58ee897a40aadfe5821661eff80add186bed0c13dfae484e55541828618be0e8",
+        "repeat.json": "7740f8a3c90c1cc43ba3be983dac347d8930660278395b6baa39a4b030b73d4a",
+        "task.json": "a6f9c2d980bfb8b4674712270297a1593a6c64e0d27c52228d36222ded012db7",
+        "verdict.json": "5363668049ba16ce2bbe5b8b9666c952f24c41de2bd9ba17eb0344967ec1fc49",
+        "cleanup-task.json": "a6f9c2d980bfb8b4674712270297a1593a6c64e0d27c52228d36222ded012db7",
+        "cleanup-remote.json": "b7a6f9b38715a3a0d4bccca40500dcc9c78af5cc2471987e7a10fe4172c58c6a"
+      },
+      "remote_after_cleanup": {
+        "issue": {
+          "number": 31,
+          "state": "closed",
+          "url": "https://github.com/simonjiao/gongcao/issues/31"
+        },
+        "pull": {
+          "number": 33,
+          "state": "closed",
+          "merged": false,
+          "head_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "url": "https://github.com/simonjiao/gongcao/pull/33"
+        },
+        "branch_deleted": true
+      },
+      "sessions": [
+        {
+          "id": "7cc51a4b48b648489f4d32bdbb9aabda",
+          "role": "analyst",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170e0-3f6d-7e11-b78b-1b9837c42a3c",
+          "context_hash": "ee83099c547ac778916d048c8602d3e2bcdedb8a4265110aef24dd00a77b4c75",
+          "evidence_valid": 0,
+          "started": 1792895105.247984,
+          "ended": 1792895141.7475567,
+          "conclusion": "ready",
+          "files": {
+            "runs/7cc51a4b48b648489f4d32bdbb9aabda/context.json": "e7a32896ed27188d39a1afed981f9b74f7ee127ea6c7a85a4e46c997a1c622e9",
+            "logs/7cc51a4b48b648489f4d32bdbb9aabda.jsonl": "7e80316a20391afbb2093fa57748596c55eb760b094d8091f537b33ceb7e108b"
+          }
+        },
+        {
+          "id": "77acffb4377d4aacb606ad4f5d40395f",
+          "role": "analyst",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170e0-e14e-70a2-bea5-400d4ee0c295",
+          "context_hash": "ee83099c547ac778916d048c8602d3e2bcdedb8a4265110aef24dd00a77b4c75",
+          "evidence_valid": 0,
+          "started": 1792895146.7176704,
+          "ended": 1792895183.165639,
+          "conclusion": "ready",
+          "files": {
+            "runs/77acffb4377d4aacb606ad4f5d40395f/context.json": "e7a32896ed27188d39a1afed981f9b74f7ee127ea6c7a85a4e46c997a1c622e9",
+            "logs/77acffb4377d4aacb606ad4f5d40395f.jsonl": "af9577bcfa731b83ba6ae39e38e77427d274bb112bf38d3bee96c579f6abb068"
+          }
+        },
+        {
+          "id": "2426055a9087487cbb86f4d381d3114c",
+          "role": "developer",
+          "state": "completed",
+          "target_sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "thread_id": "01a170e1-750c-78f3-84f6-8caeb359afca",
+          "context_hash": "b600e2c06045116b7d21d1390829668442569186c1a595c0f65d875215b8935b",
+          "evidence_valid": 0,
+          "started": 1792895184.5440197,
+          "ended": 1792895206.2390108,
+          "conclusion": "ready",
+          "files": {
+            "runs/2426055a9087487cbb86f4d381d3114c/context.json": "9cee2c0257ad4b1d53a0992f4e9456abfac0a0024ee7ec7ce37d369fa9998c94",
+            "logs/2426055a9087487cbb86f4d381d3114c.jsonl": "1456b61b2557da1f23ed9540977ba080ab67ced65fad1abdb10c5b171d28d691"
+          }
+        },
+        {
+          "id": "93045a7e1bfe42658b120fbd4b415598",
+          "role": "reviewer",
+          "state": "completed",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "thread_id": "01a170e3-dbb5-7770-8e53-0bed245d941a",
+          "context_hash": "a514096727fa24f29d8ec3ddcfe77dd5e56232d03ae83cdf88d58482ff371697",
+          "evidence_valid": 0,
+          "started": 1792895339.1026118,
+          "ended": 1792895359.8157454,
+          "conclusion": "revise",
+          "files": {
+            "runs/93045a7e1bfe42658b120fbd4b415598/context.json": "6cadbf76203c72fcd2d38792bd7a0a02d49d6f1f5a90cbde7e35f888f69a620f",
+            "logs/93045a7e1bfe42658b120fbd4b415598.jsonl": "8f4f627a438bee14683f05000dd0c3338f0feb8633926435d817687a418736cf"
+          }
+        },
+        {
+          "id": "2418fe377cdf4429a9421af6a47d59a8",
+          "role": "developer",
+          "state": "completed",
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "thread_id": "01a170e4-8dac-7302-a1b7-1576581e866a",
+          "context_hash": "d24824de9a595082169c62cf882323f2c499411fd46dc39b0eb50ba975a3515c",
+          "evidence_valid": 0,
+          "started": 1792895386.8155756,
+          "ended": 1792895410.782266,
+          "conclusion": "ready",
+          "files": {
+            "runs/2418fe377cdf4429a9421af6a47d59a8/context.json": "78d41749fea87f89586c0475782ac8d8fdfc3aaaa47ea82719f20a339ca6dd0a",
+            "logs/2418fe377cdf4429a9421af6a47d59a8.jsonl": "574bfa4da5b439c3cb3163630962582812ec14eba2a4c76cddfefc4b733a979f"
+          }
+        },
+        {
+          "id": "c03bbbabe321451d98e8a2d84810262d",
+          "role": "reviewer",
+          "state": "completed",
+          "target_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "thread_id": "01a170e6-72e5-79e1-86fe-94a3f2dd8b97",
+          "context_hash": "c652630f99de9d7e740d4737f5349e080de6d16dd67a6647a97ff69f216f24d2",
+          "evidence_valid": 1,
+          "started": 1792895511.439827,
+          "ended": 1792895533.641126,
+          "conclusion": "ready",
+          "files": {
+            "runs/c03bbbabe321451d98e8a2d84810262d/context.json": "5b69343bea1e4104adb2e2d11fe3718ff87e4325094cbad112f4e0a6107456c2",
+            "logs/c03bbbabe321451d98e8a2d84810262d.jsonl": "434e4adb267205f7cec3d686b768f1c6b25345b670532c1d2572365c8a655d7d"
+          }
+        },
+        {
+          "id": "81c755ab68c7416ebfd9142181e79c24",
+          "role": "validator",
+          "state": "completed",
+          "target_sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "thread_id": "01a170e7-0de2-7611-900d-bdb709c7edc4",
+          "context_hash": "df52d8976dd1d1b6e3c18f2914bd5dbd3d49fe1a3e685355eccf23461ca635a7",
+          "evidence_valid": 1,
+          "started": 1792895551.1660354,
+          "ended": 1792895566.4719608,
+          "conclusion": "ready",
+          "files": {
+            "runs/81c755ab68c7416ebfd9142181e79c24/context.json": "a33e5082f9a3a0c5a40a190f32d1b71dc20084a4c82f4f3673650063c0932893",
+            "logs/81c755ab68c7416ebfd9142181e79c24.jsonl": "e50eb743bc94c0cd006b4cd54ec93b03247127059ff278b2cf3daa63fe6af8d9"
+          }
+        }
+      ],
+      "quality": [
+        {
+          "kind": "checks",
+          "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "policy": "895159735d06576f8f7c2b1dca1447f2e2d8b463e720975ee947784bef52ade4",
+          "valid": 0,
+          "passed": true,
+          "command_exit_codes": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "kind": "checks",
+          "sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "policy": "895159735d06576f8f7c2b1dca1447f2e2d8b463e720975ee947784bef52ade4",
+          "valid": 1,
+          "passed": true,
+          "commands": [
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "ruff",
+                "check",
+                "."
+              ],
+              "exit_code": 0,
+              "stdout_tail": "All checks passed!\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "ruff",
+                "format",
+                "--check",
+                "."
+              ],
+              "exit_code": 0,
+              "stdout_tail": "39 files already formatted\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "mypy"
+              ],
+              "exit_code": 0,
+              "stdout_tail": "Success: no issues found in 18 source files\n"
+            },
+            {
+              "argv": [
+                "/usr/bin/env",
+                "HOME=/tmp/gongcao-check-home",
+                "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
+                "UV_LINK_MODE=copy",
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "/usr/bin/python3",
+                "pytest",
+                "-q"
+              ],
+              "exit_code": 0,
+              "stdout_tail": "........................................................................................................................................ [ 93%]\n.........                                                                [100%]\n145 passed, 8 subtests passed in 50.77s\n"
+            }
+          ]
+        },
+        {
+          "kind": "real",
+          "sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "policy": "895159735d06576f8f7c2b1dca1447f2e2d8b463e720975ee947784bef52ade4",
+          "valid": 1,
+          "passed": true,
+          "commands": [
+            {
+              "argv": [
+                "uv",
+                "run",
+                "--offline",
+                "--no-project",
+                "--python",
+                "/usr/bin/python3",
+                "python",
+                "-B",
+                "-c",
+                "import runpy; clamp=runpy.run_path('qa_fixture_a24c47c8cc8b.py')['clamp_score']; values=(-500, -1, 0, 1, 99, 100, 101, 500); assert all(clamp(x)==max(0,min(100,x)) for x in values)"
+              ],
+              "exit_code": 0,
+              "stdout_tail": ""
+            }
+          ]
+        }
+      ],
+      "operations": [
+        {
+          "id": "f236a0b9471158d32ab46b8a422f8b6b2cf6778ea12d7d888c86f7ac9b292cf6",
+          "kind": "push",
+          "sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "state": "succeeded",
+          "response": {
+            "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "branch": "gongcao/work-fcf37fd636ea"
+          },
+          "payload_sha256": "f9f2ecbd237e7e55d364c59b26b4ef16ee02b5da9ef70638d691e42718c5bc59",
+          "payload_fields": {
+            "branch": "gongcao/work-fcf37fd636ea",
+            "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12"
+          }
+        },
+        {
+          "id": "70e0f8c631d865f5fd53d075d760c1000b4f03a941c7b27cd62be49e232d5cc1",
+          "kind": "pull",
+          "sha": "35ca3609a5c84bd15ed37729a3ecb6563584c455",
+          "state": "succeeded",
+          "response": {
+            "number": 33
+          },
+          "payload_sha256": "879609aaefe2f68413b552d811660b8f98bb83ff4f2cb137ded080975e7a964c",
+          "payload_fields": {
+            "base": "main",
+            "draft": true,
+            "head": "gongcao/work-fcf37fd636ea",
+            "title": "[QA a24c47c8cc8b] clamp_score (recover)"
+          },
+          "body_sha256": "a257f9aaf651f66524bed61f3d4461658dcf691822abd5b0f041a580aa0bb18c"
+        },
+        {
+          "id": "a053ebd00e1cd05dbf2174d3933ffe9afe3ef00590a973c5853e451e62f399a8",
+          "kind": "review",
+          "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "state": "succeeded",
+          "response": {
+            "id": 5641173660
+          },
+          "payload_sha256": "1cad8d4131d247c1c35a9d3b6e11375275aaa2a4f7bfc0a9383e4d40923ff55a",
+          "payload_fields": {
+            "commit_id": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "event": "COMMENT"
+          },
+          "body_sha256": "a44d979f65b34d0fc94d48d6ae52da66e5cd9c8773ecb9ae7fd2f42d4ad708ed"
+        },
+        {
+          "id": "72e572da915318c0b036843c63da7e9d7a1a049f28e808b1fae51ac527a8730e",
+          "kind": "push",
+          "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "state": "succeeded",
+          "response": {
+            "sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+            "branch": "gongcao/work-fcf37fd636ea"
+          },
+          "payload_sha256": "51ef5e10a95fb68347cf0fd4be7ba89ddf730c572105afb5613fa87c998499a8",
+          "payload_fields": {
+            "branch": "gongcao/work-fcf37fd636ea",
+            "sha": "b49daf213d776d095733318a4e26d398ebccda7c"
+          }
+        },
+        {
+          "id": "e8759d39041e979d29af868a55d898c45c960878a9d2bc7e9f1a3728364d3986",
+          "kind": "review",
+          "sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "state": "succeeded",
+          "response": {
+            "id": 5641184412
+          },
+          "payload_sha256": "fa5033e4a69e2eacbec8fa010288f490cee3250b3411648825fefbecc3eb50d4",
+          "payload_fields": {
+            "commit_id": "b49daf213d776d095733318a4e26d398ebccda7c",
+            "event": "COMMENT"
+          },
+          "body_sha256": "3767c92196175df8d1fe0bda87a1a5c1bcabffc8cc4d6e8ba64d19517e47c4c2"
+        },
+        {
+          "id": "db209cc37df58dbe7ddd01bbd85531b50668005e813bc247e19da04e2e522bad",
+          "kind": "ready",
+          "sha": "b49daf213d776d095733318a4e26d398ebccda7c",
+          "state": "succeeded",
+          "response": {
+            "ready": true
+          },
+          "payload_sha256": "d8fab52b724a730527b681bc918dadccd1d401549591ea1517820c96275be9a5",
+          "payload_fields": {
+            "sha": "b49daf213d776d095733318a4e26d398ebccda7c"
+          }
+        }
+      ],
+      "recovery": {
+        "witness": {
+          "operation": "a053ebd00e1cd05dbf2174d3933ffe9afe3ef00590a973c5853e451e62f399a8",
+          "observed_response": {
+            "id": 5641173660
+          },
+          "target_sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "pid": 255322,
+          "point": "COMMENT observed before local operation_result"
+        },
+        "before": {
+          "id": "a053ebd00e1cd05dbf2174d3933ffe9afe3ef00590a973c5853e451e62f399a8",
+          "kind": "review",
+          "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "state": "pending",
+          "response": null,
+          "payload_sha256": "1cad8d4131d247c1c35a9d3b6e11375275aaa2a4f7bfc0a9383e4d40923ff55a",
+          "payload_fields": {
+            "commit_id": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "event": "COMMENT"
+          },
+          "body_sha256": "a44d979f65b34d0fc94d48d6ae52da66e5cd9c8773ecb9ae7fd2f42d4ad708ed"
+        },
+        "after": {
+          "id": "a053ebd00e1cd05dbf2174d3933ffe9afe3ef00590a973c5853e451e62f399a8",
+          "kind": "review",
+          "sha": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+          "state": "succeeded",
+          "response": {
+            "id": 5641173660
+          },
+          "payload_sha256": "1cad8d4131d247c1c35a9d3b6e11375275aaa2a4f7bfc0a9383e4d40923ff55a",
+          "payload_fields": {
+            "commit_id": "d70c0c1e9ce85f1ecddebc2761359564d3625f12",
+            "event": "COMMENT"
+          },
+          "body_sha256": "a44d979f65b34d0fc94d48d6ae52da66e5cd9c8773ecb9ae7fd2f42d4ad708ed"
+        }
+      },
+      "runtime": {
+        "lease_present": false,
+        "active_processes": []
+      },
+      "local_cleanup": {
+        "source_removed": true,
+        "worktrees_removed": true,
+        "model_auth_copies_remaining": 0
+      }
+    }
+  ],
+  "historical_attempts": [
+    {
+      "id": "0d41e625ae494ad09c2f61a5b432e10b",
+      "implementation_sha": "8172d03613274ae34c88ead5a0b26cf13861fd63",
+      "scenario": "loop",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 25,
+          "url": "https://github.com/simonjiao/gongcao/issues/25"
+        },
+        "branch": "gongcao/work-7ad36e0beb55"
+      },
+      "failure": "ValueError: Unexpected cancellation",
+      "cleanup_failure": null,
+      "cleaned": true
+    },
+    {
+      "id": "83b625d248be4e84bb64b02540368ada",
+      "implementation_sha": "7018c0ea19566b364dba6bed3d2b1331b90bbda3",
+      "scenario": "cancel",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 22,
+          "url": "https://github.com/simonjiao/gongcao/issues/22"
+        },
+        "branch": "gongcao/work-a0a37e3d9c8d"
+      },
+      "failure": "ValueError: Registration failed",
+      "cleanup_failure": null,
+      "cleaned": true
+    },
+    {
+      "id": "45e46f7d58a6435b94d281fbdf0265fa",
+      "implementation_sha": "7018c0ea19566b364dba6bed3d2b1331b90bbda3",
+      "scenario": "loop",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 21,
+          "url": "https://github.com/simonjiao/gongcao/issues/21"
+        },
+        "branch": "gongcao/work-b3b6ad4a02dc"
+      },
+      "failure": "ValueError: Registration failed",
+      "cleanup_failure": null,
+      "cleaned": true
+    },
+    {
+      "id": "a761a4acd87c41379b33d3e56dff3e70",
+      "implementation_sha": "8172d03613274ae34c88ead5a0b26cf13861fd63",
+      "scenario": "recover",
+      "status": "passed",
+      "resources": {
+        "issue": {
+          "number": 26,
+          "url": "https://github.com/simonjiao/gongcao/issues/26"
+        },
+        "branch": "gongcao/work-c192ab10fcf0",
+        "pr_number": 28
+      },
+      "failure": null,
+      "cleanup_failure": null,
+      "cleaned": true
+    },
+    {
+      "id": "71244cd6c9bd4ee2a1b5ccea2cb18a92",
+      "implementation_sha": "7018c0ea19566b364dba6bed3d2b1331b90bbda3",
+      "scenario": "recover",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 23,
+          "url": "https://github.com/simonjiao/gongcao/issues/23"
+        },
+        "branch": "gongcao/work-a5179d9a5583"
+      },
+      "failure": "ValueError: Registration failed",
+      "cleanup_failure": null,
+      "cleaned": true
+    },
+    {
+      "id": "003ca8585b914f308fd4df847f6c740f",
+      "implementation_sha": "2ff3ce514607b7a84f2b5235c9fed63503e5d2b5",
+      "scenario": "loop",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 19,
+          "url": "https://github.com/simonjiao/gongcao/issues/19"
+        },
+        "branch": "gongcao/work-62f4b32e3cc2"
+      },
+      "failure": "Unconfirmed: QA action create-issue needs reconciliation; do not retry the write",
+      "cleanup_failure": "QA inventory contains an unconfirmed remote write",
+      "cleaned": true
+    },
+    {
+      "id": "1230fe983dff40faba97f5e4b2aaa9f0",
+      "implementation_sha": "2ff3ce514607b7a84f2b5235c9fed63503e5d2b5",
+      "scenario": "cancel",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 18,
+          "url": "https://github.com/simonjiao/gongcao/issues/18"
+        },
+        "branch": "gongcao/work-580cfa56dace"
+      },
+      "failure": "Unconfirmed: QA action create-issue needs reconciliation; do not retry the write",
+      "cleanup_failure": "QA inventory contains an unconfirmed remote write",
+      "cleaned": true
+    },
+    {
+      "id": "a27913550c24409c8ccee99b950a522f",
+      "implementation_sha": "2ff3ce514607b7a84f2b5235c9fed63503e5d2b5",
+      "scenario": "recover",
+      "status": "failed",
+      "resources": {
+        "issue": {
+          "number": 20,
+          "url": "https://github.com/simonjiao/gongcao/issues/20"
+        },
+        "branch": "gongcao/work-3b95bf480fa8"
+      },
+      "failure": "Unconfirmed: QA action create-issue needs reconciliation; do not retry the write",
+      "cleanup_failure": "QA inventory contains an unconfirmed remote write",
+      "cleaned": true
+    },
+    {
+      "id": "b58e9af6946548adbe589e5a351977fc",
+      "implementation_sha": "8172d03613274ae34c88ead5a0b26cf13861fd63",
+      "scenario": "cancel",
+      "status": "passed",
+      "resources": {
+        "issue": {
+          "number": 24,
+          "url": "https://github.com/simonjiao/gongcao/issues/24"
+        },
+        "branch": "gongcao/work-66a35d08e2f2",
+        "pr_number": null
+      },
+      "failure": null,
+      "cleanup_failure": null,
+      "cleaned": true
+    }
+  ],
+  "implementation_ci": {
+    "run_id": 40154096080,
+    "url": "https://github.com/simonjiao/gongcao/actions/runs/40154096080",
+    "head_sha": "3c3357cc4413e647fcc78b672a47604cd2ac6f68",
+    "python_3_12": {
+      "job_id": 121051606047,
+      "passed": 167
+    },
+    "python_3_13": {
+      "job_id": 121051606183,
+      "passed": 167
+    },
+    "conclusion": "success"
+  },
+  "limitations": [
+    "This records feature-branch implementation and target main 35ca360; Issue #1 requires another integrated run at the final merged main SHA.",
+    "Recovery interrupts the controller after a real COMMENT; no claim of interrupting a real SDK developer session.",
+    "QA concurrency is bounded inside a single batch process; no global cross-process scheduling.",
+    "Failed attempts remain failed and separately listed; their owned remote resources were reconciled/cleaned."
+  ]
+}
