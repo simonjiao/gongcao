@@ -12,7 +12,7 @@ from gongcao.github import GitHub, command
 from gongcao.store import Store
 from qa.__main__ import execute as cli_execute
 from qa.__main__ import parser
-from qa.ledger import Run
+from qa.ledger import Run, RunCancelled
 from qa.resources import Unconfirmed, cleanup
 from qa.runner import batch, core, execute
 
@@ -225,8 +225,34 @@ print('cancelled')
         store.close()
 
 
+async def test_cancellation_during_implementation_check_prevents_native_spawn(
+    tmp_path, monkeypatch
+):
+    run = new_run(tmp_path)
+
+    async def verify(run):
+        run.request_cancel()
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Known cancellation must prevent native process creation")
+
+    monkeypatch.setattr("qa.runner.verify_implementation", verify)
+    monkeypatch.setattr("qa.runner.asyncio.create_subprocess_exec", forbidden)
+    with pytest.raises(RunCancelled):
+        await core(run, "run", "1")
+
+
 @pytest.mark.parametrize(
-    "race", ["merge_on_confirmation", "merge_at_finish", "base_at_start", "base_at_finish"]
+    "race",
+    [
+        "merge_on_confirmation",
+        "merge_at_finish",
+        "base_at_start",
+        "base_at_finish",
+        "merged_pr_missing_from_listing",
+        "registered_pr_404",
+        "published_pr_not_associated",
+    ],
 )
 async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_cleaned(
     tmp_path, repo, sha, monkeypatch, race
@@ -253,6 +279,11 @@ async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_clea
             ]
         },
     }
+    if race == "published_pr_not_associated":
+        task["pr_number"] = None
+        task["evidence"]["operations"].append(
+            {"kind": "pull", "state": "succeeded", "response": {"number": 23}}
+        )
     pull = {
         "number": 23,
         "state": "open",
@@ -260,7 +291,7 @@ async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_clea
         "merged_at": None,
         "body": f"Implements {issue_url}",
         "user": {"login": "qa"},
-        "head": {"repo": {"full_name": "example/demo"}},
+        "head": {"repo": {"full_name": "example/demo"}, "ref": branch},
     }
     branch_exists = True
     issue_state = "open"
@@ -278,10 +309,24 @@ async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_clea
                     raise RuntimeError("HTTP 404")
                 return {"object": {"sha": sha}}
             if "/pulls/" in path:
+                if race == "registered_pr_404":
+                    raise RuntimeError("HTTP 404")
+                if race == "merged_pr_missing_from_listing":
+                    return pull | {
+                        "state": "closed",
+                        "merged": True,
+                        "merged_at": "2026-10-25T00:00:00Z",
+                    }
                 return dict(pull)
             return {"number": 19, "body": run.marker, "state": issue_state, "user": {"login": "qa"}}
 
         async def pages(self, path, field=None):
+            if race in {
+                "merged_pr_missing_from_listing",
+                "registered_pr_404",
+                "published_pr_not_associated",
+            }:
+                return []
             return [dict(pull)]
 
     async def mutate(*args, **kwargs):
@@ -309,5 +354,10 @@ async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_clea
     if race == "merge_on_confirmation":
         assert branch_exists and len(writes) == 1
         assert run.value["actions"]["close-pull"]["state"] == "unknown"
-    elif race == "base_at_start":
+    elif race in {
+        "base_at_start",
+        "merged_pr_missing_from_listing",
+        "registered_pr_404",
+        "published_pr_not_associated",
+    }:
         assert not writes and branch_exists

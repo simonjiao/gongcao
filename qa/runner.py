@@ -45,6 +45,8 @@ async def core(run: Run, *args: str, fault: bool = False) -> int:
     if executing:
         run.check_cancelled()
     await verify_implementation(run)
+    if executing:
+        run.check_cancelled()
     name = uuid.uuid4().hex
     argv = [
         sys.executable,

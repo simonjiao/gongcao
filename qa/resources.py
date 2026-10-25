@@ -247,11 +247,25 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     pulls = await github.pages(f"{prefix}/pulls?{query}")
     if len(pulls) > 1:
         raise Unconfirmed("More than one PR uses the QA branch")
-    pull = pulls[0] if pulls else None
+    number = task.get("pr_number") if task else resources.get("pr_number")
+    if task and any(
+        op["kind"] == "pull" and (not number or (op.get("response") or {}).get("number") != number)
+        for op in task["evidence"]["operations"]
+    ):
+        raise Unconfirmed("Published PR needs task reconciliation before cleanup")
+    if number:
+        if any(p["number"] != number for p in pulls):
+            raise Unconfirmed("QA branch PR differs from the registered PR")
+        pull = await optional(github, f"{prefix}/pulls/{number}")
+        if pull is None:
+            raise Unconfirmed("Registered test PR is unavailable; manual reconciliation required")
+    else:
+        pull = pulls[0] if pulls else None
     if pull and (
         not task
         or pull["number"] != task["pr_number"]
         or pull["head"]["repo"]["full_name"].lower() != repo
+        or pull["head"]["ref"] != branch
         or pull["user"]["login"] != run.value["github_login"]
         or f"Implements {resources['issue']['url']}" not in (pull.get("body") or "")
     ):

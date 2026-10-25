@@ -119,8 +119,9 @@ uv run python -m qa cleanup RUN_ID
 Cancellation is checked before starting a queued scene, creating its remote issue,
 or launching native execution, and is forwarded to native `cancel` during preparation
 checks as well as the main loop. A user-cancelled Run ends as `cancelled`; it cannot
-count as a passing loop/smoke scenario. Existing resources still use controlled
-cleanup. Cancelling an already finished Run returns `cancel_requested=false`.
+count as a passing loop/smoke scenario. With `--cleanup`, existing resources are
+cleaned through the same controlled path; otherwise retain them for explicit
+`cleanup RUN_ID`. Cancelling an already finished Run returns `cancel_requested=false`.
 
 `reconcile` performs read-only observation/adoption and invokes native `recover`
 for the recorded task. It never resends an uncertain write or clears an uncertain
