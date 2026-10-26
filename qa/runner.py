@@ -166,6 +166,8 @@ async def drive(
 async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     run.check_cancelled()
     requirement, config = fixture(run.id, model)
+    if run.value["scenario"] == "copilot":
+        config["copilot"] = {"operators": ["gongcao-unauthorized-fixture"], "mode": "step"}
     config_path = run.root / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=True))
     config_path.chmod(0o600)
@@ -196,7 +198,11 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     issue = await create_issue(run, requirement, github)
     run.check_cancelled()
     require(
-        await core(run, "register", issue["url"], "--repo", str(source)) == 0, "Registration failed"
+        await core(
+            run, "register", issue["url"], "--repo", str(source), "--config", str(config_path)
+        )
+        == 0,
+        "Registration failed",
     )
     store = Store(run.root / "state")
     try:
@@ -251,7 +257,11 @@ async def execute(
                 }
             else:
                 await prepare(run, github, model)
-                if run.value["scenario"] != "cancel":
+                if run.value["scenario"] == "copilot":
+                    from .copilot import exercise
+
+                    await exercise(run, github)
+                elif run.value["scenario"] != "cancel":
                     await missing_gate(run)
                 injected = False
                 deadline = time.monotonic() + 3600

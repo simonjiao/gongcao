@@ -43,6 +43,7 @@ class State(StrEnum):
     RUNNING = "running"
     WAITING_DEPENDENCY = "waiting_dependency"
     WAITING_ENVIRONMENT = "waiting_environment"
+    WAITING_INSTRUCTION = "waiting_instruction"
     RECONCILE = "needs_reconciliation"
     HUMAN = "needs_human"
     FAILED = "failed"

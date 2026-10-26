@@ -101,6 +101,7 @@ class GitHub:
             "body": data.get("body") or "",
             "state": data["state"],
             "updated_at": data["updated_at"],
+            "labels": [label["name"] for label in data.get("labels", [])],
         }
         if target.kind == "pull":
             snapshot.update(
@@ -117,6 +118,14 @@ class GitHub:
                 }
             )
         return Redactor().clean(snapshot)  # type: ignore[no-any-return]
+
+    async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        target = Target.parse(task["url"])
+        if target.kind != "issues":
+            return []
+        return await self.pages(
+            f"repos/{target.repository}/issues/{target.number}/comments?per_page=100"
+        )
 
     async def task_snapshot(self, task: dict[str, Any]) -> dict[str, Any]:
         target = Target.parse(task["url"])

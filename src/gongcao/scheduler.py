@@ -6,6 +6,7 @@ import math
 import time
 
 from .config import Config
+from .control import Controls
 from .github import GitHub
 from .model import Stage, State
 from .recovery import Recovery
@@ -60,9 +61,24 @@ class Scheduler:
                 )
 
     async def advance(self, task_id: int) -> None:
+        if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+            if self.config.copilot_operators:
+                task = self.store.task(task_id)
+                if self.store.db.execute(
+                    "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
+                ).fetchone():
+                    return
+                self.store.sync(task_id, await self.github.task_snapshot(task))
+                await Controls(self.store).poll(task_id, self.config, self.github)
+            if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                return
         async with self.semaphore:
             task = self.store.task(task_id)
-            if task["stage"] == Stage.MERGED or task["cancel_requested"]:
+            if (
+                task["stage"] == Stage.MERGED
+                or task["cancel_requested"]
+                or task["state"] == State.WAITING_INSTRUCTION
+            ):
                 return
             due = self.store.db.execute(
                 "SELECT next_at FROM retries WHERE task_id=?", (task_id,)

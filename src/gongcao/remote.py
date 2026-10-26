@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .config import Config
+from .control import Controls, Paused
 from .events import Redactor
 from .github import GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage
@@ -36,6 +37,8 @@ class Controlled:
         ):
             raise UncertainWrite("Remote target changed before a controlled write")
         current = self.store.task(expected["id"])
+        if not Controls(self.store).checkpoint(current["id"]):
+            raise Paused("Paused before the next controlled write")
         self.store.guard(current)
         if any(run["state"] == "running" for run in self.store.runs(current["id"])):
             raise ValueError("An active agent cannot authorize a remote mutation")

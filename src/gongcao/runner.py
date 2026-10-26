@@ -137,6 +137,8 @@ class Runner:
             latest = await self.github.task_snapshot(task)
             self.store.sync(task_id, latest)
             next_stage, state, reason = after_run(stage, role, result, task["target_sha"])
+            if next_stage == Stage.DEVELOPMENT and task["pr_number"]:
+                next_stage = Stage.REVIEW
             if latest["state"] != "open":
                 next_stage, state, reason = (
                     stage,

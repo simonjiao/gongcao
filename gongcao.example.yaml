@@ -34,3 +34,7 @@ roles:
   developer: >-
     Implement only the confirmed plan. Work inside the assigned workspace and run
     relevant tests. Report changes and test evidence, including failures.
+# Remote control is disabled unless explicit GitHub operators are configured.
+copilot:
+  operators: []
+# mode: step  # Optional initial mode. Manual registration defaults to auto.

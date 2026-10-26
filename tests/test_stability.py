@@ -400,15 +400,16 @@ def test_schema_one_upgrade_keeps_unknown_intents_and_history(store, task_id, sh
     analysis_ready(store, task_id, sha)
     store.intent(store.task(task_id), "pending", "push", "{}")
     with store.db:
-        for table in ("leases", "processes", "dependencies", "retries"):
+        for table in ("leases", "processes", "dependencies", "retries", "instructions"):
             store.db.execute(f"DROP TABLE {table}")
         store.db.execute("DROP INDEX events_run_kind")
         store.db.execute("ALTER TABLE runs DROP COLUMN owner_token")
+        store.db.execute("ALTER TABLE tasks DROP COLUMN control")
         store.db.execute("PRAGMA user_version=1")
     for _ in range(2):
         restarted = Store(store.root)
         try:
-            assert restarted.db.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert restarted.db.execute("PRAGMA user_version").fetchone()[0] == 3
             assert len(restarted.runs(task_id)) == 1
             assert restarted.operation("pending")["state"] == "pending"
             assert restarted.runs(task_id)[0]["owner_token"] is None

@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from .config import Config
+from .control import Controls, Paused
 from .events import Redactor
 from .github import GitHub
 from .leases import Lease
@@ -52,6 +53,8 @@ class Workflow:
     async def agent(
         self, task: dict[str, Any], role: Role, evidence: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
+        if not Controls(self.store).checkpoint(task["id"]):
+            return None
         task = self.store.guard(task)
         cached = self.cached_run(task, role)
         if cached is not None:
@@ -68,6 +71,7 @@ class Workflow:
             State.FAILED,
             State.CANCELLED,
             State.WAITING_ENVIRONMENT,
+            State.WAITING_INSTRUCTION,
         }:
             return None
         return self.cached_run(current, role)
@@ -229,6 +233,8 @@ class Workflow:
             )
 
     async def run(self, task_id: int) -> list[str]:
+        if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+            return []
         async with Lease(self.store, task_id) as lease:
             self.lease = lease
             if not lease.acquired:
@@ -236,6 +242,11 @@ class Workflow:
             before = {run["id"] for run in self.store.runs(task_id)}
             try:
                 task = await self.sync(task_id)
+                controls = Controls(self.store)
+                await controls.poll(task_id, self.config, self.github)
+                if not controls.revalidate(task_id, self.config):
+                    return []
+                task = self.store.task(task_id)
                 if (
                     task["state"] in {State.RUNNING, State.HUMAN, State.RECONCILE, State.CANCELLED}
                     or task["stage"] == Stage.MERGED
@@ -254,6 +265,11 @@ class Workflow:
                 for _ in range(2 * self.config.max_revisions + 8):
                     lease.bind_resource()
                     task = await self.sync(task_id)
+                    controls = Controls(self.store)
+                    await controls.poll(task_id, self.config, self.github)
+                    if not controls.revalidate(task_id, self.config):
+                        break
+                    task = self.store.task(task_id)
                     if (
                         task["state"]
                         in {State.RUNNING, State.HUMAN, State.RECONCILE, State.CANCELLED}
@@ -273,6 +289,8 @@ class Workflow:
                     if not policy or policy["hash"] != self.config.policy_hash:
                         self.store.record(task, "policy", "", {"hash": self.config.policy_hash})
                     await self.step(task)
+                    await controls.poll(task_id, self.config, self.github)
+                    controls.checkpoint(task_id)
                     if self.store.task(task_id)["state"] != State.QUEUED:
                         break
                 else:
@@ -287,6 +305,8 @@ class Workflow:
                 else:
                     self.store.cancel(task_id)
                     self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
+            except Paused:
+                pass
             except Exception as exc:
                 if self.store.task(task_id)["stage"] == Stage.MERGED:
                     return [

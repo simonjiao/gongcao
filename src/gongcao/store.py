@@ -20,7 +20,7 @@ class Store:
         self.owners: dict[int, str] = {}
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 2:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
             self.db.close()
             raise ValueError("Database schema is newer than this Gongcao version")
         self.db.executescript("""
@@ -86,6 +86,15 @@ class Store:
                 ):
                     self.db.execute(statement)
                 self.db.execute("PRAGMA user_version=2")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == 2:
+                self.db.execute("ALTER TABLE tasks ADD COLUMN control TEXT NOT NULL DEFAULT '{}'")
+                self.db.execute(
+                    "CREATE TABLE instructions (task_id INTEGER NOT NULL REFERENCES tasks(id), "
+                    "id TEXT NOT NULL, data TEXT NOT NULL, status TEXT NOT NULL, "
+                    "reason TEXT NOT NULL, "
+                    "PRIMARY KEY(task_id,id))"
+                )
+                self.db.execute("PRAGMA user_version=3")
 
     def close(self) -> None:
         self.db.close()
@@ -96,6 +105,7 @@ class Store:
             raise ValueError(f"Unknown task: {task_id}")
         task = dict(row)
         task["snapshot"] = json.loads(task["snapshot"])
+        task["control"] = json.loads(task["control"])
         return task
 
     def tasks(self) -> list[dict[str, Any]]:
@@ -139,7 +149,17 @@ class Store:
             )
         ]
 
-    def register(self, url: str, repo_path: Path, sha: str, snapshot: dict[str, Any]) -> int:
+    def register(
+        self,
+        url: str,
+        repo_path: Path,
+        sha: str,
+        snapshot: dict[str, Any],
+        *,
+        source: str = "manual",
+        mode: str | None = None,
+        policy: str | None = None,
+    ) -> int:
         is_open = snapshot.get("state") == "open"
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -168,6 +188,11 @@ class Store:
                     snapshot["number"] if snapshot.get("kind") == "pull" else None,
                 ),
             )
+            from .control import Controls
+
+            created = self.db.execute("SELECT id FROM tasks WHERE url=?", (url,)).fetchone()
+            assert created is not None
+            Controls(self).initialize(created[0], source=source, mode=mode, policy=policy)
         row = self.db.execute("SELECT id,repo_path FROM tasks WHERE url=?", (url,)).fetchone()
         assert row is not None
         if row[1] != str(repo_path.resolve()):
@@ -215,6 +240,10 @@ class Store:
                 "WHERE id=?",
                 (stage, state, reason, json.dumps(snapshot), sha, time.time(), task_id),
             )
+            if version_changed or lifecycle_changed:
+                from .control import Controls
+
+                Controls(self).invalidate(task_id, "GitHub version changed; renew instruction")
 
     def begin_run(
         self,
@@ -339,6 +368,9 @@ class Store:
                 "UPDATE tasks SET stage=?,state=?,reason=?,updated=? WHERE id=?",
                 (stage, task_state, reason, time.time(), run["task_id"]),
             )
+            from .control import Controls
+
+            Controls(self).checkpoint(task["id"], previous_stage=task["stage"])
 
     def cancel(self, task_id: int) -> None:
         with self.db:
@@ -364,6 +396,10 @@ class Store:
 
     def guard(self, expected: dict[str, Any]) -> dict[str, Any]:
         task = self.task(expected["id"])
+        if task["state"] == State.WAITING_INSTRUCTION:
+            from .control import Paused
+
+            raise Paused("Task is waiting for an instruction")
         if owner := self.owners.get(task["id"]):
             lease = self.db.execute(
                 "SELECT 1 FROM leases WHERE task_id=? AND owner=? AND expires>=?",
@@ -422,6 +458,11 @@ class Store:
                     time.time(),
                     task["id"],
                 ),
+            )
+            from .control import Controls
+
+            Controls(self).checkpoint(
+                task["id"], previous_stage=None if invalidate else task["stage"]
             )
 
     def artifact(self, task_id: int, kind: str, policy: str) -> dict[str, Any] | None:
@@ -501,4 +542,12 @@ class Store:
             operation["response"] = (
                 json.loads(operation["response"]) if operation["response"] else None
             )
-        return {"artifacts": artifacts, "operations": operations}
+        instructions = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM instructions WHERE task_id=? ORDER BY rowid", (task_id,)
+            )
+        ]
+        for instruction in instructions:
+            instruction["data"] = json.loads(instruction["data"])
+        return {"artifacts": artifacts, "operations": operations, "instructions": instructions}

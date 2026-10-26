@@ -350,11 +350,38 @@ def verify_archived(run: Run) -> dict[str, Any]:
                 and repeat["review_ids_before"] == repeat["review_ids_after"],
                 "Repeated execution changed remote effects or sessions",
             )
-            missing = json.loads((run.root / "missing-gate.json").read_text())
-            require(
-                missing["state"] == "waiting_environment" and not missing["evidence"]["operations"],
-                "Missing gate probe did not block",
-            )
+            if run.value["scenario"] == "copilot":
+                commands = json.loads((run.root / "copilot-commands.json").read_text())
+                require(len(commands) == 5, "Missing real control comments")
+                for index, command in enumerate(commands):
+                    require(
+                        any(
+                            row["id"] == "github:" + str(command["id"])
+                            and row["status"] == ("rejected" if index == 0 else "consumed")
+                            and row["data"]["actor"]
+                            == command["actor"]
+                            == run.value["github_login"]
+                            for row in task["evidence"]["instructions"]
+                        ),
+                        "Control comment acceptance/consumption mismatch",
+                    )
+                for stage in ("pending_development", "pending_review", "pending_validation"):
+                    checkpoint = json.loads(
+                        (run.root / f"copilot-{stage.replace('_', '-')}.json").read_text()
+                    )
+                    require(
+                        checkpoint["id"] == task["id"]
+                        and checkpoint["stage"] == stage
+                        and checkpoint["state"] == "waiting_instruction",
+                        "Control checkpoint continuity failed",
+                    )
+            else:
+                missing = json.loads((run.root / "missing-gate.json").read_text())
+                require(
+                    missing["state"] == "waiting_environment"
+                    and not missing["evidence"]["operations"],
+                    "Missing gate probe did not block",
+                )
             boundaries = result["boundary_probe"]
             require(
                 boundaries["inputs"] == list(VECTORS)
