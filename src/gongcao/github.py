@@ -56,12 +56,31 @@ async def command(*args: str, cwd: str | None = None, input_data: str | None = N
     return stdout.decode()
 
 
+async def read_command(*args: str) -> str:
+    """Retry only read transports; write ambiguity is owned by Controlled.perform."""
+    attempts = 0
+    while True:
+        try:
+            return await command(*args)
+        except (RuntimeError, ConnectionError, TimeoutError) as exc:
+            if not isinstance(exc, (ConnectionError, TimeoutError)) and not re.search(
+                r"\bEOF\b|connection (reset|closed)|TLS handshake timeout|i/o timeout",
+                str(exc),
+                re.I,
+            ):
+                raise
+            attempts += 1
+            if attempts >= 3:
+                raise ConnectionError(str(exc)) from exc
+            await asyncio.sleep(0.25 * attempts)
+
+
 class GitHub:
     async def read(self, path: str) -> Any:
-        return json.loads(await command("gh", "api", path))
+        return json.loads(await read_command("gh", "api", path))
 
     async def pages(self, path: str, field: str | None = None) -> list[dict[str, Any]]:
-        raw = (await command("gh", "api", "--paginate", path)).lstrip()
+        raw = (await read_command("gh", "api", "--paginate", path)).lstrip()
         pages = []
         decoder = json.JSONDecoder()
         while raw:
@@ -88,7 +107,7 @@ class GitHub:
     async def snapshot(self, target: Target) -> dict[str, Any]:
         resource = "issues" if target.kind == "issues" else "pulls"
         data = json.loads(
-            await command("gh", "api", f"repos/{target.repository}/{resource}/{target.number}")
+            await read_command("gh", "api", f"repos/{target.repository}/{resource}/{target.number}")
         )
         if target.kind == "issues" and "pull_request" in data:
             raise ValueError("This is a pull request; register its /pull/N URL")
@@ -153,7 +172,7 @@ class GitHub:
         repository = task["snapshot"]["repository"]
         number = task["pr_number"]
         data = json.loads(
-            await command(
+            await read_command(
                 "gh",
                 "pr",
                 "view",
@@ -219,7 +238,9 @@ class GitHub:
                 not steps and run["conclusion"] == "success" and job["conclusion"] == "success"
             ):
                 continue
-            log = await command("gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs")
+            log = await read_command(
+                "gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs"
+            )
             sha = checkout_sha(log, task["pr_number"])
             if sha is None:
                 continue
