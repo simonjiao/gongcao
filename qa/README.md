@@ -34,6 +34,13 @@ and exercise actual Bubblewrap mounts, credential isolation and read-only access
 No pre-existing temporary directory is required. All temporary probe data is
 created and removed by the check.
 
+The real scene's pytest command tests a complete source copy inside the same
+quality sandbox, with newly initialized credential-free Git metadata. This lets
+clone-dependent project tests run while production isolation continues to mask
+the controller's `.git`. The command records `QA_SOURCE_TREE` for comparison with
+the target commit tree; no tests are excluded. Ruff/mypy and independent boundary
+probes continue to inspect the target worktree.
+
 ## Explicit real acceptance
 
 Real scenarios create issues, unmerged PRs, review COMMENTs and dedicated branches

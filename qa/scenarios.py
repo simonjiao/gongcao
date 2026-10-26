@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 4
+VERSION = 5
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -65,7 +65,7 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
                     ["ruff", "check", "."],
                     ["ruff", "format", "--check", "."],
                     ["mypy"],
-                    ["pytest", "-q"],
+                    ["python", "-c", pytest_snapshot_script()],
                 )
             ],
             "ci_workflows": ["ci.yml"],
@@ -89,6 +89,34 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
     if model:
         config["model"] = model
     return requirement, config
+
+
+def pytest_snapshot_script() -> str:
+    # Quality deliberately masks .git. Clone-dependent project tests get fresh,
+    # credential-free metadata around an identical source copy, inside the same sandbox.
+    return """
+import os, subprocess, sys, tempfile
+from pathlib import Path
+from shutil import copytree, ignore_patterns
+with tempfile.TemporaryDirectory(prefix='gongcao-pytest-') as temporary:
+    source = Path(temporary) / 'source'
+    copytree(Path.cwd(), source, symlinks=True, ignore=ignore_patterns(
+        '.git', '.venv', '.qa-runs', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache'))
+    commands = [
+        ['git', 'init', '-q'], ['git', 'add', '--all'],
+        ['git', '-c', 'user.name=QA', '-c', 'user.email=qa@localhost',
+         '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false',
+         'commit', '-qm', 'QA source snapshot'],
+    ]
+    for command in commands:
+        subprocess.run(command, cwd=source, check=True)
+    tree = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD^{tree}'], cwd=source, text=True).strip()
+    print('QA_SOURCE_TREE=' + tree, flush=True)
+    env = os.environ | {'PYTHONPATH': os.pathsep.join((str(source/'src'), str(source)))}
+    print('Testing a full source copy of target {sha}', flush=True)
+    subprocess.run([sys.executable, '-m', 'pytest', '-q'], cwd=source, env=env, check=True)
+""".strip()
 
 
 def vector_script(module: str) -> str:
