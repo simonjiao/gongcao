@@ -109,6 +109,7 @@ uv run gongcao control 1 --pause
 `waiting_instruction`；审查退回修订也消耗一次授权。等待 CI 或依赖时授权保留。
 `until development/review/validation` 在目标入口暂停，已到目标立即暂停，拒绝倒退；
 `until mergeable` 完成现有验证门禁后等待人工合并。`auto` 推进到现有阻断或待人工合并。
+已有 PR 的分析直接进入审查，因此拒绝不可达的 `until development`。
 `pause` 持久请求在安全检查点停止，当前 Agent/写入先收束，结果不明仍待核对。
 切换至 `step`、`until` 或 `auto` 恢复。执行中可请求 pause，其余切换需等待安全暂停。
 `run` 不绕过暂停，暂停任务不占 `jobs`；`serve --once` 仍然只是一次调度周期。
@@ -128,4 +129,5 @@ uv run gongcao control 1 --pause
 GitHub 时间戳精确到秒，进入新检查点后请在下一秒发布新指令。
 授权评论首行之后的补充要求作为注明来源的任务数据输入，并重建分析/审查证据。
 外部变更请求、PR/SHA 或执行策略使显式旧授权失效，需重新指示；未知写入和人工门禁优先。
+移出 `copilot.operators` 的操作者，其旧远端授权也会暂停并要求重新指示。
 本功能不发现/领取 Issue、不发布状态评论、不自动合并；#56 负责发现与统一状态评论。

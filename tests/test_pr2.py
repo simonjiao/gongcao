@@ -270,7 +270,7 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
 ):
     controlled = Controlled(store, policy, GitHub())
 
-    async def before(task, kind):
+    async def before(task, kind, *, finish_operation=False):
         return task
 
     monkeypatch.setattr(controlled, "before", before)

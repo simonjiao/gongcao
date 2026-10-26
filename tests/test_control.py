@@ -10,7 +10,9 @@ from test_pr2 import policy as policy
 from gongcao.config import Config
 from gongcao.control import Controls
 from gongcao.github import GitHub
+from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
+from gongcao.remote import Controlled
 from gongcao.runner import Runner
 from gongcao.scheduler import Scheduler
 from gongcao.store import Store
@@ -189,4 +191,145 @@ def test_execution_policy_changes_require_new_permission(store, task_id):
     config = Config()
     Controls(store).issue(task_id, "auto", policy=config.policy_hash)
     assert not Controls(store).revalidate(task_id, replace(config, model="new-model"))
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+
+
+@pytest.mark.parametrize(
+    "state,merged", [(State.COMPLETED, True), (State.HUMAN, False), (State.CANCELLED, False)]
+)
+def test_rejected_policy_change_cannot_reopen_terminal_or_blocked_work(
+    store, task_id, snapshot, state, merged
+):
+    controls = Controls(store)
+    controls.issue(task_id, "auto", policy=Config().policy_hash)
+    if merged:
+        store.sync(task_id, snapshot | {"merged": True})
+    else:
+        store.halt(task_id, state, "blocked")
+    before = store.task(task_id)
+    assert not controls.issue(task_id, "auto", policy=Config(model="changed").policy_hash)
+    assert not controls.revalidate(task_id, Config(model="changed"))
+    assert store.task(task_id) == before
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_lost_lease_cannot_accept_feedback(store, task_id, replacement):
+    async with Lease(store, task_id) as lease:
+        with store.db:
+            store.db.execute(
+                "UPDATE leases SET expires=0,owner=? WHERE task_id=?",
+                ("other" if replacement else lease.owner, task_id),
+            )
+        before = store.task(task_id), store.evidence(task_id)
+        with pytest.raises(ValueError, match="lease lost"):
+            Controls(store).issue(task_id, "step", feedback="Changed requirements", safe=True)
+        assert before == (store.task(task_id), store.evidence(task_id))
+        with store.db:
+            store.db.execute(
+                "UPDATE leases SET expires=9999999999,owner=? WHERE task_id=?",
+                (lease.owner, task_id),
+            )
+
+
+async def test_journaled_operation_settles_before_pause(store, task_id, fixture_github, policy):
+    store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "fixture")
+    remote = Controlled(store, policy, fixture_github)
+    written = False
+
+    async def observe():
+        if written:
+            return {"confirmed": True}
+        Controls(store).issue(task_id, "pause")
+        return None
+
+    async def write():
+        nonlocal written
+        written = True
+        return {}
+
+    async with Lease(store, task_id):
+        assert await remote.perform(store.task(task_id), "push", "fixture", {}, observe, write)
+        assert not Controls(store).checkpoint(task_id)
+    assert written and store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert store.evidence(task_id)["operations"][0]["state"] == "succeeded"
+    assert not store.db.execute("SELECT 1 FROM leases").fetchone()
+
+
+async def test_remote_pause_is_read_after_agent_before_publication(
+    store, task_id, fixture_github, policy, monkeypatch
+):
+    config = replace(policy, copilot_operators=["owner"])
+    comments = []
+
+    async def instructions(task):
+        return comments
+
+    monkeypatch.setattr(fixture_github, "instructions", instructions)
+    Controls(store).issue(task_id, "until", "development", policy=config.policy_hash)
+    await Workflow(store, config, fixture_github).run(task_id)
+    original = Runner.receive
+
+    async def receive(self, *args):
+        result = await original(self, *args)
+        stamp = datetime.now(UTC).isoformat()
+        comments.append(
+            {
+                "id": 100,
+                "body": "/gongcao pause",
+                "user": {"login": "owner"},
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+        return result
+
+    monkeypatch.setattr(Runner, "receive", receive)
+    Controls(store).issue(task_id, "auto", policy=config.policy_hash)
+    await Workflow(store, config, fixture_github).run(task_id)
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert store.task(task_id)["stage"] == Stage.DEVELOPMENT
+    assert not fixture_github.writes
+
+
+def test_unreachable_until_and_revoked_operator_cannot_authorize_work(store, task_id):
+    with store.db:
+        store.db.execute("UPDATE tasks SET pr_number=9 WHERE id=?", (task_id,))
+    assert not Controls(store).issue(task_id, "until", "development")
+    config = Config(copilot_operators=["owner"])
+    assert Controls(store).issue(
+        task_id, "auto", command_id="github:1", actor="owner", policy=config.policy_hash
+    )
+    assert not Controls(store).revalidate(task_id, replace(config, copilot_operators=[]))
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+
+
+def test_until_validates_the_stage_after_policy_rebuild(store, task_id):
+    config = Config()
+    Controls(store).issue(task_id, "auto", policy=config.policy_hash)
+    store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "fixture", pr_number=9)
+    assert not Controls(store).issue(
+        task_id, "until", "development", policy=Config(model="changed").policy_hash
+    )
+    assert store.task(task_id)["stage"] == Stage.REVIEW
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+
+
+async def test_paused_poll_failure_preserves_sibling_execution(
+    store, task_id, repo, sha, snapshot, monkeypatch
+):
+    Controls(store).issue(task_id, "pause")
+    other = store.register(snapshot["url"].replace("/1", "/2"), repo, sha, snapshot)
+    completed = []
+
+    class API(GitHub):
+        async def task_snapshot(self, task):
+            raise PermissionError("offline denial")
+
+    async def run(self, number):
+        await asyncio.sleep(0)
+        completed.append(number)
+
+    monkeypatch.setattr(Workflow, "run", run)
+    await Scheduler(store, Config(copilot_operators=["owner"]), API()).serve(once=True)
+    assert completed == [other]
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION

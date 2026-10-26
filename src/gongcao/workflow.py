@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from .config import Config
-from .control import Controls, Paused
+from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import GitHub
 from .leases import Lease
@@ -53,7 +53,12 @@ class Workflow:
     async def agent(
         self, task: dict[str, Any], role: Role, evidence: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
-        if not Controls(self.store).checkpoint(task["id"]):
+        controls = Controls(self.store)
+        await controls.poll(task["id"], self.config, self.github)
+        if not controls.revalidate(task["id"], self.config):
+            return None
+        current = self.store.task(task["id"])
+        if baseline(current) != baseline(task) or current["stage"] != task["stage"]:
             return None
         task = self.store.guard(task)
         cached = self.cached_run(task, role)
@@ -64,6 +69,8 @@ class Workflow:
                 task, Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
             )
         await self.runner.run(task["id"], evidence, expected_task=task)
+        await controls.poll(task["id"], self.config, self.github)
+        controls.revalidate(task["id"], self.config)
         current = self.store.task(task["id"])
         if current["state"] in {
             State.HUMAN,
@@ -305,7 +312,7 @@ class Workflow:
                 else:
                     self.store.cancel(task_id)
                     self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
-            except Paused:
+            except (Paused, InstructionChanged):
                 pass
             except Exception as exc:
                 if self.store.task(task_id)["stage"] == Stage.MERGED:

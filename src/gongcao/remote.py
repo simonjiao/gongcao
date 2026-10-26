@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .config import Config
-from .control import Controls, Paused
+from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage
@@ -28,7 +28,19 @@ class Controlled:
         self.store, self.config, self.github = store, config, github
         self.verified: set[str] = set()
 
-    async def before(self, expected: dict[str, Any], kind: str) -> dict[str, Any]:
+    async def instruction_checkpoint(self, expected: dict[str, Any]) -> dict[str, Any]:
+        controls = Controls(self.store)
+        await controls.poll(expected["id"], self.config, self.github)
+        if not controls.revalidate(expected["id"], self.config):
+            raise Paused("Paused before the next controlled write")
+        current = self.store.task(expected["id"])
+        if baseline(current) != baseline(expected) or current["stage"] != expected["stage"]:
+            raise InstructionChanged("New requirements must be evaluated before writing")
+        return current
+
+    async def before(
+        self, expected: dict[str, Any], kind: str, *, finish_operation: bool = False
+    ) -> dict[str, Any]:
         target = Target.parse(expected["url"])
         latest = await self.github.task_snapshot(expected)
         self.store.sync(expected["id"], latest)
@@ -37,8 +49,8 @@ class Controlled:
         ):
             raise UncertainWrite("Remote target changed before a controlled write")
         current = self.store.task(expected["id"])
-        if not Controls(self.store).checkpoint(current["id"]):
-            raise Paused("Paused before the next controlled write")
+        if not finish_operation:
+            current = await self.instruction_checkpoint(expected)
         self.store.guard(current)
         if any(run["state"] == "running" for run in self.store.runs(current["id"])):
             raise ValueError("An active agent cannot authorize a remote mutation")
@@ -60,6 +72,8 @@ class Controlled:
             evidence = await sandbox.verify(repo)
             self.store.record(current, "write-isolation", "", evidence)
             self.verified.add(current["target_sha"])
+        if not finish_operation:
+            current = await self.instruction_checkpoint(expected)
         return self.store.guard(current)
 
     def identity(self, task: dict[str, Any], kind: str, object_id: str) -> str:
@@ -85,7 +99,7 @@ class Controlled:
             return found
         if not created:
             raise UncertainWrite("Existing write intent is not confirmed remotely; refusing replay")
-        await self.before(task, kind)
+        await self.before(task, kind, finish_operation=True)
         try:
             await write()
         except BaseException as exc:

@@ -32,6 +32,10 @@ class Paused(ValueError):
     pass
 
 
+class InstructionChanged(ValueError):
+    pass
+
+
 def baseline(task: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -69,6 +73,21 @@ class Controls:
             "UPDATE instructions SET status=?,reason=? WHERE task_id=? AND id=?",
             (status, reason, task_id, command_id),
         )
+
+    def owns_checkpoint(self, task_id: int) -> bool:
+        lease = self.db.execute(
+            "SELECT owner,expires FROM leases WHERE task_id=?", (task_id,)
+        ).fetchone()
+        owner = self.store.owners.get(task_id)
+        return (
+            owner is None
+            if lease is None
+            else owner == lease["owner"] and lease["expires"] >= time.time()
+        )
+
+    def fence(self, task_id: int) -> None:
+        if not self.owns_checkpoint(task_id):
+            raise ValueError("Execution lease lost; control cannot advance")
 
     def initialize(
         self,
@@ -127,20 +146,15 @@ class Controls:
         with self.transaction():
             task = self.store.task(task_id)
             control = task["control"]
-            occupied = self.db.execute(
-                "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
-            ).fetchone()
-            if mode != "pause" and policy and (safe or not occupied):
-                self.check_policy(task_id, policy)
-                task = self.store.task(task_id)
-                control = task["control"]
-            if mode == "pause":
-                policy = control.get("policy")
             command_id = command_id or "local:" + uuid.uuid4().hex
             if self.db.execute(
                 "SELECT 1 FROM instructions WHERE task_id=? AND id=?", (task_id, command_id)
             ).fetchone():
                 return False
+            if safe or task_id in self.store.owners:
+                self.fence(task_id)
+            if mode == "pause":
+                policy = control.get("policy")
             created = time.time() if created is None else created
             data = {
                 "mode": mode,
@@ -158,10 +172,10 @@ class Controls:
                 (mode == "until" and target not in TARGETS) or (mode != "until" and target)
             ):
                 reason = "Invalid instruction or target"
-            elif mode != "pause" and (task["state"] in UNSAFE or task["stage"] == Stage.MERGED):
+            elif task["stage"] == Stage.MERGED or (
+                task["state"] in UNSAFE and (mode != "pause" or feedback)
+            ):
                 reason = "Task requires manual recovery or is terminal"
-            elif mode == "until" and RANK[Stage(task["stage"])] > RANK[TARGETS[str(target)]]:
-                reason = "Target is behind the current stage"
             elif (
                 not safe
                 and mode != "pause"
@@ -172,6 +186,22 @@ class Controls:
                 "request_since" if mode == "pause" else "since", task["updated"]
             ):
                 reason = "Comment predates the current stage/request baseline"
+            if not reason and mode != "pause" and policy:
+                self.check_policy(task_id, policy)
+                task = self.store.task(task_id)
+                control = task["control"]
+                data.update(stage=task["stage"], baseline=baseline(task))
+            if not reason and mode == "until":
+                if RANK[Stage(task["stage"])] > RANK[TARGETS[str(target)]]:
+                    reason = "Target is behind the current stage"
+                elif (
+                    target == "development"
+                    and task["pr_number"]
+                    and task["stage"] == Stage.ANALYSIS
+                ):
+                    reason = (
+                        "Existing PR analysis proceeds directly to review; target is unreachable"
+                    )
             self.db.execute(
                 "INSERT INTO instructions VALUES(?,?,?,?,?)",
                 (
@@ -262,6 +292,7 @@ class Controls:
                 return bool(task["state"] != State.WAITING_INSTRUCTION)
             if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
                 return False
+            self.fence(task_id)
             if self.db.execute(
                 "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
             ).fetchone():
@@ -272,7 +303,7 @@ class Controls:
                 control["baseline"] = baseline(task)
             reached = (
                 control["mode"] == "until"
-                and task["stage"] == TARGETS[control["target"]]
+                and RANK[Stage(task["stage"])] >= RANK[TARGETS[control["target"]]]
                 and (task["stage"] != Stage.MERGEABLE or task["state"] == State.COMPLETED)
             )
             final = task["stage"] == Stage.MERGEABLE and task["state"] == State.COMPLETED
@@ -299,11 +330,29 @@ class Controls:
             return not pause
 
     def revalidate(self, task_id: int, config: "Config") -> bool:
+        with self.transaction():
+            task = self.store.task(task_id)
+            if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
+                return False
+            self.fence(task_id)
+            command_id = task["control"].get("command_id", "") or ""
+            if command_id.startswith("github:"):
+                row = self.db.execute(
+                    "SELECT data FROM instructions WHERE task_id=? AND id=?", (task_id, command_id)
+                ).fetchone()
+                if row and json.loads(row[0])["actor"].casefold() not in {
+                    name.casefold() for name in config.copilot_operators
+                }:
+                    self.invalidate(task_id, "Operator authorization changed; renew instruction")
+                    return False
         return self.check_policy(task_id, config.policy_hash)
 
     def check_policy(self, task_id: int, policy: str) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
+            if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
+                return False
+            self.fence(task_id)
             control = task["control"]
             if control and control.get("policy") not in {None, policy}:
                 if task["state"] not in UNSAFE:
@@ -329,16 +378,12 @@ class Controls:
         task = self.store.task(task_id)
         if task["snapshot"].get("kind") != "issues":
             return
-        lease = self.db.execute("SELECT owner FROM leases WHERE task_id=?", (task_id,)).fetchone()
-        if lease and self.store.owners.get(task_id) != lease[0]:
+        if not self.owns_checkpoint(task_id):
             return
         comments = await github.instructions(task)
         with self.transaction():
             # Recheck ownership after network I/O; another controller may have claimed it.
-            lease = self.db.execute(
-                "SELECT owner FROM leases WHERE task_id=?", (task_id,)
-            ).fetchone()
-            if lease and self.store.owners.get(task_id) != lease[0]:
+            if not self.owns_checkpoint(task_id):
                 return
             self.initialize(task_id, policy=config.policy_hash)
             accepted = False

@@ -7,6 +7,7 @@ import time
 
 from .config import Config
 from .control import Controls
+from .events import Redactor
 from .github import GitHub
 from .model import Stage, State
 from .recovery import Recovery
@@ -68,8 +69,17 @@ class Scheduler:
                     "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
                 ).fetchone():
                     return
-                self.store.sync(task_id, await self.github.task_snapshot(task))
-                await Controls(self.store).poll(task_id, self.config, self.github)
+                try:
+                    self.store.sync(task_id, await self.github.task_snapshot(task))
+                    await Controls(self.store).poll(task_id, self.config, self.github)
+                except Exception as exc:
+                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                        self.store.halt(
+                            task_id,
+                            State.WAITING_INSTRUCTION,
+                            Redactor().text(f"Instruction poll failed: {exc}"),
+                        )
+                    return
             if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
                 return
         async with self.semaphore:

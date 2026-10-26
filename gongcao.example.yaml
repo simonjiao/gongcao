@@ -37,4 +37,4 @@ roles:
 # Remote control is disabled unless explicit GitHub operators are configured.
 copilot:
   operators: []
-# mode: step  # Optional initial mode. Manual registration defaults to auto.
+  # mode: step  # Optional initial mode. Manual registration defaults to auto.
