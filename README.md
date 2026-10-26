@@ -111,7 +111,7 @@ uv run gongcao control 1 --pause
 `until mergeable` 完成现有验证门禁后等待人工合并。`auto` 推进到现有阻断或待人工合并。
 已有 PR 的分析直接进入审查，因此拒绝不可达的 `until development`。
 `pause` 持久请求在安全检查点停止，当前 Agent/写入先收束，结果不明仍待核对。
-切换至 `step`、`until` 或 `auto` 恢复。执行中可请求 pause，其余切换需等待安全暂停。
+切换至 `step`、`until` 或 `auto` 恢复。本地 CLI 在执行中可请求 pause，其余本地切换需等待安全暂停。
 `run` 不绕过暂停，暂停任务不占 `jobs`；`serve --once` 仍然只是一次调度周期。
 `status/inspect` 提供阶段、状态、策略/目标、PR/SHA、等待原因及指令受理/消费记录。
 
@@ -124,8 +124,11 @@ uv run gongcao control 1 --pause
 远端指令默认禁用。配置 `copilot.operators: [GITHUB_LOGIN]` 后，控制器只读取
 原 Issue 的顶层评论：`/gongcao step`、`/gongcao until review`（亦支持其余确定目标）、
 `/gongcao auto`、`/gongcao pause`。信任 API 返回的登录账户，不信任正文自报身份。
+标签使用独立分页读取；后台评论读取不申请 jobs 或 Agent 租约。运行中收到的指令先登记为
+pending，在下一安全点核验并应用；任务暂停时 serve 仍会读取评论并按授权唤醒。
 普通评论和 PR Review 不作控制指令；编辑旧评论不能重新授权，请发新评论。
-按评论 ID、发布时间、阶段、SHA 和需求基线持久去重；早于当前阶段/需求基线的指令拒绝。
+按评论 ID、内容指纹、发布时间、阶段、SHA 和需求基线持久去重；早于当前阶段/需求基线的指令拒绝。
+同一时间的冲突指令保守暂停，分批读取和重启保持相同结果；撤回已授权评论同样暂停。
 GitHub 时间戳精确到秒，进入新检查点后请在下一秒发布新指令。
 授权评论首行之后的补充要求作为注明来源的任务数据输入，并重建分析/审查证据。
 外部变更请求、PR/SHA 或执行策略使显式旧授权失效，需重新指示；未知写入和人工门禁优先。

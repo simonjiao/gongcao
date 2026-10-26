@@ -97,7 +97,10 @@ This does not provide cross-process/global scheduling.
 - `copilot`: requires `--real --repo`. Posts actual Issue comments from the API account,
   first excluded from operators (rejected), then explicitly allowed. Uses step for
   analysis and development/publication, until-validation for review/revision, then
-  auto for the existing exact-SHA gates. Each permission is consumed once across
+  auto for the existing exact-SHA gates. Edited and expired comments must be rejected.
+  A continuously running native serve must wake an already-paused task from an
+  authorized comment; the test does not restart serve to cause that first wakeup.
+  Each permission is consumed once across
   fresh native CLI processes; repeated polling preserves sessions and writes.
   Archives command IDs, true actors, waiting checkpoints and the final evidence.
   Uses the existing owned-resource cleanup; it never merges the test PR.
@@ -105,7 +108,9 @@ This does not provide cross-process/global scheduling.
 The #57 offline CLI regression is `uv run pytest -q tests/test_control_cli.py`.
 It runs the actual CLI in separate processes, real Git worktrees/pushes to a local
 bare repository and production OS sandboxes. `qa.copilot_fixture` substitutes only
-the GitHub/model protocols. This is offline evidence, not real model/GitHub acceptance.
+the GitHub/model protocols. Its persistent serve receives an authorized comment,
+wakes the paused task, publishes once, and stops at review with no lease held.
+This is offline evidence, not real model/GitHub acceptance.
 The optional real run is `uv run python -m qa run copilot --real --repo OWNER/REPO --cleanup`;
 execute it only with explicit authorization for real QA.
 
