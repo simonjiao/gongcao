@@ -12,9 +12,46 @@ from gongcao.github import GitHub, command
 from gongcao.store import Store
 from qa.__main__ import execute as cli_execute
 from qa.__main__ import parser
+from qa.copilot import wake
 from qa.ledger import Run, RunCancelled
 from qa.resources import Unconfirmed, cleanup
 from qa.runner import batch, core, execute
+
+
+async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+    observed = asyncio.Event()
+    released = False
+    state = "waiting_instruction"
+
+    async def serving(run, *args, stop_event):
+        nonlocal released, state
+        await observed.wait()
+        try:
+            await asyncio.wait_for(stop_event.wait(), 0.05)
+        except TimeoutError:
+            released = True
+            await stop_event.wait()
+        else:
+            state = "needs_reconciliation"  # Shutdown interrupted occupied work.
+        return 130
+
+    def inspect(run):
+        observed.set()
+        return {
+            "stage": "pending_development",
+            "state": state,
+            "reason": "",
+            "runtime": {"lease": None if released else {"owner": "live"}},
+        }
+
+    async def post(text):
+        return "github:1"
+
+    monkeypatch.setattr("qa.copilot.core", serving)
+    monkeypatch.setattr("qa.copilot.inspect", inspect)
+    assert await wake(run, run.root / "config.yaml", post) == "github:1"
+    assert released and state == "waiting_instruction"
 
 
 @pytest.mark.parametrize("scene", ["loop", "smoke"])

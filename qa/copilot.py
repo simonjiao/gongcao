@@ -3,7 +3,9 @@
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from pathlib import Path
 
 import yaml
 
@@ -12,6 +14,44 @@ from gongcao.github import GitHub, command
 from .evidence import require
 from .ledger import Run, digest
 from .runner import core, inspect, signature
+
+
+async def wake(run: Run, path: Path, post: Callable[[str], Awaitable[str]]) -> str:
+    stop_event = asyncio.Event()
+    serving = asyncio.create_task(
+        core(
+            run,
+            "serve",
+            "--poll",
+            "1",
+            "--config",
+            str(path),
+            stop_event=stop_event,
+        )
+    )
+    try:
+        await asyncio.sleep(0.5)
+        accepted = await post("/gongcao step")
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            run.check_cancelled()
+            task = inspect(run)
+            if (
+                task["stage"] == "pending_development"
+                and task["state"] == "waiting_instruction"
+                and task["runtime"]["lease"] is None
+            ):
+                return accepted
+            require(not serving.done(), "Continuous serve exited before remote wakeup")
+            require(
+                task["state"] not in {"failed", "needs_human", "needs_reconciliation"},
+                task["reason"],
+            )
+            await asyncio.wait({serving}, timeout=0.5)
+        raise ValueError("Remote instruction did not wake the paused task")
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(asyncio.shield(serving), 15)
 
 
 async def exercise(run: Run, github: GitHub) -> None:
@@ -100,49 +140,13 @@ async def exercise(run: Run, github: GitHub) -> None:
         )
         run.archive("copilot-" + probe, task)
 
-    async def wake() -> str:
-        stop_event = asyncio.Event()
-        serving = asyncio.create_task(
-            core(
-                run,
-                "serve",
-                "--poll",
-                "1",
-                "--config",
-                str(path),
-                stop_event=stop_event,
-            )
-        )
-        try:
-            await asyncio.sleep(0.5)
-            accepted = await post("/gongcao step")
-            deadline = time.monotonic() + 600
-            while time.monotonic() < deadline:
-                run.check_cancelled()
-                task = inspect(run)
-                if (
-                    task["stage"] == "pending_development"
-                    and task["state"] == "waiting_instruction"
-                ):
-                    return accepted
-                require(not serving.done(), "Continuous serve exited before remote wakeup")
-                require(
-                    task["state"] not in {"failed", "needs_human", "needs_reconciliation"},
-                    task["reason"],
-                )
-                await asyncio.wait({serving}, timeout=0.5)
-            raise ValueError("Remote instruction did not wake the paused task")
-        finally:
-            stop_event.set()
-            await asyncio.wait_for(asyncio.shield(serving), 15)
-
     for stage, instruction in (
         ("pending_development", "/gongcao step"),
         ("pending_review", "/gongcao step"),
         ("pending_validation", "/gongcao until validation"),
     ):
         if stage == "pending_development":
-            accepted = await wake()
+            accepted = await wake(run, path, post)
         else:
             accepted = await post(instruction)
             await once()
