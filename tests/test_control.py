@@ -1,4 +1,5 @@
 import asyncio
+from contextvars import Context
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -396,7 +397,7 @@ async def test_edited_and_conflicting_commands_pause_without_replay(store, task_
 
     controls = Controls(store)
     await controls.poll(task_id, config, API())
-    comments[0]["body"] = "/gongcao step"
+    comments[0]["body"] = "Withdrawn"
     await controls.poll(task_id, config, API())
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
     assert store.evidence(task_id)["instructions"][0]["status"] == "stale"
@@ -420,3 +421,155 @@ async def test_edited_and_conflicting_commands_pause_without_replay(store, task_
         for row in store.evidence(task_id)["instructions"]
         if row["id"] in {"github:2", "github:3"}
     )
+
+
+async def test_conflict_is_independent_of_poll_batching(store, task_id):
+    config = Config(copilot_operators=["owner"])
+    stamp = datetime.now(UTC).isoformat()
+    comments = []
+
+    class API(GitHub):
+        async def instructions(self, task):
+            return comments
+
+    for number, body in ((1, "/gongcao auto"), (2, "/gongcao step")):
+        comments.append(
+            {
+                "id": number,
+                "body": body,
+                "user": {"login": "owner"},
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+        await Controls(store).poll(task_id, config, API())
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert "Conflicting" in store.task(task_id)["reason"]
+
+
+async def test_until_current_review_pauses_after_review_write_without_advancing(
+    store, task_id, fixture_github, policy, monkeypatch
+):
+    config = replace(policy, copilot_operators=["owner"])
+    comments = []
+
+    async def instructions(task):
+        return comments
+
+    monkeypatch.setattr(fixture_github, "instructions", instructions)
+    controls = Controls(store)
+    controls.issue(task_id, "until", "review", policy=config.policy_hash)
+    await Workflow(store, config, fixture_github).run(task_id)
+    controls.issue(task_id, "auto", policy=config.policy_hash)
+    workflow = Workflow(store, config, fixture_github)
+    original = workflow.remote.review
+
+    async def reviewed(task, result, run_id):
+        await original(task, result, run_id)
+        stamp = datetime.now(UTC).isoformat()
+        comments.append(
+            {
+                "id": 201,
+                "body": "/gongcao until review",
+                "user": {"login": "owner"},
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+        await asyncio.create_task(
+            controls.collect(task_id, config, fixture_github), context=Context()
+        )
+
+    monkeypatch.setattr(workflow.remote, "review", reviewed)
+    await workflow.run(task_id)
+    assert (store.task(task_id)["stage"], store.task(task_id)["state"]) == (
+        Stage.REVIEW,
+        State.WAITING_INSTRUCTION,
+    )
+    assert len(fixture_github.reviews) == 1
+
+
+async def test_step_received_during_failed_checks_stops_at_revision(
+    store, task_id, fixture_github, policy, monkeypatch
+):
+    config = replace(policy, copilot_operators=["owner"])
+    comments = []
+
+    async def instructions(task):
+        return comments
+
+    monkeypatch.setattr(fixture_github, "instructions", instructions)
+    controls = Controls(store)
+    controls.issue(task_id, "until", "review", policy=config.policy_hash)
+    await Workflow(store, config, fixture_github).run(task_id)
+    controls.issue(task_id, "auto", policy=config.policy_hash)
+    workflow = Workflow(store, config, fixture_github)
+
+    async def failed_checks(task, kind):
+        stamp = datetime.now(UTC).isoformat()
+        comments.append(
+            {
+                "id": 200,
+                "body": "/gongcao step",
+                "user": {"login": "owner"},
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+        )
+        await asyncio.create_task(
+            controls.collect(task_id, config, fixture_github), context=Context()
+        )
+        return {"passed": False, "target_sha": task["target_sha"]}
+
+    monkeypatch.setattr(workflow.quality, "run", failed_checks)
+    await workflow.run(task_id)
+    assert store.task(task_id)["stage"] == Stage.REVISION
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert len(store.runs(task_id)) == 2
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_remote_pause_after_publish_keeps_confirmed_pr_and_sha(
+    store, task_id, fixture_github, policy, monkeypatch, conflict
+):
+    config = replace(policy, copilot_operators=["owner"])
+    comments = []
+
+    async def instructions(task):
+        assert observer.get() is None
+        return comments
+
+    monkeypatch.setattr(fixture_github, "instructions", instructions)
+    workflow = Workflow(store, config, fixture_github)
+    original = workflow.remote.publish
+
+    async def publish(task, run):
+        result = await original(task, run)
+        stamp = datetime.now(UTC).isoformat()
+        comments.extend(
+            [
+                {
+                    "id": number,
+                    "body": body,
+                    "user": {"login": "owner"},
+                    "created_at": stamp,
+                    "updated_at": stamp,
+                }
+                for number, body in ((10, "/gongcao pause"), (11, "/gongcao step"))
+                if conflict or number == 10
+            ]
+        )
+        await asyncio.create_task(
+            Controls(store).collect(task_id, config, fixture_github), context=Context()
+        )
+        return result
+
+    monkeypatch.setattr(workflow.remote, "publish", publish)
+    await workflow.run(task_id)
+    task = store.task(task_id)
+    assert (task["stage"], task["state"]) == (Stage.REVIEW, State.WAITING_INSTRUCTION)
+    assert task["pr_number"] == 9 and task["target_sha"] == fixture_github.head()
+    assert all(row["state"] == "succeeded" for row in store.evidence(task_id)["operations"])
+    store.sync(task_id, await fixture_github.task_snapshot(task))
+    assert store.task(task_id)["stage"] == Stage.REVIEW
+    assert len(store.runs(task_id)) == 2 and len(fixture_github.writes) == 1

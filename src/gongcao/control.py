@@ -145,6 +145,7 @@ class Controls:
         feedback: str = "",
         safe: bool = False,
         received: dict[str, Any] | None = None,
+        defer_checkpoint: bool = False,
     ) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
@@ -269,7 +270,8 @@ class Controls:
                 and not safe
             ):
                 return True
-            self.checkpoint(task_id)
+            if not defer_checkpoint:
+                self.checkpoint(task_id)
             return True
 
     def invalidate(self, task_id: int, reason: str) -> None:
@@ -385,7 +387,9 @@ class Controls:
                 self.save(task_id, control | {"policy": policy})
             return self.checkpoint(task_id)
 
-    def apply_pending(self, task_id: int, config: Config) -> None:
+    def apply_pending(
+        self, task_id: int, config: Config, *, defer_checkpoint: bool = False
+    ) -> None:
         with self.transaction():
             if not self.owns_checkpoint(task_id):
                 return
@@ -395,20 +399,36 @@ class Controls:
                     "SELECT * FROM instructions WHERE task_id=? AND status='pending'", (task_id,)
                 )
             ]
+            operators = {name.casefold() for name in config.copilot_operators}
+            for row in rows:
+                if json.loads(row["data"])["actor"].casefold() not in operators:
+                    self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
+            rows = [row for row in rows if json.loads(row["data"])["actor"].casefold() in operators]
             rows.sort(key=lambda row: (json.loads(row["data"])["created"], row["id"]), reverse=True)
             if not rows:
                 return
             newest = json.loads(rows[0]["data"])
             peers = [row for row in rows if json.loads(row["data"])["created"] == newest["created"]]
-            if len({json.loads(row["data"])["fingerprint"] for row in peers}) > 1:
+            current_id = self.store.task(task_id)["control"].get("command_id")
+            current = self.db.execute(
+                "SELECT * FROM instructions WHERE task_id=? AND id=?", (task_id, current_id)
+            ).fetchone()
+            if (
+                current
+                and json.loads(current["data"])["created"] == newest["created"]
+                and (json.loads(current["data"])["actor"].casefold() in operators)
+            ):
+                peers.append(dict(current))
+            if len({json.loads(row["data"]).get("fingerprint", row["id"]) for row in peers}) > 1:
                 for row in rows:
                     self.mark(
                         task_id, row["id"], "rejected", "Conflicting commands at the same time"
                     )
-                self.issue(task_id, "pause", safe=True)
+                self.issue(task_id, "pause", safe=True, defer_checkpoint=defer_checkpoint)
                 control = self.store.task(task_id)["control"]
                 self.save(task_id, control | {"pause_reason": "Conflicting GitHub instructions"})
-                self.checkpoint(task_id)
+                if not defer_checkpoint:
+                    self.checkpoint(task_id)
                 return
             accepted = False
             for row in rows:
@@ -416,18 +436,23 @@ class Controls:
                 if accepted:
                     self.mark(task_id, row["id"], "rejected", "Superseded by a newer command")
                     continue
-                if (
-                    data["feedback"]
-                    and self.db.execute(
+                if data["feedback"] and (
+                    defer_checkpoint
+                    or self.db.execute(
                         "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
                     ).fetchone()
                 ):
                     return  # Apply changed requirements after the completed result is retained.
-                if data["actor"].casefold() not in {
-                    name.casefold() for name in config.copilot_operators
-                }:
-                    self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
-                    continue
+                reached = (
+                    data["mode"] == "until"
+                    and self.store.task(task_id)["stage"] == TARGETS[data["target"]]
+                )
+                if reached and defer_checkpoint and data["target"] == "development":
+                    self.mark(
+                        task_id, row["id"], "rejected", "Target entry completed during publication"
+                    )
+                    self.issue(task_id, "pause", safe=True, defer_checkpoint=True)
+                    return
                 accepted = self.issue(
                     task_id,
                     data["mode"],
@@ -439,6 +464,7 @@ class Controls:
                     policy=config.policy_hash,
                     safe=True,
                     received=data,
+                    defer_checkpoint=defer_checkpoint and not reached,
                 )
 
     async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
@@ -453,8 +479,6 @@ class Controls:
             for comment in comments:
                 body = comment.get("body") or ""
                 header, _, feedback = body.strip().partition("\n")
-                if not header.startswith("/gongcao "):
-                    continue
                 command_id = "github:" + str(comment["id"])
                 fingerprint = hashlib.sha256(body.encode()).hexdigest()
                 known = self.db.execute(
@@ -476,6 +500,8 @@ class Controls:
                                     "pause_reason": "Authorized comment was edited",
                                 },
                             )
+                    continue
+                if not header.startswith("/gongcao "):
                     continue
                 words = header.split()[1:]
                 actor = comment.get("user", {}).get("login", "")

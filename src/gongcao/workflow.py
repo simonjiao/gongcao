@@ -37,6 +37,13 @@ class Workflow:
             raise UncertainWrite("Target changed; old evidence cannot authorize the new version")
         return self.store.guard(current)
 
+    def safe(self, expected: dict[str, Any], *, complete: bool = False) -> dict[str, Any]:
+        Controls(self.store).apply_pending(expected["id"], self.config, defer_checkpoint=complete)
+        current = self.store.task(expected["id"])
+        if baseline(current) != baseline(expected) or current["stage"] != expected["stage"]:
+            raise InstructionChanged("New requirements must be evaluated before advancing")
+        return self.store.guard(expected)
+
     def cached_run(self, task: dict[str, Any], role: Role) -> dict[str, Any] | None:
         rows = [
             run
@@ -67,7 +74,7 @@ class Workflow:
             return cached
         if task["state"] != State.QUEUED:
             self.store.transition(
-                task, Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
+                self.safe(task), Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
             )
         await self.runner.run(task["id"], evidence, expected_task=task)
         await controls.poll(task["id"], self.config, self.github)
@@ -85,16 +92,24 @@ class Workflow:
         return self.cached_run(current, role)
 
     def revision(self, task: dict[str, Any], findings: dict[str, Any]) -> None:
+        task = self.safe(task, complete=True)
         if task["revision_count"] >= self.config.max_revisions:
             self.store.transition(
-                task, Stage(task["stage"]), State.HUMAN, "Automatic revision limit reached"
+                self.safe(task),
+                Stage(task["stage"]),
+                State.HUMAN,
+                "Automatic revision limit reached",
             )
             return
         self.store.record(
             task, "revision", self.config.policy_hash, findings | {"target_sha": task["target_sha"]}
         )
         self.store.transition(
-            task, Stage.REVISION, State.QUEUED, "Confirmed findings require revision", revision=True
+            self.safe(task),
+            Stage.REVISION,
+            State.QUEUED,
+            "Confirmed findings require revision",
+            revision=True,
         )
 
     async def step(self, task: dict[str, Any]) -> None:
@@ -105,7 +120,7 @@ class Workflow:
             current = self.store.task(task["id"])
             if run and current["pr_number"]:
                 self.store.transition(
-                    current,
+                    self.safe(current, complete=True),
                     Stage.REVIEW,
                     State.QUEUED,
                     "Existing PR is ready for independent review",
@@ -117,7 +132,7 @@ class Workflow:
             or (self.config.require_real_checks and not self.config.real_checks)
         ):
             self.store.transition(
-                task,
+                self.safe(task),
                 stage,
                 State.WAITING_ENVIRONMENT,
                 "Configure target-project checks, CI workflows and required real checks",
@@ -137,7 +152,7 @@ class Workflow:
             if snapshot.get("head_sha") is None or snapshot["state"] != "open":
                 raise UncertainWrite("Published PR is not open at a confirmed head")
             self.store.transition(
-                current,
+                self.safe(current, complete=True),
                 Stage.REVIEW,
                 State.QUEUED,
                 "Controller commit and PR confirmed on GitHub",
@@ -163,7 +178,7 @@ class Workflow:
                 self.revision(current, result)
             elif result["conclusion"] == "ready":
                 self.store.transition(
-                    current,
+                    self.safe(current, complete=True),
                     Stage.VALIDATION,
                     State.QUEUED,
                     "Independent review for current SHA recorded",
@@ -179,7 +194,7 @@ class Workflow:
                 or not checks["passed"]
             ):
                 self.store.transition(
-                    task,
+                    self.safe(task),
                     Stage.REVIEW,
                     State.QUEUED,
                     "Current-version review/check evidence is missing",
@@ -234,7 +249,7 @@ class Workflow:
                 {"target_sha": current["target_sha"], "result": result, "github": final},
             )
             self.store.transition(
-                current,
+                self.safe(current, complete=True),
                 Stage.MERGEABLE if state == State.COMPLETED else Stage.VALIDATION,
                 state,
                 "Ready for human merge" if state == State.COMPLETED else reason,
@@ -294,7 +309,7 @@ class Workflow:
                     policy = self.store.artifact(task_id, "policy", "")
                     if policy and policy["hash"] != self.config.policy_hash:
                         self.store.transition(
-                            task,
+                            self.safe(task),
                             Stage.REVIEW if task["pr_number"] else Stage.ANALYSIS,
                             State.QUEUED,
                             "Quality policy changed; evidence must be rebuilt",
