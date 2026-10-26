@@ -40,7 +40,12 @@ def inspect(run: Run) -> dict[str, Any]:
         store.close()
 
 
-async def core(run: Run, *args: str, fault: bool = False) -> int:
+async def core(
+    run: Run,
+    *args: str,
+    fault: bool = False,
+    stop_event: asyncio.Event | None = None,
+) -> int:
     executing = args[0] in {"run", "serve"}
     if executing:
         run.check_cancelled()
@@ -69,9 +74,14 @@ async def core(run: Run, *args: str, fault: bool = False) -> int:
     started = time.time()
     pending = asyncio.create_task(process.communicate())
     cancel_sent = False
+    stop_sent = False
     try:
         async with asyncio.timeout(1800):
             while not pending.done():
+                if stop_event and stop_event.is_set() and not stop_sent:
+                    if process.returncode is None:
+                        process.terminate()
+                    stop_sent = True
                 if executing and not cancel_sent and (run.root / "cancel-requested").exists():
                     require(
                         await core(run, "cancel", str(run.value["task_id"])) == 0,

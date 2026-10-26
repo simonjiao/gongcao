@@ -12,6 +12,7 @@ from gongcao.control import Controls
 from gongcao.github import GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
+from gongcao.processes import observer
 from gongcao.remote import Controlled
 from gongcao.runner import Runner
 from gongcao.scheduler import Scheduler
@@ -325,6 +326,9 @@ async def test_paused_poll_failure_preserves_sibling_execution(
         async def task_snapshot(self, task):
             raise PermissionError("offline denial")
 
+        async def instructions(self, task):
+            return []
+
     async def run(self, number):
         await asyncio.sleep(0)
         completed.append(number)
@@ -333,3 +337,86 @@ async def test_paused_poll_failure_preserves_sibling_execution(
     await Scheduler(store, Config(copilot_operators=["owner"]), API()).serve(once=True)
     assert completed == [other]
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+
+
+async def test_background_commands_are_recorded_without_agent_lease_and_survive_restart(
+    store, task_id
+):
+    config = Config(copilot_operators=["owner"])
+    received = asyncio.Event()
+
+    class API(GitHub):
+        async def instructions(self, task):
+            assert observer.get() is None
+            stamp = datetime.now(UTC).isoformat()
+            received.set()
+            return [
+                {
+                    "id": 1,
+                    "body": "/gongcao step",
+                    "user": {"login": "owner"},
+                    "created_at": stamp,
+                    "updated_at": stamp,
+                }
+            ]
+
+    async with Controls(store).listen(config, API(), task_id):
+        async with Lease(store, task_id):
+            run = store.begin_run(task_id, Role.ANALYST)
+            await asyncio.wait_for(received.wait(), 2)
+            assert store.task(task_id)["control"]["mode"] == "auto"
+            assert store.evidence(task_id)["instructions"][0]["status"] == "pending"
+            Controls(store).apply_pending(task_id, config)
+            store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ready")
+    restarted = Store(store.root)
+    try:
+        assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        row = restarted.evidence(task_id)["instructions"][0]
+        assert row["status"] == "consumed" and len(row["data"]["fingerprint"]) == 64
+    finally:
+        restarted.close()
+
+
+async def test_edited_and_conflicting_commands_pause_without_replay(store, task_id):
+    config = Config(copilot_operators=["owner"])
+    stamp = datetime.now(UTC).isoformat()
+    comments = [
+        {
+            "id": 1,
+            "body": "/gongcao auto",
+            "user": {"login": "owner"},
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+    ]
+
+    class API(GitHub):
+        async def instructions(self, task):
+            return comments
+
+    controls = Controls(store)
+    await controls.poll(task_id, config, API())
+    comments[0]["body"] = "/gongcao step"
+    await controls.poll(task_id, config, API())
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert store.evidence(task_id)["instructions"][0]["status"] == "stale"
+    stamp = datetime.now(UTC).isoformat()
+    comments.extend(
+        [
+            {
+                "id": number,
+                "body": body,
+                "user": {"login": "owner"},
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            for number, body in ((2, "/gongcao auto"), (3, "/gongcao step"))
+        ]
+    )
+    await controls.poll(task_id, config, API())
+    assert "Conflicting" in store.task(task_id)["reason"]
+    assert all(
+        row["status"] == "rejected"
+        for row in store.evidence(task_id)["instructions"]
+        if row["id"] in {"github:2", "github:3"}
+    )

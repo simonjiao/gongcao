@@ -352,12 +352,13 @@ def verify_archived(run: Run) -> dict[str, Any]:
             )
             if run.value["scenario"] == "copilot":
                 commands = json.loads((run.root / "copilot-commands.json").read_text())
-                require(len(commands) == 5, "Missing real control comments")
-                for index, command in enumerate(commands):
+                require(len(commands) == 7, "Missing real control comments")
+                for command in commands:
                     require(
                         any(
                             row["id"] == "github:" + str(command["id"])
-                            and row["status"] == ("rejected" if index == 0 else "consumed")
+                            and row["status"] == command["expected"]
+                            and row["data"].get("fingerprint")
                             and row["data"]["actor"]
                             == command["actor"]
                             == run.value["github_login"]

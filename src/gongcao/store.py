@@ -257,6 +257,10 @@ class Store:
             task = self.task(task_id)
             if task_id in self.owners:
                 self.guard(task)
+            if task["control"].get("pause_requested"):
+                from .control import Paused
+
+                raise Paused("Pause requested before starting an Agent")
             if expected_snapshot is not None and task["snapshot"] != expected_snapshot:
                 raise ValueError("GitHub snapshot changed before claim; sync and retry")
             if task["snapshot"].get("state") != "open" or task["cancel_requested"]:
@@ -492,12 +496,16 @@ class Store:
     def intent(self, expected: dict[str, Any], key: str, kind: str, payload: str) -> bool:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            self.guard(expected)
+            task = self.guard(expected)
             row = self.operation(key)
             if row:
                 if row["payload"] != payload or row["sha"] != expected["target_sha"]:
                     raise ValueError("Operation identity conflicts with existing intent")
                 return False
+            if task["control"].get("pause_requested"):
+                from .control import Paused
+
+                raise Paused("Pause requested before opening a new write intent")
             self.db.execute(
                 "INSERT INTO operations(id,task_id,sha,kind,payload,state) VALUES(?,?,?,?,?,?)",
                 (key, expected["id"], expected["target_sha"], kind, payload, "pending"),

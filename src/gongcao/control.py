@@ -1,11 +1,13 @@
 """Persistent permissions for the existing workflow, never a second stage machine."""
 
+import asyncio
 import hashlib
 import json
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import Context
 from datetime import datetime
 from typing import Any
 
@@ -142,14 +144,16 @@ class Controls:
         policy: str | None = None,
         feedback: str = "",
         safe: bool = False,
+        received: dict[str, Any] | None = None,
     ) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
             control = task["control"]
             command_id = command_id or "local:" + uuid.uuid4().hex
-            if self.db.execute(
-                "SELECT 1 FROM instructions WHERE task_id=? AND id=?", (task_id, command_id)
-            ).fetchone():
+            existing = self.db.execute(
+                "SELECT status FROM instructions WHERE task_id=? AND id=?", (task_id, command_id)
+            ).fetchone()
+            if existing and not (received and existing[0] == "pending"):
                 return False
             if safe or task_id in self.store.owners:
                 self.fence(task_id)
@@ -166,6 +170,8 @@ class Controls:
                 "baseline": baseline(task),
                 "policy": policy,
                 "feedback": feedback,
+                "fingerprint": (received or {}).get("fingerprint")
+                or hashlib.sha256(json.dumps([mode, target, feedback]).encode()).hexdigest(),
             }
             reason = ""
             if mode not in {"step", "until", "auto", "pause"} or (
@@ -183,9 +189,15 @@ class Controls:
             ):
                 reason = "Task is occupied; pause first and wait for a safe checkpoint"
             elif command_id.startswith("github:") and created < control.get(
-                "request_since" if mode == "pause" else "since", task["updated"]
+                "request_since" if received or mode == "pause" else "since", task["updated"]
             ):
                 reason = "Comment predates the current stage/request baseline"
+            elif received and (
+                received["sha"] != task["target_sha"]
+                or received["baseline"] != baseline(task)
+                or (mode != "pause" and not feedback and received["stage"] != task["stage"])
+            ):
+                reason = "Instruction no longer matches the current stage/SHA/request"
             if not reason and mode != "pause" and policy:
                 self.check_policy(task_id, policy)
                 task = self.store.task(task_id)
@@ -203,7 +215,8 @@ class Controls:
                         "Existing PR analysis proceeds directly to review; target is unreachable"
                     )
             self.db.execute(
-                "INSERT INTO instructions VALUES(?,?,?,?,?)",
+                "INSERT INTO instructions VALUES(?,?,?,?,?) ON CONFLICT(task_id,id) DO UPDATE SET "
+                "data=excluded.data,status=excluded.status,reason=excluded.reason",
                 (
                     task_id,
                     command_id,
@@ -372,80 +385,172 @@ class Controls:
                 self.save(task_id, control | {"policy": policy})
             return self.checkpoint(task_id)
 
-    async def poll(self, task_id: int, config: "Config", github: "GitHub") -> None:
+    def apply_pending(self, task_id: int, config: Config) -> None:
+        with self.transaction():
+            if not self.owns_checkpoint(task_id):
+                return
+            rows = [
+                dict(row)
+                for row in self.db.execute(
+                    "SELECT * FROM instructions WHERE task_id=? AND status='pending'", (task_id,)
+                )
+            ]
+            rows.sort(key=lambda row: (json.loads(row["data"])["created"], row["id"]), reverse=True)
+            if not rows:
+                return
+            newest = json.loads(rows[0]["data"])
+            peers = [row for row in rows if json.loads(row["data"])["created"] == newest["created"]]
+            if len({json.loads(row["data"])["fingerprint"] for row in peers}) > 1:
+                for row in rows:
+                    self.mark(
+                        task_id, row["id"], "rejected", "Conflicting commands at the same time"
+                    )
+                self.issue(task_id, "pause", safe=True)
+                control = self.store.task(task_id)["control"]
+                self.save(task_id, control | {"pause_reason": "Conflicting GitHub instructions"})
+                self.checkpoint(task_id)
+                return
+            accepted = False
+            for row in rows:
+                data = json.loads(row["data"])
+                if accepted:
+                    self.mark(task_id, row["id"], "rejected", "Superseded by a newer command")
+                    continue
+                if (
+                    data["feedback"]
+                    and self.db.execute(
+                        "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
+                    ).fetchone()
+                ):
+                    return  # Apply changed requirements after the completed result is retained.
+                if data["actor"].casefold() not in {
+                    name.casefold() for name in config.copilot_operators
+                }:
+                    self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
+                    continue
+                accepted = self.issue(
+                    task_id,
+                    data["mode"],
+                    data["target"],
+                    command_id=row["id"],
+                    actor=data["actor"],
+                    created=data["created"],
+                    feedback=data["feedback"],
+                    policy=config.policy_hash,
+                    safe=True,
+                    received=data,
+                )
+
+    async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
         if not config.copilot_operators:
             return
         task = self.store.task(task_id)
         if task["snapshot"].get("kind") != "issues":
             return
-        if not self.owns_checkpoint(task_id):
-            return
         comments = await github.instructions(task)
         with self.transaction():
-            # Recheck ownership after network I/O; another controller may have claimed it.
-            if not self.owns_checkpoint(task_id):
-                return
-            self.initialize(task_id, policy=config.policy_hash)
-            accepted = False
-            for comment in sorted(comments, key=lambda c: (c["created_at"], c["id"]), reverse=True):
-                header, _, feedback = (comment.get("body") or "").strip().partition("\n")
+            task = self.store.task(task_id)
+            for comment in comments:
+                body = comment.get("body") or ""
+                header, _, feedback = body.strip().partition("\n")
                 if not header.startswith("/gongcao "):
                     continue
                 command_id = "github:" + str(comment["id"])
+                fingerprint = hashlib.sha256(body.encode()).hexdigest()
                 known = self.db.execute(
-                    "SELECT status FROM instructions WHERE task_id=? AND id=?",
+                    "SELECT data,status FROM instructions WHERE task_id=? AND id=?",
                     (task_id, command_id),
                 ).fetchone()
                 if known:
-                    accepted = accepted or known[0] != "rejected"
+                    if known["status"] != "rejected" and (
+                        json.loads(known["data"]).get("fingerprint", fingerprint) != fingerprint
+                        or comment.get("updated_at") != comment["created_at"]
+                    ):
+                        self.mark(task_id, command_id, "stale", "Comment content was edited")
+                        if task["control"].get("command_id") == command_id:
+                            self.save(
+                                task_id,
+                                task["control"]
+                                | {
+                                    "pause_requested": True,
+                                    "pause_reason": "Authorized comment was edited",
+                                },
+                            )
                     continue
                 words = header.split()[1:]
                 actor = comment.get("user", {}).get("login", "")
                 trusted = actor.casefold() in {name.casefold() for name in config.copilot_operators}
-                valid = len(words) == 1 or (len(words) == 2 and words[0] == "until")
-                rejected = (
+                valid = (len(words) == 1 and words[0] in {"step", "auto", "pause"}) or (
+                    len(words) == 2 and words[0] == "until" and words[1] in TARGETS
+                )
+                reason = (
                     "Operator is not authorized"
                     if not trusted
                     else "Edited comments require a new command"
                     if comment.get("updated_at") != comment["created_at"]
-                    else "Superseded by a newer command"
-                    if accepted
                     else "Invalid command syntax"
                     if not valid
                     else ""
                 )
-                created = datetime.fromisoformat(
-                    comment["created_at"].replace("Z", "+00:00")
-                ).timestamp()
-                if rejected:
-                    current = self.store.task(task_id)
-                    self.db.execute(
-                        "INSERT INTO instructions VALUES(?,?,?,?,?)",
-                        (
-                            task_id,
-                            command_id,
-                            json.dumps(
-                                {
-                                    "actor": actor,
-                                    "created": created,
-                                    "stage": current["stage"],
-                                    "sha": current["target_sha"],
-                                    "baseline": baseline(current),
-                                }
-                            ),
-                            "rejected",
-                            rejected,
-                        ),
-                    )
-                    continue
-                accepted = self.issue(
-                    task_id,
-                    words[0],
-                    words[1] if len(words) == 2 else None,
-                    command_id=command_id,
-                    actor=actor,
-                    created=created,
-                    policy=config.policy_hash,
-                    feedback=Redactor().text(feedback.strip()),
-                    safe=True,
+                data = {
+                    "actor": actor,
+                    "created": datetime.fromisoformat(
+                        comment["created_at"].replace("Z", "+00:00")
+                    ).timestamp(),
+                    "stage": task["stage"],
+                    "sha": task["target_sha"],
+                    "baseline": baseline(task),
+                    "fingerprint": fingerprint,
+                    "mode": words[0] if words else "",
+                    "target": words[1] if len(words) == 2 else None,
+                    "feedback": Redactor().text(feedback.strip()) if trusted else "",
+                }
+                if not reason and data["created"] < task["control"].get(
+                    "request_since" if data["mode"] == "pause" or data["feedback"] else "since",
+                    task["updated"],
+                ):
+                    reason = "Comment predates the current stage/request baseline"
+                self.db.execute(
+                    "INSERT INTO instructions VALUES(?,?,?,?,?)",
+                    (
+                        task_id,
+                        command_id,
+                        json.dumps(data),
+                        "rejected" if reason else "pending",
+                        reason,
+                    ),
                 )
+
+    async def poll(self, task_id: int, config: Config, github: GitHub) -> None:
+        # Transport tasks inherit no Agent lease/process observer and take no jobs slot.
+        await asyncio.create_task(self.collect(task_id, config, github), context=Context())
+        self.apply_pending(task_id, config)
+        if self.owns_checkpoint(task_id):
+            self.checkpoint(task_id)
+
+    @asynccontextmanager
+    async def listen(
+        self,
+        config: Config,
+        github: GitHub,
+        task_id: int | None = None,
+    ) -> AsyncIterator[None]:
+        async def receive() -> None:
+            while True:
+                selected = [self.store.task(task_id)] if task_id is not None else self.store.tasks()
+                for task in selected:
+                    try:
+                        await self.collect(task["id"], config, github)
+                    except Exception:
+                        pass  # Foreground polling reports errors; background reads retry later.
+                await asyncio.sleep(5)
+
+        listener = (
+            asyncio.create_task(receive(), context=Context()) if config.copilot_operators else None
+        )
+        try:
+            yield
+        finally:
+            if listener:
+                listener.cancel()
+                await asyncio.gather(listener, return_exceptions=True)

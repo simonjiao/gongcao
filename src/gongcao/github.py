@@ -101,7 +101,6 @@ class GitHub:
             "body": data.get("body") or "",
             "state": data["state"],
             "updated_at": data["updated_at"],
-            "labels": [label["name"] for label in data.get("labels", [])],
         }
         if target.kind == "pull":
             snapshot.update(
@@ -126,6 +125,12 @@ class GitHub:
         return await self.pages(
             f"repos/{target.repository}/issues/{target.number}/comments?per_page=100"
         )
+
+    async def labels(self, target: Target) -> list[str]:
+        rows = await self.pages(
+            f"repos/{target.repository}/issues/{target.number}/labels?per_page=100"
+        )
+        return [row["name"] for row in rows]
 
     async def task_snapshot(self, task: dict[str, Any]) -> dict[str, Any]:
         target = Target.parse(task["url"])

@@ -92,6 +92,8 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         target = Target.parse(args.url)
         repo, sha = await repository(args.repo, target)
         snapshot = await github.snapshot(target)
+        if not any(task["url"].lower() == target.url.lower() for task in store.tasks()):
+            snapshot["labels"] = await github.labels(target)
         if snapshot.get("head_sha"):
             sha = snapshot["head_sha"]
             # Explicit PR registration fetches this one head, never discovers other tasks.

@@ -28,7 +28,11 @@ class OfflineGitHub(GitHub):
         self.data: dict[str, Any] = json.loads(path.read_text())
 
     def save(self) -> None:
+        self.data["comments"] = json.loads(self.path.read_text()).get("comments", [])
         self.path.write_text(json.dumps(self.data))
+
+    async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        return list(json.loads(self.path.read_text()).get("comments", []))
 
     async def head(self) -> str:
         return (
@@ -57,7 +61,7 @@ class OfflineGitHub(GitHub):
         if "/reviews" in path:
             return self.data["reviews"]  # type: ignore[no-any-return]
         if "/comments" in path:
-            return []
+            return list(self.data.get("comments", []))
         if not self.data.get("pull"):
             return []
         pull = self.data["pull"]

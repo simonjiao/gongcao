@@ -96,6 +96,7 @@ class Scheduler:
             if due and due[0] > time.time():
                 return
             workflow = Workflow(self.store, self.config, self.github)
+            workflow.watch_instructions = False
             self.workflows.append(workflow)
             try:
                 await workflow.run(task_id)
@@ -112,7 +113,11 @@ class Scheduler:
                 with self.store.db:
                     self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))
 
-    async def serve(self, *, once: bool = False, poll: float = 5) -> None:
+    async def serve(self, *, once: bool = False, poll: float = 5.0) -> None:
+        async with Controls(self.store).listen(self.config, self.github):
+            await self.execute(once=once, poll=poll)
+
+    async def execute(self, *, once: bool, poll: float) -> None:
         if not math.isfinite(poll) or poll < 1:
             raise ValueError("Poll interval must be at least one second")
         recovery = Recovery(self.store, self.github)

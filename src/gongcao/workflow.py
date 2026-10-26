@@ -24,6 +24,7 @@ class Workflow:
         self.quality = Quality(store, config)
         self.remote = Controlled(store, config, github)
         self.lease: Lease | None = None
+        self.watch_instructions = True
 
     async def sync(self, task_id: int) -> dict[str, Any]:
         task = self.store.task(task_id)
@@ -240,6 +241,13 @@ class Workflow:
             )
 
     async def run(self, task_id: int) -> list[str]:
+        if self.watch_instructions:
+            async with Controls(self.store).listen(self.config, self.github, task_id):
+                await Controls(self.store).poll(task_id, self.config, self.github)
+                return await self.execute(task_id)
+        return await self.execute(task_id)
+
+    async def execute(self, task_id: int) -> list[str]:
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             return []
         async with Lease(self.store, task_id) as lease:
@@ -313,7 +321,7 @@ class Workflow:
                     self.store.cancel(task_id)
                     self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
             except (Paused, InstructionChanged):
-                pass
+                Controls(self.store).checkpoint(task_id)
             except Exception as exc:
                 if self.store.task(task_id)["stage"] == Stage.MERGED:
                     return [
