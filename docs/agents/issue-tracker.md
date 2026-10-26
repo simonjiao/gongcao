@@ -9,10 +9,15 @@ The second stage was merged in https://github.com/simonjiao/gongcao/pull/4 at
 `82eafb9a00f8fc06556539b73314791ecb76dfb9`, following explicit user authorization.
 The third stage was merged in https://github.com/simonjiao/gongcao/pull/14 at
 `35ca3609a5c84bd15ed37729a3ecb6563584c455`, following explicit user authorization.
-The current delivery is the native QA sub-issue https://github.com/simonjiao/gongcao/issues/13.
+The native QA sub-issue is https://github.com/simonjiao/gongcao/issues/13.
 QA implementation PR: https://github.com/simonjiao/gongcao/pull/17.
 Feature-branch acceptance: `docs/acceptance-qa.md` (implementation `3c3357c`).
 Stage numbers are independent of GitHub's PR numbers.
+
+Current feature work: Copilot advancement permissions and trusted instructions,
+https://github.com/simonjiao/gongcao/issues/57. Local acceptance and the outstanding
+authorized real-QA boundary are recorded in `docs/acceptance-copilot.md`.
+Issue #56 owns discovery/claiming and the single GitHub status publisher separately.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.
 The product
