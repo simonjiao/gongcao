@@ -1,5 +1,9 @@
 # Issue #57 本地验收
 
+最新状态：用户已明确授权真实 QA，并已执行四轮；完整真实验收仍未通过，最后一轮
+被模型服务 `serverOverloaded` 阻断。全部测试资源已安全清理。下文保留授权前的
+本地记录，最新结果见文末及 [结构化证据](evidence/copilot-24b14bd.json)。
+
 日期：2026-10-26。需求：[Issue #57](https://github.com/simonjiao/gongcao/issues/57)。
 基线：`f5c81118f8fbeef8b1b261e3fabe93f6dff9096d`。
 实现：`92c803a`；审查修正及以下验证的代码版本：
@@ -81,3 +85,41 @@ step、until、auto、pause 许可、可信 Issue 顶层评论、初始标签和
 超过最初估计。增量集中于已登记任务的指令持久接收、消费一致性和暂停边界；
 本次未实现发现/领取、进度评论、Web 服务或另一套业务阶段机。
 远端 CI、真实 GitHub/Codex QA、特性 PR 的推送/创建及 Issue 关闭仍未执行。
+
+## 已授权真实 QA 的结果与阻断
+
+用户随后明确授权 `uv run python -m qa run copilot --real --repo simonjiao/gongcao --cleanup`。
+真实运行发现并修正了以下问题，均保留先失败、后通过的定向回归：
+
+- `b659c27`：测试脚本等待阶段暂停后，还须等待执行租约释放，才可停止持续 serve。
+- `47e7a31`：全量 pytest 中的 Git 克隆测试需要临时 Git 元数据。QA 在原质量沙箱内
+  复制完整源码并初始化无凭据 Git 仓库，运行全部测试，没有修改产品沙箱或排除测试。
+- `24b14bd`：GitHub 只读 API 短暂 EOF 最多重试三次；权限错误立即失败。
+  POST、push 和其他受控写入不重放，原有未知写入与租约安全规则保留。
+
+最终代码版本：`24b14bdd1c9da0aa8726f1b33a6896e5b7c4f32d`。
+Ruff、格式与 mypy 全部通过。Python 3.12.3 为 **249 passed（238.20 秒）**，
+Python 3.13.13 为 **249 passed（241.74 秒）**。
+
+| Run | 测试资源 | 结果 | 清理 |
+| --- | --- | --- | --- |
+| `9ece43822cc2452bae06599d3b8aab80` | Issue #58 | 过早停止 serve，租约收尾被中断 | 已完成 |
+| `73d46d8cd4f84e19b02b7a4b2aace6b2` | Issue #59 / PR #60 | 3 个 Git 克隆测试失败，修订阶段无可发布改动 | 已完成 |
+| `30a9f380272d409aac4fc065ba276bac` | Issue #61 / PR #62 | 六个真实角色执行完成；最终 GitHub 读取 EOF，未形成完整通过结论 | 已完成 |
+| `7cd2f2263427485c84454e06aef4a8d8` | Issue #63 | SDK `serverOverloaded`，分析未完成 | 已完成 |
+
+第三轮在固定实现 `47e7a31` 上实际验证了未授权、编辑和过期评论拒绝、持续 serve
+唤醒、单步持久暂停、重启去重、审查退回与修订，以及真实边界检查。初始/修订版
+源码副本的 tree 分别为 `e1b9bce7385a1e5f16ea3b245176ca2ec5826271` 和
+`56c1a3ebbcb33d0613faf12f56775d0605ec8039`，已与 GitHub 实际提交 tree 对照一致。
+临时 Git 提交本身是测试元数据，不是原提交身份。修订版真实 SHA 为
+`d5269a909b9a5ef97a284c5b3f7e4f9e7782230c`，对应
+[PR CI 40287128515](https://github.com/simonjiao/gongcao/actions/runs/40287128515) 成功。
+这些是第三轮的局部证据，不冒充最终代码版本的完整真实验收通过。
+
+最新阻断的 SDK 原始错误为 `codexErrorInfo=serverOverloaded`：
+`Selected model is at capacity. Please try a different model.`
+按用户对耗时的要求，当前冻结实现、不再自动启动第五轮。
+所有专用 Issue/未合并 PR、分支和隔离工作区均按现有安全清理流程处理，失败记录保留；
+生产 main 仍为 `f5c81118f8fbeef8b1b261e3fabe93f6dff9096d`。
+未推送特性分支、未合并测试 PR、未关闭 Issue #57；完整真实验收仍待完成。

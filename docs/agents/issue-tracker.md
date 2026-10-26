@@ -15,8 +15,9 @@ Feature-branch acceptance: `docs/acceptance-qa.md` (implementation `3c3357c`).
 Stage numbers are independent of GitHub's PR numbers.
 
 Current feature work: Copilot advancement permissions and trusted instructions,
-https://github.com/simonjiao/gongcao/issues/57. Local acceptance and the outstanding
-authorized real-QA boundary are recorded in `docs/acceptance-copilot.md`.
+https://github.com/simonjiao/gongcao/issues/57. Local acceptance and authorized real-QA
+attempts are recorded in `docs/acceptance-copilot.md`; complete real acceptance is
+still blocked by model capacity after safely cleaned attempts.
 Issue #56 owns discovery/claiming and the single GitHub status publisher separately.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.

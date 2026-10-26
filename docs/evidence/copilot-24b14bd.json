@@ -1,0 +1,193 @@
+{
+  "schema": 1,
+  "issue": 57,
+  "complete_real_acceptance_passed": false,
+  "implementation_sha": "24b14bdd1c9da0aa8726f1b33a6896e5b7c4f32d",
+  "local_checks": {
+    "ruff": true,
+    "format": true,
+    "mypy": true,
+    "python3.12": {
+      "passed": 249,
+      "seconds": 238.2
+    },
+    "python3.13": {
+      "passed": 249,
+      "seconds": 241.74
+    }
+  },
+  "attempts": [
+    {
+      "run_id": "9ece43822cc2452bae06599d3b8aab80",
+      "implementation_sha": "d1d77de3d627e10727c6db1697ce0b9f0b979a16",
+      "status": "failed",
+      "failure": "ValueError: Command failed to pause at pending_development: Execution lease lost",
+      "cleaned": true,
+      "cleanup_failure": null,
+      "issue": {
+        "number": 58,
+        "url": "https://github.com/simonjiao/gongcao/issues/58"
+      }
+    },
+    {
+      "run_id": "73d46d8cd4f84e19b02b7a4b2aace6b2",
+      "implementation_sha": "b659c27ffbd5129c84860d47cfbd30ca5205d890",
+      "status": "failed",
+      "failure": "ValueError: Command failed to pause at pending_validation: ValueError: Developer produced no changes; no PR can be published",
+      "cleaned": true,
+      "cleanup_failure": null,
+      "issue": {
+        "number": 59,
+        "url": "https://github.com/simonjiao/gongcao/issues/59"
+      }
+    },
+    {
+      "run_id": "30a9f380272d409aac4fc065ba276bac",
+      "implementation_sha": "47e7a31408bafea429a5f31c4be812350f497813",
+      "status": "failed",
+      "failure": "ValueError: Workflow stopped: needs_human: RuntimeError: Get \"https://api.github.com/repos/simonjiao/gongcao/pulls/62\": EOF\n",
+      "cleaned": true,
+      "cleanup_failure": null,
+      "issue": {
+        "number": 61,
+        "url": "https://github.com/simonjiao/gongcao/issues/61"
+      }
+    },
+    {
+      "run_id": "7cd2f2263427485c84454e06aef4a8d8",
+      "implementation_sha": "24b14bdd1c9da0aa8726f1b33a6896e5b7c4f32d",
+      "status": "failed",
+      "failure": "ValueError: RuntimeError: {'type': 'RuntimeError', 'message': 'SDK turn did not complete with a result (status=failed)'}",
+      "cleaned": true,
+      "cleanup_failure": null,
+      "issue": {
+        "number": 63,
+        "url": "https://github.com/simonjiao/gongcao/issues/63"
+      }
+    }
+  ],
+  "final_blocker": {
+    "code": "serverOverloaded",
+    "message": "Selected model is at capacity. Please try a different model."
+  },
+  "partial_evidence": {
+    "run_id": "30a9f380272d409aac4fc065ba276bac",
+    "implementation_sha": "47e7a31408bafea429a5f31c4be812350f497813",
+    "complete_real_acceptance_passed": false,
+    "test_issue": 61,
+    "test_pr": 62,
+    "initial_sha": "af3001ffc5c342b21c84d82edb611ad2cc44fadd",
+    "final_sha": "d5269a909b9a5ef97a284c5b3f7e4f9e7782230c",
+    "roles": [
+      {
+        "id": "82b4ec18a7554121a7acf16039d077ad",
+        "role": "analyst",
+        "state": "completed",
+        "thread_id": "01a17720-d810-7e52-ad52-89c2ecf0e704",
+        "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+        "conclusion": "ready"
+      },
+      {
+        "id": "0e82c802bdda4aca9feca7e1d847d115",
+        "role": "developer",
+        "state": "completed",
+        "thread_id": "01a17721-ada5-7df0-9773-84d8e2372383",
+        "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+        "conclusion": "ready"
+      },
+      {
+        "id": "daa3934e90cf43e09975672ef45fb760",
+        "role": "reviewer",
+        "state": "completed",
+        "thread_id": "01a17724-c730-7ae2-85bc-af762d3301f1",
+        "target_sha": "af3001ffc5c342b21c84d82edb611ad2cc44fadd",
+        "conclusion": "revise"
+      },
+      {
+        "id": "541e2cd9be944589acba4d7542d30867",
+        "role": "developer",
+        "state": "completed",
+        "thread_id": "01a17725-8be4-7503-9b6a-94b3ebbfb777",
+        "target_sha": "af3001ffc5c342b21c84d82edb611ad2cc44fadd",
+        "conclusion": "ready"
+      },
+      {
+        "id": "482a2bbcbbcb4d88821d16c38455100a",
+        "role": "reviewer",
+        "state": "completed",
+        "thread_id": "01a17728-8a37-7353-a07d-1341a0cff8ad",
+        "target_sha": "d5269a909b9a5ef97a284c5b3f7e4f9e7782230c",
+        "conclusion": "ready"
+      },
+      {
+        "id": "92dd22222c4040149e224fd877e9c7ec",
+        "role": "validator",
+        "state": "completed",
+        "thread_id": "01a1772b-0a8c-77c0-abcc-71f44e60e287",
+        "target_sha": "d5269a909b9a5ef97a284c5b3f7e4f9e7782230c",
+        "conclusion": "ready"
+      }
+    ],
+    "commands": [
+      {
+        "id": "local:fc2904405b5242e98a1945fe70bf06ba",
+        "status": "consumed",
+        "reason": "Safe checkpoint reached"
+      },
+      {
+        "id": "github:6410674603",
+        "status": "rejected",
+        "reason": "Operator is not authorized"
+      },
+      {
+        "id": "github:6410675468",
+        "status": "rejected",
+        "reason": "Edited comments require a new command"
+      },
+      {
+        "id": "local:8372415fbf134eab813918df7c93a74b",
+        "status": "consumed",
+        "reason": "Safe checkpoint reached"
+      },
+      {
+        "id": "github:6410676841",
+        "status": "rejected",
+        "reason": "Comment predates the current stage/request baseline"
+      },
+      {
+        "id": "github:6410677960",
+        "status": "consumed",
+        "reason": "Safe checkpoint reached"
+      },
+      {
+        "id": "github:6410691124",
+        "status": "consumed",
+        "reason": "Safe checkpoint reached"
+      },
+      {
+        "id": "github:6410712402",
+        "status": "consumed",
+        "reason": "Safe checkpoint reached"
+      },
+      {
+        "id": "github:6410840331",
+        "status": "accepted",
+        "reason": ""
+      }
+    ],
+    "source_trees": [
+      {
+        "target_sha": "af3001ffc5c342b21c84d82edb611ad2cc44fadd",
+        "source_tree": "e1b9bce7385a1e5f16ea3b245176ca2ec5826271"
+      },
+      {
+        "target_sha": "d5269a909b9a5ef97a284c5b3f7e4f9e7782230c",
+        "source_tree": "56c1a3ebbcb33d0613faf12f56775d0605ec8039"
+      }
+    ],
+    "github_tree_comparison_verified": true,
+    "ci_run": 40287128515
+  },
+  "all_attempts_cleaned": true,
+  "main_sha_after": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d"
+}
