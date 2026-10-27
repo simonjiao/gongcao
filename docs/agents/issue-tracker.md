@@ -16,8 +16,9 @@ Stage numbers are independent of GitHub's PR numbers.
 
 Current feature work: Copilot advancement permissions and trusted instructions,
 https://github.com/simonjiao/gongcao/issues/57. Local acceptance and authorized real-QA
-attempts are recorded in `docs/acceptance-copilot.md`; concentrated simplification and local Python 3.12/3.13 checks are complete;
-final real acceptance follows one service-available run after four safely cleaned failures.
+attempts are recorded in `docs/acceptance-copilot.md`; concentrated simplification, Python 3.12/3.13 checks and fixed-SHA CI are complete.
+Real Copilot acceptance passed at `6472646` in Run `3f562f499836476783620e0e2b6db079`;
+all test resources were safely cleaned. Formal review and final-main integration remain.
 Issue #56 owns discovery/claiming and the single GitHub status publisher separately.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.
