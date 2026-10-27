@@ -12,6 +12,8 @@ from gongcao.cli import main as native_main
 from gongcao.github import GitHub, Target, command
 from gongcao.sandbox import Sandbox
 
+from .ledger import write_json
+
 WORKER = """
 import json,pathlib,sys,uuid
 data=json.loads(sys.stdin.readline())['context']
@@ -30,7 +32,7 @@ class OfflineGitHub(GitHub):
 
     def save(self) -> None:
         self.data["comments"] = json.loads(self.path.read_text()).get("comments", [])
-        self.path.write_text(json.dumps(self.data))
+        write_json(self.path, self.data)
 
     async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
         number = Target.parse(task["url"]).number

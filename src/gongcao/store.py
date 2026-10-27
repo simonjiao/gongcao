@@ -1,5 +1,6 @@
 """Transactional local task and execution records. GitHub facts remain snapshots."""
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -18,6 +19,16 @@ class Store:
         self.db = sqlite3.connect(self.root / "gongcao.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.owners: dict[int, str] = {}
+        try:
+            with (self.root / "schema.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.initialize()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def initialize(self) -> None:
+        """Serialize first-open WAL setup and upgrades across CLI processes."""
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
