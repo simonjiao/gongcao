@@ -50,9 +50,12 @@ def intake(store, repo, sha, snapshot):
             if path == "user":
                 return {"login": "owner"}
             if "/comments/" in path:
-                return deepcopy(
+                item = deepcopy(
                     next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
                 )
+                # Real GitHub list/detail payloads use different avatar URL variants.
+                item["user"]["avatar_url"] = "https://avatars.example/variant"
+                return item
             if "/issues/" in path:
                 return deepcopy(self.rows[int(path.rsplit("/", 1)[1])])
             return (

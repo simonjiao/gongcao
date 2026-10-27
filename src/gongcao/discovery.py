@@ -302,7 +302,11 @@ class Discovery:
         # Verify the ID directly as well as uniqueness across all comment pages.
         target = Target.parse(row["url"])
         observed = await self.github.read(f"repos/{target.repository}/issues/comments/{item['id']}")
-        if any(observed.get(key) != item.get(key) for key in ("id", "body", "user")):
+        if (
+            any(observed.get(key) != item.get(key) for key in ("id", "body"))
+            or observed.get("user", {}).get("login", "").lower() != data["actor"]
+            or observed.get("user", {}).get("id") != item["user"].get("id")
+        ):
             raise ValueError("Status comment changed during observation")
         return item
 

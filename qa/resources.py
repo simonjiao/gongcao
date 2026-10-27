@@ -384,3 +384,8 @@ async def reconcile(run: Run, github: GitHub) -> None:
             raise Unconfirmed("Unknown QA action; manual inspection required")
 
         await action(run, key, intent["method"], intent["path"], intent["payload"], observe)
+
+    if run.value["scenario"] == "discovery":
+        from .discovery import reconcile_claims
+
+        await reconcile_claims(run, github)

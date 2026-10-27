@@ -8,6 +8,8 @@ from urllib.parse import quote
 
 import yaml
 
+from gongcao.config import Config
+from gongcao.discovery import Discovery
 from gongcao.github import GitHub
 from gongcao.recovery import diagnose
 from gongcao.store import Store
@@ -217,7 +219,7 @@ async def cleanup_extras(run: Run, github: GitHub) -> None:
     try:
         require(
             not store.db.execute(
-                "SELECT 1 FROM claims WHERE intent!='' OR task_id IS NULL"
+                "SELECT 1 FROM claims WHERE intent!='' OR (task_id IS NULL AND confirmed='')"
             ).fetchone(),
             "Discovery writes need reconciliation before cleanup",
         )
@@ -261,3 +263,30 @@ async def cleanup_extras(run: Run, github: GitHub) -> None:
 
         await action(run, "delete-" + label, "DELETE", endpoint, {}, deleted)
     run.archive("discovery-cleanup", {"issues": ["step", "excluded"], "labels_deleted": True})
+
+
+async def reconcile_claims(run: Run, github: GitHub) -> None:
+    """Confirm claim writes for cleanup without registering or executing tasks."""
+    store = Store(run.root / "state")
+    try:
+        require(
+            not store.db.execute(
+                "SELECT 1 FROM leases UNION SELECT 1 FROM processes WHERE state!='stopped' "
+                "UNION SELECT 1 FROM runs WHERE state='running'"
+            ).fetchone(),
+            "Discovery execution must settle before claim reconciliation",
+        )
+        publisher = Discovery(store, Config(), github)
+        confirmed = []
+        for row in publisher.records():
+            item = await publisher.owned(row)
+            expected = row["intent"] or row["confirmed"]
+            if item is None or not expected or item["body"] != expected:
+                raise Unconfirmed("Claim write remains unconfirmed; refusing cleanup")
+            publisher.save(
+                row["url"], comment_id=item["id"], confirmed=expected, intent="", reason=""
+            )
+            confirmed.append({"url": row["url"], "comment_id": item["id"], "body": expected})
+        run.archive("discovery-claim-reconciliation", confirmed)
+    finally:
+        store.close()
