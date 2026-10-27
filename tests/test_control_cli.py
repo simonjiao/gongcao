@@ -41,16 +41,11 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root))),
     }
 
+    command = [sys.executable, "-m", "qa.copilot_fixture", "--state-dir", str(tmp_path / "state")]
+
     def cli(*args):
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "qa.copilot_fixture",
-                "--state-dir",
-                str(tmp_path / "state"),
-                *args,
-            ],
+            [*command, *args],
             env=env,
             capture_output=True,
             text=True,
@@ -73,18 +68,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
     cli("control", number, "--step", "--config", str(config))
     waiting = drive(Stage.DEVELOPMENT)
     serving = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "qa.copilot_fixture",
-            "--state-dir",
-            str(tmp_path / "state"),
-            "serve",
-            "--poll",
-            "1",
-            "--config",
-            str(config),
-        ],
+        [*command, "serve", "--poll", "1", "--config", str(config)],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

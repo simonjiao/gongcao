@@ -42,7 +42,7 @@ class Workflow:
         current = self.store.task(expected["id"])
         if baseline(current) != baseline(expected) or current["stage"] != expected["stage"]:
             raise InstructionChanged("New requirements must be evaluated before advancing")
-        return self.store.guard(expected)
+        return self.store.guard(current)
 
     def cached_run(self, task: dict[str, Any], role: Role) -> dict[str, Any] | None:
         rows = [
@@ -258,7 +258,8 @@ class Workflow:
     async def run(self, task_id: int) -> list[str]:
         if self.watch_instructions:
             async with Controls(self.store).listen(self.config, self.github, task_id):
-                await Controls(self.store).poll(task_id, self.config, self.github)
+                if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                    await Controls(self.store).poll(task_id, self.config, self.github)
                 return await self.execute(task_id)
         return await self.execute(task_id)
 
@@ -271,31 +272,9 @@ class Workflow:
                 return []
             before = {run["id"] for run in self.store.runs(task_id)}
             try:
-                task = await self.sync(task_id)
                 controls = Controls(self.store)
-                await controls.poll(task_id, self.config, self.github)
-                if not controls.revalidate(task_id, self.config):
-                    return []
-                task = self.store.task(task_id)
-                if (
-                    task["state"] in {State.RUNNING, State.HUMAN, State.RECONCILE, State.CANCELLED}
-                    or task["stage"] == Stage.MERGED
-                ):
-                    return []
-                blockers = [
-                    d["id"] for d in self.store.dependencies(task_id) if d["stage"] != Stage.MERGED
-                ]
-                if blockers and task["stage"] != Stage.MERGED and not task["cancel_requested"]:
-                    self.store.halt(
-                        task_id,
-                        State.WAITING_DEPENDENCY,
-                        f"Waiting for merged dependencies: {blockers}",
-                    )
-                    return []
                 for _ in range(2 * self.config.max_revisions + 8):
-                    lease.bind_resource()
                     task = await self.sync(task_id)
-                    controls = Controls(self.store)
                     await controls.poll(task_id, self.config, self.github)
                     if not controls.revalidate(task_id, self.config):
                         break
@@ -306,6 +285,19 @@ class Workflow:
                         or task["stage"] == Stage.MERGED
                     ):
                         break
+                    blockers = [
+                        d["id"]
+                        for d in self.store.dependencies(task_id)
+                        if d["stage"] != Stage.MERGED
+                    ]
+                    if blockers and not task["cancel_requested"]:
+                        self.store.halt(
+                            task_id,
+                            State.WAITING_DEPENDENCY,
+                            f"Waiting for merged dependencies: {blockers}",
+                        )
+                        break
+                    lease.bind_resource()
                     policy = self.store.artifact(task_id, "policy", "")
                     if policy and policy["hash"] != self.config.policy_hash:
                         self.store.transition(
