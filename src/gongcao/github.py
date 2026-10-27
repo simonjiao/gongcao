@@ -89,13 +89,15 @@ class GitHub:
             raw = raw[end:].lstrip()
         return [item for page in pages for item in (page[field] if field else page)]
 
-    async def mutate(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def mutate(
+        self, path: str, payload: dict[str, Any], *, method: str = "POST"
+    ) -> dict[str, Any]:
         response: dict[str, Any] = json.loads(
             await command(
                 "gh",
                 "api",
                 "--method",
-                "POST",
+                method,
                 path,
                 "--input",
                 "-",

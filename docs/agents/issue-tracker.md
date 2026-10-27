@@ -14,12 +14,19 @@ QA implementation PR: https://github.com/simonjiao/gongcao/pull/17.
 Feature-branch acceptance: `docs/acceptance-qa.md` (implementation `3c3357c`).
 Stage numbers are independent of GitHub's PR numbers.
 
-Current feature work: Copilot advancement permissions and trusted instructions,
-https://github.com/simonjiao/gongcao/issues/57. Local acceptance and authorized real-QA
-attempts are recorded in `docs/acceptance-copilot.md`; concentrated simplification, Python 3.12/3.13 checks and fixed-SHA CI are complete.
-Real Copilot acceptance passed at `6472646` in Run `3f562f499836476783620e0e2b6db079`;
-all test resources were safely cleaned. Formal review and final-main integration remain.
-Issue #56 owns discovery/claiming and the single GitHub status publisher separately.
+Copilot controls and trusted instructions (#57) merged through PR #66 at
+`221ff3f4afeb153e09d3096d08ef63f1f25e1b5e`. Real Copilot acceptance passed at
+`6472646` in Run `3f562f499836476783620e0e2b6db079`; resources were safely cleaned.
+See `docs/acceptance-copilot.md` for the historical feature-branch evidence.
+
+Current feature work: configured discovery, confirmed claiming and the single GitHub
+status publisher, https://github.com/simonjiao/gongcao/issues/56.
+Implementation `af363b8` passes Python 3.12/3.13 CI (266 tests each) and both review axes.
+Authorized real GitHub/Codex Run `25d018afb9d04bf9886a1a105a2f8d95` passed and its
+three issues, unmerged PR #75, two labels, branch and workspaces were safely cleaned.
+See `docs/issue56-discovery.md` and `docs/evidence/discovery-af363b8.json`.
+Implementation PR: https://github.com/simonjiao/gongcao/pull/68. Keep #56 open pending
+human review and merge; no automated merge or release.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.
 The product

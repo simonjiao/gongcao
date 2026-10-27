@@ -199,16 +199,22 @@ def test_initial_policy_is_consumed_once(store, repo, sha, snapshot, labels, sou
     assert store.task(number)["control"]["mode"] == "pause"
 
 
-def test_schema_two_upgrade_preserves_intents_and_legacy_auto(store, task_id):
+@pytest.mark.parametrize("version", [2, 3])
+def test_schema_upgrade_preserves_intents_and_legacy_auto(store, task_id, version):
     store.intent(store.task(task_id), "unknown", "push", "{}")
+    expected = {} if version == 2 else store.task(task_id)["control"]
     with store.db:
-        store.db.execute("DROP TABLE instructions")
-        store.db.execute("ALTER TABLE tasks DROP COLUMN control")
-        store.db.execute("PRAGMA user_version=2")
+        store.db.execute("DROP TRIGGER status_dirty")
+        store.db.execute("DROP TABLE claims")
+        store.db.execute("DROP TABLE controller")
+        if version == 2:
+            store.db.execute("DROP TABLE instructions")
+            store.db.execute("ALTER TABLE tasks DROP COLUMN control")
+        store.db.execute(f"PRAGMA user_version={version}")
     for _ in range(2):
         restarted = Store(store.root)
         try:
-            assert restarted.task(task_id)["control"] == {}
+            assert restarted.task(task_id)["control"] == expected
             assert restarted.operation("unknown")["state"] == "pending"
             assert Controls(restarted).checkpoint(task_id)
         finally:

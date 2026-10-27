@@ -55,7 +55,7 @@ async def action(
         previous["state"] = "unknown"
         run.save()
         raise Unconfirmed(f"Unconfirmed QA action {key}; refusing replay")
-    if key == "create-issue":
+    if method == "POST" and path.endswith("/issues"):
         run.check_cancelled()
     actions[key] = {"intent": intent, "state": "pending"}
     run.save()
@@ -81,7 +81,7 @@ async def action(
                 "-",
                 input_data=json.dumps(payload),
             )
-            if key == "create-issue":
+            if method == "POST" and path.endswith("/issues"):
                 row = json.loads(response)
                 actions[key]["response_hint"] = {"number": row["number"]}
                 run.save()
@@ -114,15 +114,17 @@ async def action(
     return observed
 
 
-async def create_issue(run: Run, requirement: str, github: GitHub) -> dict[str, Any]:
+async def create_issue(
+    run: Run, requirement: str, github: GitHub, *, name: str = "issue"
+) -> dict[str, Any]:
     repository = run.value["repository"]
     payload = {
-        "title": f"[QA {run.id[:12]}] clamp_score ({run.value['scenario']})",
+        "title": f"[QA {run.id[:12]}] clamp_score ({run.value['scenario']}/{name})",
         "body": f"{run.marker}\n\n{requirement}",
     }
 
     async def observe() -> Any:
-        hint = run.value["actions"].get("create-issue", {}).get("response_hint")
+        hint = run.value["actions"].get("create-" + name, {}).get("response_hint")
         if hint:
             row = await optional(github, f"repos/{repository}/issues/{int(hint['number'])}")
             rows = [row] if row else []
@@ -147,12 +149,13 @@ async def create_issue(run: Run, requirement: str, github: GitHub) -> dict[str, 
         return {"number": row["number"], "url": row["html_url"]}
 
     issue = await action(
-        run, "create-issue", "POST", f"repos/{repository}/issues", payload, observe
+        run, "create-" + name, "POST", f"repos/{repository}/issues", payload, observe
     )
-    run.value["resources"]["issue"] = issue
-    run.value["resources"]["branch"] = (
-        "gongcao/work-" + hashlib.sha256(issue["url"].encode()).hexdigest()[:12]
-    )
+    run.value["resources"][name] = issue
+    if name == "issue":
+        run.value["resources"]["branch"] = (
+            "gongcao/work-" + hashlib.sha256(issue["url"].encode()).hexdigest()[:12]
+        )
     run.save()
     return issue  # type: ignore[no-any-return]
 
@@ -297,6 +300,11 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     if not (run.root / "cleanup-remote.json").exists():
         run.archive("cleanup-remote", {"issue": issue, "pull": pull, "ref": ref})
 
+    if run.value["scenario"] == "discovery":
+        from .discovery import cleanup_extras
+
+        await cleanup_extras(run, github)
+
     async def closed(path: str) -> Any:
         row = await github.read(path)
         if path == pull_path:
@@ -376,3 +384,8 @@ async def reconcile(run: Run, github: GitHub) -> None:
             raise Unconfirmed("Unknown QA action; manual inspection required")
 
         await action(run, key, intent["method"], intent["path"], intent["payload"], observe)
+
+    if run.value["scenario"] == "discovery":
+        from .discovery import reconcile_claims
+
+        await reconcile_claims(run, github)

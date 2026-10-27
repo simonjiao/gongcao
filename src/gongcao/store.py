@@ -1,5 +1,6 @@
 """Transactional local task and execution records. GitHub facts remain snapshots."""
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -18,9 +19,19 @@ class Store:
         self.db = sqlite3.connect(self.root / "gongcao.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.owners: dict[int, str] = {}
+        try:
+            with (self.root / "schema.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.initialize()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def initialize(self) -> None:
+        """Serialize first-open WAL setup and upgrades across CLI processes."""
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
             self.db.close()
             raise ValueError("Database schema is newer than this Gongcao version")
         self.db.executescript("""
@@ -95,9 +106,47 @@ class Store:
                     "PRIMARY KEY(task_id,id))"
                 )
                 self.db.execute("PRAGMA user_version=3")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == 3:
+                self.db.execute(
+                    "CREATE TABLE claims (url TEXT PRIMARY KEY, data TEXT NOT NULL, "
+                    "task_id INTEGER UNIQUE REFERENCES tasks(id), comment_id INTEGER UNIQUE, "
+                    "intent TEXT NOT NULL DEFAULT '', confirmed TEXT NOT NULL DEFAULT '', "
+                    "dirty INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '')"
+                )
+                self.db.execute("CREATE TABLE controller (id TEXT NOT NULL)")
+                self.db.execute("INSERT INTO controller VALUES(?)", (uuid.uuid4().hex,))
+                self.db.execute(
+                    "CREATE TRIGGER status_dirty AFTER UPDATE OF stage,state,target_sha,reason,"
+                    "pr_number,control,cancel_requested ON tasks WHEN "
+                    "OLD.stage IS NOT NEW.stage OR OLD.state IS NOT NEW.state OR "
+                    "OLD.target_sha IS NOT NEW.target_sha OR OLD.reason IS NOT NEW.reason OR "
+                    "OLD.pr_number IS NOT NEW.pr_number OR OLD.control IS NOT NEW.control OR "
+                    "OLD.cancel_requested IS NOT NEW.cancel_requested BEGIN "
+                    "UPDATE claims SET dirty=1 WHERE task_id=NEW.id; END"
+                )
+                self.db.execute("PRAGMA user_version=4")
 
     def close(self) -> None:
         self.db.close()
+
+    def refresh_base(self, task_id: int, sha: str) -> None:
+        """Caller owns the task lease and transaction, as for recovery retry."""
+        from .control import Controls
+
+        Controls(self).fence(task_id)
+        if self.task(task_id)["pr_number"] or self.evidence(task_id)["operations"]:
+            raise ValueError(
+                "Only unpublished issues without remote intents can refresh their baseline"
+            )
+        self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,))
+        self.db.execute("UPDATE artifacts SET valid=0 WHERE task_id=?", (task_id,))
+        self.db.execute(
+            "UPDATE tasks SET target_sha=?,stage=? WHERE id=?", (sha, Stage.ANALYSIS, task_id)
+        )
+        self.db.execute(
+            "UPDATE claims SET data=json_set(data,'$.base_sha',?) WHERE task_id=?", (sha, task_id)
+        )
+        Controls(self).invalidate(task_id, "Baseline refreshed; renew instruction")
 
     def task(self, task_id: int) -> dict[str, Any]:
         row = self.db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -106,6 +155,10 @@ class Store:
         task = dict(row)
         task["snapshot"] = json.loads(task["snapshot"])
         task["control"] = json.loads(task["control"])
+        status = self.db.execute(
+            "SELECT comment_id,dirty,reason,intent FROM claims WHERE task_id=?", (task_id,)
+        ).fetchone()
+        task["status_sync"] = dict(status) | {"intent": bool(status["intent"])} if status else None
         return task
 
     def tasks(self) -> list[dict[str, Any]]:

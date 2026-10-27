@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gongcao.model import Stage, State
+from qa.ledger import write_json
 
 
 def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
@@ -87,7 +88,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
                 "updated_at": stamp,
             }
         ]
-        fixture.write_text(json.dumps(data))
+        write_json(fixture, data)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             published = cli("inspect", number)

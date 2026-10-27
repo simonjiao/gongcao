@@ -38,3 +38,9 @@ roles:
 copilot:
   operators: []
   # mode: step  # Optional initial mode. Manual registration defaults to auto.
+# Opt in with explicit repository/path/label sources; see README.
+discovery:
+  enabled: false
+  interval_seconds: 60
+  max_new_per_scan: 10
+  sources: []

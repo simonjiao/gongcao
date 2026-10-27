@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from .github import Target
 from .model import Role
 
 PROMPTS = {
@@ -41,6 +42,7 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
         "scheduler",
         "qa",
         "copilot",
+        "discovery",
     }:
         raise ValueError("Invalid configuration keys")
     return raw
@@ -55,6 +57,80 @@ def _jobs(raw: dict[str, Any], section: str, default: int, maximum: int | None =
         bound = f"an integer between 1 and {maximum}" if maximum else "a positive integer"
         raise ValueError(f"{section}.jobs must be {bound}")
     return value
+
+
+@dataclass(frozen=True)
+class Source:
+    repo: str
+    path: Path
+    label: str = "agent-ready"
+    mode: str = "step"
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    enabled: bool = False
+    interval_seconds: int = 60
+    max_new_per_scan: int = 10
+    sources: tuple[Source, ...] = ()
+
+    @classmethod
+    def load(cls, raw: Any) -> "DiscoveryConfig":
+        if not isinstance(raw, dict) or raw.keys() - {
+            "enabled",
+            "interval_seconds",
+            "max_new_per_scan",
+            "sources",
+        }:
+            raise ValueError("Invalid discovery configuration")
+        enabled, interval, maximum = (
+            raw.get("enabled", False),
+            raw.get("interval_seconds", 60),
+            raw.get("max_new_per_scan", 10),
+        )
+        if (
+            type(enabled) is not bool
+            or type(interval) is not int
+            or interval < 1
+            or type(maximum) is not int
+            or not 1 <= maximum <= 100
+        ):
+            raise ValueError("Invalid discovery enabled, interval_seconds or max_new_per_scan")
+        sources = raw.get("sources", [])
+        if not isinstance(sources, list):
+            raise ValueError("discovery.sources must be a list")
+        parsed: list[Source] = []
+        for item in sources:
+            if (
+                not isinstance(item, dict)
+                or item.keys() - {"repo", "path", "label", "mode"}
+                or not all(isinstance(item.get(key), str) for key in ("repo", "path"))
+            ):
+                raise ValueError("Each discovery source requires repo and absolute path")
+            target = Target.parse(f"https://github.com/{item['repo']}/issues/1")
+            path, label, mode = (
+                Path(item["path"]).expanduser(),
+                item.get("label", "agent-ready"),
+                item.get("mode", "step"),
+            )
+            if (
+                not path.is_absolute()
+                or not isinstance(label, str)
+                or not label.strip()
+                or not isinstance(mode, str)
+                or mode not in {"step", "auto"}
+            ):
+                raise ValueError("Invalid discovery source path, label or mode")
+            if any(
+                source.repo == target.repository
+                and (source.label == label or source.path.resolve() != path.resolve())
+                for source in parsed
+            ):
+                raise ValueError("Duplicate discovery source or conflicting repository paths")
+            parsed.append(Source(target.repository, path, label, mode))
+        if enabled and not parsed:
+            raise ValueError("Enabled discovery requires sources")
+        return cls(enabled, interval, maximum, tuple(parsed))
 
 
 @dataclass(frozen=True)
@@ -73,6 +149,7 @@ class Config:
     qa_jobs: int = 2
     copilot_operators: list[str] = field(default_factory=list)
     copilot_mode: str | None = None
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
 
     @property
     def policy_hash(self) -> str:
@@ -164,6 +241,7 @@ class Config:
             _jobs(raw, "qa", 2),
             operators,
             mode,
+            DiscoveryConfig.load(raw.get("discovery", {})),
         )
 
     @classmethod
