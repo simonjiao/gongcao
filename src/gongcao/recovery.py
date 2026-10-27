@@ -35,6 +35,9 @@ class Recovery:
     async def sync(self, task: dict[str, Any]) -> dict[str, Any]:
         """Discovery baselines are remote facts, including immediately before writes."""
         snapshot = await self.github.task_snapshot(task)
+        self.store.sync(task["id"], snapshot)
+        if snapshot.get("state") != "open" or snapshot.get("merged"):
+            return snapshot
         row = self.store.db.execute(
             "SELECT data FROM claims WHERE task_id=?", (task["id"],)
         ).fetchone()
@@ -42,7 +45,6 @@ class Recovery:
             data = json.loads(row["data"])
             sha = await self.default_base(task)
             if sha != data["base_sha"]:
-                self.store.sync(task["id"], snapshot)
                 if task["pr_number"] or self.store.evidence(task["id"])["operations"]:
                     self.store.halt(
                         task["id"],
@@ -55,7 +57,6 @@ class Recovery:
                         self.store.db.execute("BEGIN IMMEDIATE")
                         self.store.refresh_base(task["id"], sha)
                 raise InstructionChanged("Default branch changed; previous evidence cannot advance")
-        self.store.sync(task["id"], snapshot)
         return snapshot
 
     async def observe(self, task: dict[str, Any], op: dict[str, Any]) -> dict[str, Any] | None:

@@ -39,6 +39,7 @@ class Discovery:
         self.locks: list[TextIO] = []
         self.retry: dict[str, tuple[int, float]] = {}
         self.next_scan = 0.0
+        self.next_facts = 0.0
 
     def records(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.store.db.execute("SELECT * FROM claims ORDER BY url")]
@@ -113,20 +114,57 @@ class Discovery:
 
     async def cycle(self, *, discover: bool) -> None:
         # Reconcile old claims and pending PATCHes before admitting new work.
+        facts_due = time.monotonic() >= self.next_facts
+        if facts_due:
+            self.next_facts = time.monotonic() + self.config.discovery.interval_seconds
         for row in self.records():
             if not self.due(row["url"]):
                 continue
             try:
                 if row["task_id"] is None:
                     await self.claim(row)
-                elif row["dirty"] or row["intent"]:
-                    await self.publish(row)
+                else:
+                    if facts_due:
+                        await self.lifecycle(row["task_id"])
+                        row = dict(
+                            self.store.db.execute(
+                                "SELECT * FROM claims WHERE url=?", (row["url"],)
+                            ).fetchone()
+                        )
+                    if row["dirty"] or row["intent"]:
+                        await self.publish(row)
                 self.retry.pop(row["url"], None)
             except Exception as exc:
                 self.warning(row["url"], exc)
         if discover and self.config.discovery.enabled and time.monotonic() >= self.next_scan:
             self.next_scan = time.monotonic() + self.config.discovery.interval_seconds
             await self.scan()
+
+    async def lifecycle(self, task_id: int) -> None:
+        task = self.store.task(task_id)
+        if (
+            task["stage"] == Stage.MERGED
+            or self.store.db.execute("SELECT 1 FROM leases WHERE task_id=?", (task_id,)).fetchone()
+        ):
+            return
+        snapshot = await self.github.task_snapshot(task)
+        if (
+            self.store.task(task_id)["updated"] != task["updated"]
+            or self.store.db.execute("SELECT 1 FROM leases WHERE task_id=?", (task_id,)).fetchone()
+        ):
+            return
+        self.store.sync(task_id, snapshot)
+        if (
+            task["pr_number"]
+            and snapshot.get("state") == "open"
+            and not snapshot.get("merged")
+            and snapshot.get("base_sha") != task["snapshot"].get("base_sha")
+        ):
+            self.store.halt(
+                task_id,
+                State.RECONCILE,
+                "Published PR baseline changed; manual reconciliation required",
+            )
 
     async def eligible(self, target: Target, label: str, marker: str = "") -> dict[str, Any]:
         raw = await self.github.read(f"repos/{target.repository}/issues/{target.number}")

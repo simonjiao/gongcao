@@ -1,7 +1,9 @@
 """Intake risks at existing GitHub/SQLite seams; workflow/OS behavior lives in CLI tests."""
 
 import asyncio
+import hashlib
 import json
+import subprocess
 from copy import deepcopy
 from dataclasses import replace
 
@@ -19,6 +21,14 @@ from gongcao.store import Store
 
 @pytest.fixture
 def intake(store, repo, sha, snapshot):
+    name = "example/discovery-" + hashlib.sha256(str(store.root).encode()).hexdigest()[:12]
+    snapshot.update(repository=name, url=f"https://github.com/{name}/issues/1")
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", f"https://github.com/{name}.git"],
+        cwd=repo,
+        check=True,
+    )
+
     class API(GitHub):
         def __init__(self):
             self.rows = {
@@ -83,9 +93,7 @@ def intake(store, repo, sha, snapshot):
                 raise asyncio.CancelledError
             return deepcopy(self.comments[0])
 
-    config = replace(
-        Config(), discovery=DiscoveryConfig(True, 60, 1, (Source("example/demo", repo),))
-    )
+    config = replace(Config(), discovery=DiscoveryConfig(True, 60, 1, (Source(name, repo),)))
     return Discovery(store, config, API())
 
 
@@ -94,11 +102,15 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
 ):
     # Manual completed/cancelled tasks are never rediscovered; all pages are filtered locally too.
     store.register(snapshot["url"], repo, sha, snapshot)
+    await command("git", "commit", "--allow-empty", "-qm", "user local HEAD", cwd=str(repo))
+    head = await command("git", "rev-parse", "HEAD", cwd=str(repo))
     intake.github.rows[5]["assignees"] = [{"login": "human"}]
     async with intake.active(once=True):
         assert [t["snapshot"]["number"] for t in store.tasks()] == [1, 6]
         task = store.tasks()[-1]
         assert task["control"]["mode"] == "step"
+        assert task["target_sha"] == sha
+        assert await command("git", "rev-parse", "HEAD", cwd=str(repo)) == head
         assert intake.github.writes == ["POST", "PATCH"]
         other = Store(tmp_path / "other-state")
         try:
@@ -189,8 +201,35 @@ async def test_scan_errors_back_off_without_changing_registered_tasks(
     before = store.task(task_id)
     intake.github.failure = status
     await intake.scan()
-    assert not intake.due("example/demo") and store.task(task_id) == before
+    assert not intake.due(intake.config.discovery.sources[0].repo) and store.task(task_id) == before
     assert not intake.github.writes
+
+
+@pytest.mark.parametrize("entry", ["workflow", "publisher"])
+async def test_merged_fact_wins_over_new_default_base_without_operators(intake, store, entry):
+    await intake.scan()
+    task = store.tasks()[0]
+    with store.db:
+        store.db.execute(
+            "UPDATE tasks SET pr_number=9,stage=?,state=? WHERE id=?",
+            (Stage.MERGEABLE, State.WAITING_INSTRUCTION, task["id"]),
+        )
+    intake.github.rows[9] = intake.github.rows[1] | {
+        "merged": True,
+        "state": "closed",
+        "head_sha": task["target_sha"],
+        "base_sha": "b" * 40,
+    }
+    intake.github.sha = "0" * 40  # A terminal read must not fetch or replace this baseline.
+    assert not intake.config.copilot_operators
+    if entry == "workflow":
+        async with Lease(store, task["id"]):
+            await Recovery(store, intake.github).sync(store.task(task["id"]))
+    await intake.cycle(discover=False)
+    current = store.task(task["id"])
+    assert (current["stage"], current["state"]) == (Stage.MERGED, State.COMPLETED)
+    assert "`merged`" in intake.github.comments[0]["body"] and not current["status_sync"]["dirty"]
+    assert not store.runs(task["id"])
 
 
 def test_discovery_configuration_defaults_and_rejections(tmp_path):

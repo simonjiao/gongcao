@@ -1,5 +1,6 @@
 """Actual CLI and sandbox processes with only GitHub/model protocols substituted."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -16,6 +17,13 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
     tmp_path, repo, sha, snapshot, auth_file, continuous
 ):
     fixture = tmp_path / "github.json"
+    name = "example/discovery-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    snapshot = snapshot | {"repository": name, "url": f"https://github.com/{name}/issues/1"}
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", f"https://github.com/{name}.git"],
+        cwd=repo,
+        check=True,
+    )
     issues = [
         snapshot
         | {
@@ -45,7 +53,7 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
         "discovery": {
             "enabled": True,
             "interval_seconds": 1,
-            "sources": [{"repo": "example/demo", "path": str(repo)}],
+            "sources": [{"repo": name, "path": str(repo)}],
         },
     }
     config.write_text(yaml.safe_dump(settings))

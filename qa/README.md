@@ -111,6 +111,13 @@ This does not provide cross-process/global scheduling.
   fresh native CLI processes; repeated polling preserves sessions and writes.
   Archives command IDs, true actors, waiting checkpoints and the final evidence.
   Uses the existing owned-resource cleanup; it never merges the test PR.
+- `discovery`: requires explicit real-QA authorization. Native continuous serve discovers
+  an auto issue and a step issue through two run-owned labels, excludes an unlabelled issue,
+  confirms unique controller status comments, and consumes a trusted pause on the step issue.
+  The auto issue uses the existing six-role loop and exact-SHA CI acceptance. A repeated scan
+  must preserve sessions/PRs; cleanup additionally validates and closes the companion issues
+  and removes only the run-owned labels. Run with
+  `uv run python -m qa run discovery --real --repo OWNER/REPO --cleanup`.
 
 The #57 offline CLI regression is `uv run pytest -q tests/test_control_cli.py`.
 It runs the actual CLI in separate processes, real Git worktrees/pushes to a local
