@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .control import Controls
 from .github import GitHub, Target, command
 from .model import State
 from .recovery import Recovery, diagnose
@@ -91,12 +92,27 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         target = Target.parse(args.url)
         repo, sha = await repository(args.repo, target)
         snapshot = await github.snapshot(target)
+        if not any(task["url"].lower() == target.url.lower() for task in store.tasks()):
+            snapshot["labels"] = await github.labels(target)
         if snapshot.get("head_sha"):
             sha = snapshot["head_sha"]
             # Explicit PR registration fetches this one head, never discovers other tasks.
             await command("git", "fetch", "origin", sha, cwd=str(repo))
-        task_id = store.register(target.url, repo, sha, snapshot)
+        config = Config.load(args.config)
+        task_id = store.register(
+            target.url, repo, sha, snapshot, mode=config.copilot_mode, policy=config.policy_hash
+        )
         output(store.task(task_id))
+    elif args.command == "control":
+        config = Config.load(args.config)
+        if args.mode != "pause":
+            task = store.task(args.task)
+            store.sync(args.task, await github.task_snapshot(task))
+        accepted = Controls(store).issue(
+            args.task, args.mode or "until", args.until, policy=config.policy_hash
+        )
+        output(store.task(args.task))
+        return 0 if accepted else 1
     elif args.command == "sync":
         selected = [store.task(args.task)] if args.task else store.tasks()
         for task in selected:
@@ -119,6 +135,8 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                         "target_sha",
                         "reason",
                         "cancel_requested",
+                        "pr_number",
+                        "control",
                     )
                 }
                 | {
@@ -184,7 +202,10 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         task = store.task(args.task)
         output({"run_ids": run_ids, "task": task})
         return (
-            0 if task["state"] in {State.QUEUED, State.WAITING_DEPENDENCY, State.COMPLETED} else 1
+            0
+            if task["state"]
+            in {State.QUEUED, State.WAITING_DEPENDENCY, State.WAITING_INSTRUCTION, State.COMPLETED}
+            else 1
         )
     return 0
 
@@ -202,6 +223,14 @@ def parser() -> argparse.ArgumentParser:
     register = commands.add_parser("register", help="Register exactly one GitHub Issue/PR")
     register.add_argument("url")
     register.add_argument("--repo", type=Path, default=Path.cwd())
+    register.add_argument("--config", type=Path)
+    control = commands.add_parser("control", help="Authorize progress or request a safe pause")
+    control.add_argument("task", type=int)
+    control.add_argument("--config", type=Path)
+    modes = control.add_mutually_exclusive_group(required=True)
+    for mode in ("step", "auto", "pause"):
+        modes.add_argument("--" + mode, dest="mode", action="store_const", const=mode)
+    modes.add_argument("--until", choices=("development", "review", "validation", "mergeable"))
     serve = commands.add_parser("serve", help="Poll registered tasks with bounded concurrency")
     serve.add_argument("--config", type=Path)
     serve.add_argument("--jobs", type=int, choices=(1, 2, 3), help="Parallel tasks (YAML or 1)")

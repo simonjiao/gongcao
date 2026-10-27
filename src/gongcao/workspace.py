@@ -62,6 +62,7 @@ async def context(
         "role": role.value,
         "role_instructions": config.prompts[role],
         "github": task["snapshot"],
+        "operator_feedback": task.get("control", {}).get("feedback", []),
         "repository_instructions": agents,
         "confirmed_analysis": confirmed_analysis if role == Role.DEVELOPER else None,
         "confirmed_findings": evidence if role == Role.DEVELOPER else None,

@@ -40,7 +40,12 @@ def inspect(run: Run) -> dict[str, Any]:
         store.close()
 
 
-async def core(run: Run, *args: str, fault: bool = False) -> int:
+async def core(
+    run: Run,
+    *args: str,
+    fault: bool = False,
+    stop_event: asyncio.Event | None = None,
+) -> int:
     executing = args[0] in {"run", "serve"}
     if executing:
         run.check_cancelled()
@@ -69,9 +74,14 @@ async def core(run: Run, *args: str, fault: bool = False) -> int:
     started = time.time()
     pending = asyncio.create_task(process.communicate())
     cancel_sent = False
+    stop_sent = False
     try:
         async with asyncio.timeout(1800):
             while not pending.done():
+                if stop_event and stop_event.is_set() and not stop_sent:
+                    if process.returncode is None:
+                        process.terminate()
+                    stop_sent = True
                 if executing and not cancel_sent and (run.root / "cancel-requested").exists():
                     require(
                         await core(run, "cancel", str(run.value["task_id"])) == 0,
@@ -166,6 +176,8 @@ async def drive(
 async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     run.check_cancelled()
     requirement, config = fixture(run.id, model)
+    if run.value["scenario"] == "copilot":
+        config["copilot"] = {"operators": ["gongcao-unauthorized-fixture"], "mode": "step"}
     config_path = run.root / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=True))
     config_path.chmod(0o600)
@@ -196,7 +208,11 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     issue = await create_issue(run, requirement, github)
     run.check_cancelled()
     require(
-        await core(run, "register", issue["url"], "--repo", str(source)) == 0, "Registration failed"
+        await core(
+            run, "register", issue["url"], "--repo", str(source), "--config", str(config_path)
+        )
+        == 0,
+        "Registration failed",
     )
     store = Store(run.root / "state")
     try:
@@ -251,7 +267,11 @@ async def execute(
                 }
             else:
                 await prepare(run, github, model)
-                if run.value["scenario"] != "cancel":
+                if run.value["scenario"] == "copilot":
+                    from .copilot import exercise
+
+                    await exercise(run, github)
+                elif run.value["scenario"] != "cancel":
                     await missing_gate(run)
                 injected = False
                 deadline = time.monotonic() + 3600

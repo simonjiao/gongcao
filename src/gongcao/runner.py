@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .control import Controls, Paused
 from .events import Journal, Redactor
 from .github import GitHub
 from .model import AgentResult, Role, Stage, State, after_run, same_version
@@ -33,6 +34,11 @@ class Runner:
         task = self.store.task(task_id)
         if expected_task is not None and not same_version(expected_task, task):
             raise ValueError("Task version changed before starting the requested agent role")
+        controls = Controls(self.store)
+        controls.apply_pending(task_id, self.config)
+        if not controls.revalidate(task_id, self.config):
+            raise Paused("Waiting for instruction before starting an Agent")
+        task = self.store.task(task_id)
         role = {
             Stage.ANALYSIS: Role.ANALYST,
             Stage.DEVELOPMENT: Role.DEVELOPER,
@@ -137,6 +143,8 @@ class Runner:
             latest = await self.github.task_snapshot(task)
             self.store.sync(task_id, latest)
             next_stage, state, reason = after_run(stage, role, result, task["target_sha"])
+            if next_stage == Stage.DEVELOPMENT and task["pr_number"]:
+                next_stage = Stage.REVIEW
             if latest["state"] != "open":
                 next_stage, state, reason = (
                     stage,
@@ -198,6 +206,7 @@ class Runner:
                     message = str(exc)
                     outcome = (State.RECONCILE, stage, State.RECONCILE, message, None)
             # Accept the outcome only after all subprocess resources have been settled.
+            Controls(self.store).apply_pending(task_id, self.config)
             self.store.finish(run_id, *outcome)
             if journal is not None:
                 try:

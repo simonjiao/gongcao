@@ -270,7 +270,7 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
 ):
     controlled = Controlled(store, policy, GitHub())
 
-    async def before(task, kind):
+    async def before(task, kind, *, finish_operation=False):
         return task
 
     monkeypatch.setattr(controlled, "before", before)
@@ -348,7 +348,7 @@ def test_pr1_schema_upgrade_preserves_history_and_restarts(
     db.close()
     for _ in range(2):
         upgraded = Store(root)
-        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert upgraded.task(1)["reason"] == "history"
         assert upgraded.runs(1)[0]["thread_id"] == "old-thread"
         assert upgraded.runs(1)[0]["state"] == run_state

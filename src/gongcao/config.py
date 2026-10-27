@@ -40,6 +40,7 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
         "max_revisions",
         "scheduler",
         "qa",
+        "copilot",
     }:
         raise ValueError("Invalid configuration keys")
     return raw
@@ -70,6 +71,8 @@ class Config:
     max_revisions: int = 3
     scheduler_jobs: int = 1
     qa_jobs: int = 2
+    copilot_operators: list[str] = field(default_factory=list)
+    copilot_mode: str | None = None
 
     @property
     def policy_hash(self) -> str:
@@ -135,6 +138,17 @@ class Config:
         revisions = raw.get("max_revisions", 3)
         if type(real) is not bool or type(revisions) is not int or not 0 <= revisions <= 10:
             raise ValueError("Invalid real check requirement or revision limit")
+        copilot = raw.get("copilot", {})
+        if not isinstance(copilot, dict) or copilot.keys() - {"operators", "mode"}:
+            raise ValueError("copilot must contain only operators and mode")
+        operators = copilot.get("operators", [])
+        if not isinstance(operators, list) or any(
+            not isinstance(login, str) or not login.strip() for login in operators
+        ):
+            raise ValueError("copilot.operators must contain GitHub account names")
+        mode = copilot.get("mode")
+        if mode not in {None, "step", "auto"}:
+            raise ValueError("copilot.mode must be step or auto")
         return cls(
             model,
             timeout,
@@ -148,6 +162,8 @@ class Config:
             revisions,
             _jobs(raw, "scheduler", 1, 3),
             _jobs(raw, "qa", 2),
+            operators,
+            mode,
         )
 
     @classmethod

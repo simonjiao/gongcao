@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from .control import Controls
 from .events import Redactor
 from .github import GitHub, Target, command
 from .leases import Lease, identity, session_alive
@@ -213,6 +214,7 @@ class Recovery:
                         task_id,
                     ),
                 )
+            Controls(self.store).checkpoint(task_id)
         return {
             "task_id": task_id,
             "recovered": True,
@@ -280,6 +282,9 @@ class Recovery:
                         "UPDATE tasks SET target_sha=?,stage=? WHERE id=?",
                         (refreshed_sha, Stage.ANALYSIS, task_id),
                     )
+                    Controls(self.store).invalidate(
+                        task_id, "Baseline refreshed; renew instruction"
+                    )
                 self.store.db.execute(
                     "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
                     "(state!='completed' OR json_extract(result,'$.conclusion')!='ready' "
@@ -298,6 +303,7 @@ class Recovery:
                     "ELSE revision_count END,updated=? WHERE id=? AND cancel_requested=0",
                     (State.QUEUED, "Manual retry requested", reset_revisions, time.time(), task_id),
                 )
+                Controls(self.store).checkpoint(task_id)
             return {"task_id": task_id, "recovered": True, "task": self.store.task(task_id)}
 
 

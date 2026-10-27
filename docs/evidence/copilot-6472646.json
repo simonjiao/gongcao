@@ -1,0 +1,257 @@
+{
+  "schema": 1,
+  "issue": 57,
+  "complete_real_acceptance_passed": true,
+  "implementation_sha": "64726462dcc5ece558220e697e070521ca4c81d3",
+  "local_checks": {
+    "ruff": true,
+    "format": true,
+    "mypy": true,
+    "python3.12": {
+      "passed": 250,
+      "seconds": 250.62
+    },
+    "python3.13": {
+      "passed": 250,
+      "seconds": 253.63
+    }
+  },
+  "implementation_ci": {
+    "id": 40442623133,
+    "head_sha": "64726462dcc5ece558220e697e070521ca4c81d3",
+    "conclusion": "success",
+    "python": [
+      "3.12",
+      "3.13"
+    ]
+  },
+  "run_id": "3f562f499836476783620e0e2b6db079",
+  "scenario_version": 5,
+  "scenario_digest": "d6c8f9a7e32bac1a5db60d7e0add4dd21699f24ee180b159dfdece8b7dc23215",
+  "status": "passed",
+  "cleaned": true,
+  "resources": {
+    "issue": {
+      "number": 64,
+      "url": "https://github.com/simonjiao/gongcao/issues/64"
+    },
+    "branch": "gongcao/work-1159f637f936",
+    "pr_number": 65
+  },
+  "archived_verification": {
+    "run_id": "3f562f499836476783620e0e2b6db079",
+    "passed": true,
+    "as_of": 1793071278.3202283,
+    "cleaned": true,
+    "evidence": "archived, digest-checked"
+  },
+  "verdict": {
+    "passed": true,
+    "at": 1793071278.3202283,
+    "kind": "real-loop",
+    "target_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+    "revision_count": 1,
+    "initial_sha": "0b1130f88597b895db46039c8d8e73353a938a2c",
+    "ci_runs": [
+      {
+        "id": 40443243677,
+        "run_attempt": 1,
+        "head_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+        "path": ".github/workflows/ci.yml",
+        "conclusion": "success",
+        "target_proof": {
+          "pr_number": 65,
+          "repository": "simonjiao/gongcao",
+          "base_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+          "head_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+          "base_ref": "main",
+          "base_ref_basis": "current ref + complete retarget history before run creation",
+          "run_created_at": "2026-10-27T03:16:24Z",
+          "last_base_change": null,
+          "timeline_sha256": "310fb9b494efe1e176f40e9354e1504799cf2fb40e9ba149ac06228bc5beb987",
+          "checkout_sha": "ebe894cf74820ab31462b87aedceb0a48c93e9cf",
+          "run_id": 40443243677,
+          "attempt": 1,
+          "job_id": 121988301563,
+          "source": "actions/checkout job log + GitHub commit parents",
+          "checkout_basis": "successful checkout step",
+          "log_sha256": "44ddf07a3c4add885a19065bf98209501f356fcc7a5af9e9d9c7a770a423fc0c"
+        }
+      }
+    ],
+    "sessions": [
+      {
+        "id": "e3979a0e5398496287c9ff4024ae3387",
+        "role": "analyst",
+        "state": "completed",
+        "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+        "thread_id": "01a17b56-adf0-7ea2-bac4-6ae0c8bbea9b",
+        "evidence_valid": 0
+      },
+      {
+        "id": "5b79d21099f949fd8295e87bc649791e",
+        "role": "developer",
+        "state": "completed",
+        "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+        "thread_id": "01a17b57-7b05-7d63-b282-40b3f066e433",
+        "evidence_valid": 0
+      },
+      {
+        "id": "2861250f8b774b3394b387360cca83b5",
+        "role": "reviewer",
+        "state": "completed",
+        "target_sha": "0b1130f88597b895db46039c8d8e73353a938a2c",
+        "thread_id": "01a17b5a-96a8-7533-b215-4222a76f740a",
+        "evidence_valid": 0
+      },
+      {
+        "id": "e38f10d8ed5d49d7a95ad9b9be1ad5db",
+        "role": "developer",
+        "state": "completed",
+        "target_sha": "0b1130f88597b895db46039c8d8e73353a938a2c",
+        "thread_id": "01a17b5b-38ec-7ce3-ba92-1b0cc38b895f",
+        "evidence_valid": 0
+      },
+      {
+        "id": "dcd49f22769346cdb7d75163d6459bb3",
+        "role": "reviewer",
+        "state": "completed",
+        "target_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+        "thread_id": "01a17b5d-be70-7822-a94f-abc0ed0e2200",
+        "evidence_valid": 1
+      },
+      {
+        "id": "1757211a703445f99713e6417dad1ed1",
+        "role": "validator",
+        "state": "completed",
+        "target_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+        "thread_id": "01a17b5e-a42d-7700-b261-f954dd91018d",
+        "evidence_valid": 1
+      }
+    ],
+    "stale_sha_rejected": true,
+    "boundary_probe": {
+      "inputs": [
+        -500,
+        -1,
+        0,
+        1,
+        99,
+        100,
+        101,
+        500
+      ],
+      "initial": [
+        -500,
+        -1,
+        0,
+        1,
+        99,
+        100,
+        100,
+        100
+      ],
+      "final": [
+        0,
+        0,
+        0,
+        1,
+        99,
+        100,
+        100,
+        100
+      ]
+    },
+    "changed_files": [
+      "qa_fixture_3f562f499836.py",
+      "tests/test_qa_fixture_3f562f499836.py"
+    ],
+    "review_ids": [
+      5661815604,
+      5661835222
+    ],
+    "repeat_unchanged": true
+  },
+  "quality_snapshot_trees": [
+    {
+      "target_sha": "0b1130f88597b895db46039c8d8e73353a938a2c",
+      "snapshot_tree": "f2e90babe16e95c172d1da4396e8fbdc32f84a08",
+      "github_tree": "f2e90babe16e95c172d1da4396e8fbdc32f84a08",
+      "matched": true
+    },
+    {
+      "target_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+      "snapshot_tree": "3970bc666b32382369348e1a40685627697cc276",
+      "github_tree": "3970bc666b32382369348e1a40685627697cc276",
+      "matched": true
+    }
+  ],
+  "copilot_checkpoints": {
+    "copilot-denied": {
+      "id": 1,
+      "stage": "pending_analysis",
+      "state": "waiting_instruction",
+      "pr_number": null,
+      "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+      "run_count": 0
+    },
+    "copilot-edited": {
+      "id": 1,
+      "stage": "pending_analysis",
+      "state": "waiting_instruction",
+      "pr_number": null,
+      "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+      "run_count": 0
+    },
+    "copilot-expired": {
+      "id": 1,
+      "stage": "pending_analysis",
+      "state": "waiting_instruction",
+      "pr_number": null,
+      "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+      "run_count": 0
+    },
+    "copilot-pending-development": {
+      "id": 1,
+      "stage": "pending_development",
+      "state": "waiting_instruction",
+      "pr_number": null,
+      "target_sha": "f5c81118f8fbeef8b1b261e3fabe93f6dff9096d",
+      "run_count": 1
+    },
+    "copilot-pending-review": {
+      "id": 1,
+      "stage": "pending_review",
+      "state": "waiting_instruction",
+      "pr_number": 65,
+      "target_sha": "0b1130f88597b895db46039c8d8e73353a938a2c",
+      "run_count": 2
+    },
+    "copilot-pending-validation": {
+      "id": 1,
+      "stage": "pending_validation",
+      "state": "waiting_instruction",
+      "pr_number": 65,
+      "target_sha": "ce58f1904b212f2dd14fa5de32f73abf19241214",
+      "run_count": 5
+    }
+  },
+  "archive_digests": {
+    "configuration.json": "92423b89b1e363fbcf603c282472328b9277c29815558ba834d7c1fbb32eff54",
+    "copilot-denied.json": "533ad1db5bf7ef5ce48e5e02496d481dee70c9ef79a1a009f12687402c5dc895",
+    "copilot-edited.json": "562f966ba253585b7744f9e6a87a882b0929560aebafe55fb8cd0f455c0ffe49",
+    "copilot-expired.json": "f10671ff9ed2945816fd20d16cf563dcc4b8b52853bd4532cebcc175a846a968",
+    "copilot-pending-development.json": "f430dcee543427ec8e694c3bc5261ffea195b055689c85c0b9301b0bcf58fa54",
+    "copilot-pending-review.json": "402a58a7f1594bd344ace942ba4ae9dd71b6b7d0756863caea00232a330d20e4",
+    "copilot-pending-validation.json": "45aa9cbe0e14c5a53560d77d2fe397e2a04e486b4c3e72172de83d5cfc91a3c2",
+    "copilot-commands.json": "9212f6018abd693d1fb4a6b68a9e0e2f930b5f75e966ea23afcf211f7e6275fc",
+    "github.json": "6fb3c250ec9bf76234ce9286389c941b62a6ea0a19df366f0471611093d9ce5f",
+    "repeat.json": "dccf611f1931ff6125cc398a5213eff93b07c69d76d321cc7b53bdc4a6a1da03",
+    "task.json": "cb99ad843c39939d1b97cef52134592e9da1ffffa8459fb47cf3da1bccbca8c4",
+    "verdict.json": "6d4749db0cff037ccbcb34f36d64a2288100d270a2e3ecab2bad6ddd40acc6ad",
+    "cleanup-task.json": "cb99ad843c39939d1b97cef52134592e9da1ffffa8459fb47cf3da1bccbca8c4",
+    "cleanup-remote.json": "b07d8e83cf90f33495ec2c4cb0b1cb48c575354543237b152f7d7d694139ed5a",
+    "cleanup-confirmed.json": "692c1d55cdcbe7d5579df7a1fbe1bfe64e919576395882e11810228d0ccbe9fe"
+  },
+  "historical_failures": "copilot-24b14bd.json"
+}

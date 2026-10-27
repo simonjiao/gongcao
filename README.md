@@ -89,6 +89,48 @@ Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
 请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
-旧 SQLite 在事务内依次升级到模式版本 2；更高版本数据库会被拒绝打开，不静默降级。
+旧 SQLite 在事务内依次升级到模式版本 3；更高版本数据库会被拒绝打开，不静默降级。
 运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
 验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。
+
+## 按指示推进
+
+在已登记任务上设置持久策略，再运行 `run` 或 `serve`：
+
+```bash
+uv run gongcao control 1 --step --config gongcao.example.yaml
+uv run gongcao run 1 --config gongcao.example.yaml
+uv run gongcao control 1 --until review --config gongcao.example.yaml
+uv run gongcao control 1 --auto --config gongcao.example.yaml
+uv run gongcao control 1 --pause
+```
+
+`step` 完成当前一个业务阶段及其受控写入后，在下一阶段入口进入
+`waiting_instruction`；审查退回修订也消耗一次授权。等待 CI 或依赖时授权保留。
+`until development/review/validation` 在目标入口暂停，已到目标立即暂停，拒绝倒退；
+`until mergeable` 完成现有验证门禁后等待人工合并。`auto` 推进到现有阻断或待人工合并。
+已有 PR 的分析直接进入审查，因此拒绝不可达的 `until development`。
+`pause` 持久请求在安全检查点停止，当前 Agent/写入先收束，结果不明仍待核对。
+切换至 `step`、`until` 或 `auto` 恢复。本地 CLI 在执行中可请求 pause，其余本地切换需等待安全暂停。
+`run` 不绕过暂停，暂停任务不占 `jobs`；`serve --once` 仍然只是一次调度周期。
+`status/inspect` 提供阶段、状态、策略/目标、PR/SHA、等待原因及指令受理/消费记录。
+
+手工登记默认 `auto`。可在首次 `register --config FILE` 时设置
+`copilot.mode: step`，或用互斥的 `gongcao:step`、`gongcao:auto`、
+`gongcao:until-review`、`gongcao:until-validation` 标签覆盖初始策略；冲突标签暂停。
+标签只在首次登记消费，后续改标签或重复登记不会重新授权。供 #56 使用的
+`Store.register(..., source="discovery")` 默认 `step`，显式 mode 才覆盖。
+
+远端指令默认禁用。配置 `copilot.operators: [GITHUB_LOGIN]` 后，控制器只读取
+原 Issue 的顶层评论：`/gongcao step`、`/gongcao until review`（亦支持其余确定目标）、
+`/gongcao auto`、`/gongcao pause`。信任 API 返回的登录账户，不信任正文自报身份。
+标签使用独立分页读取；后台评论读取不申请 jobs 或 Agent 租约。运行中收到的指令先登记为
+pending，在下一安全点核验并应用；任务暂停时 serve 仍会读取评论并按授权唤醒。
+普通评论和 PR Review 不作控制指令；编辑旧评论不能重新授权，请发新评论。
+按评论 ID、内容指纹、发布时间、阶段、SHA 和需求基线持久去重；早于当前阶段/需求基线的指令拒绝。
+同一时间的冲突指令保守暂停，分批读取和重启保持相同结果；撤回已授权评论同样暂停。
+GitHub 时间戳精确到秒，进入新检查点后请在下一秒发布新指令。
+授权评论首行之后的补充要求作为注明来源的任务数据输入，并重建分析/审查证据。
+外部变更请求、PR/SHA 或执行策略使显式旧授权失效，需重新指示；未知写入和人工门禁优先。
+移出 `copilot.operators` 的操作者，其旧远端授权也会暂停并要求重新指示。
+本功能不发现/领取 Issue、不发布状态评论、不自动合并；#56 负责发现与统一状态评论。

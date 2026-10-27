@@ -34,6 +34,13 @@ and exercise actual Bubblewrap mounts, credential isolation and read-only access
 No pre-existing temporary directory is required. All temporary probe data is
 created and removed by the check.
 
+The real scene's pytest command tests a complete source copy inside the same
+quality sandbox, with newly initialized credential-free Git metadata. This lets
+clone-dependent project tests run while production isolation continues to mask
+the controller's `.git`. The command records `QA_SOURCE_TREE` for comparison with
+the target commit tree; no tests are excluded. Ruff/mypy and independent boundary
+probes continue to inspect the target worktree.
+
 ## Explicit real acceptance
 
 Real scenarios create issues, unmerged PRs, review COMMENTs and dedicated branches
@@ -94,6 +101,25 @@ This does not provide cross-process/global scheduling.
   parallel batch), invokes native `cancel`, confirms stopped descendants and no
   remote controller writes, then archives and cleans its own issue. Expected
   cancellation counts as this scenario's success; unexpected stops fail a Run.
+- `copilot`: requires `--real --repo`. Posts actual Issue comments from the API account,
+  first excluded from operators (rejected), then explicitly allowed. Uses step for
+  analysis and development/publication, until-validation for review/revision, then
+  auto for the existing exact-SHA gates. Edited and expired comments must be rejected.
+  A continuously running native serve must wake an already-paused task from an
+  authorized comment; the test does not restart serve to cause that first wakeup.
+  Each permission is consumed once across
+  fresh native CLI processes; repeated polling preserves sessions and writes.
+  Archives command IDs, true actors, waiting checkpoints and the final evidence.
+  Uses the existing owned-resource cleanup; it never merges the test PR.
+
+The #57 offline CLI regression is `uv run pytest -q tests/test_control_cli.py`.
+It runs the actual CLI in separate processes, real Git worktrees/pushes to a local
+bare repository and production OS sandboxes. `qa.copilot_fixture` substitutes only
+the GitHub/model protocols. Its persistent serve receives an authorized comment,
+wakes the paused task, publishes once, and stops at review with no lease held.
+This is offline evidence, not real model/GitHub acceptance.
+The optional real run is `uv run python -m qa run copilot --real --repo OWNER/REPO --cleanup`;
+execute it only with explicit authorization for real QA.
 
 `verify-batch --require-isolation` checks slot events, independent resource IDs,
 overlapping real SDK session intervals, a queued third Run, and cancellation

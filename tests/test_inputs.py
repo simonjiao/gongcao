@@ -66,6 +66,43 @@ async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
     assert snapshot["body"] == "[REDACTED]"
 
 
+async def test_transient_github_read_retries_but_a_write_never_replays(monkeypatch):
+    calls = []
+
+    async def transport(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise RuntimeError('Get "https://api.github.com/repos/a/b/pulls/1": EOF')
+        return '{"ok": true}'
+
+    monkeypatch.setattr("gongcao.github.command", transport)
+    assert await GitHub().read("repos/a/b/pulls/1") == {"ok": True}
+    assert len(calls) == 2
+    calls.clear()
+    with pytest.raises(RuntimeError, match="EOF"):
+        await GitHub().mutate("repos/a/b/issues", {"title": "test"})
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("permission", [False, True])
+async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
+    monkeypatch, permission
+):
+    calls = 0
+
+    async def transport(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if permission:
+            raise PermissionError("HTTP 403")
+        raise RuntimeError("Get https://api.github.com/user: EOF")
+
+    monkeypatch.setattr("gongcao.github.command", transport)
+    with pytest.raises(PermissionError if permission else ConnectionError):
+        await GitHub().read("user")
+    assert calls == (1 if permission else 3)
+
+
 async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):
     async def read(*args):
         return json.dumps(

@@ -8,13 +8,76 @@ import sys
 import pytest
 from test_qa import new_run
 
+from gongcao.config import Config
 from gongcao.github import GitHub, command
+from gongcao.model import Stage, State
+from gongcao.quality import Quality
 from gongcao.store import Store
 from qa.__main__ import execute as cli_execute
 from qa.__main__ import parser
+from qa.copilot import wake
 from qa.ledger import Run, RunCancelled
 from qa.resources import Unconfirmed, cleanup
 from qa.runner import batch, core, execute
+from qa.scenarios import pytest_snapshot_script
+
+
+async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+    observed = asyncio.Event()
+    released = False
+    state = "waiting_instruction"
+
+    async def serving(run, *args, stop_event):
+        nonlocal released, state
+        await observed.wait()
+        try:
+            await asyncio.wait_for(stop_event.wait(), 0.05)
+        except TimeoutError:
+            released = True
+            await stop_event.wait()
+        else:
+            state = "needs_reconciliation"  # Shutdown interrupted occupied work.
+        return 130
+
+    def inspect(run):
+        observed.set()
+        return {
+            "stage": "pending_development",
+            "state": state,
+            "reason": "",
+            "runtime": {"lease": None if released else {"owner": "live"}},
+        }
+
+    async def post(text):
+        return "github:1"
+
+    monkeypatch.setattr("qa.copilot.core", serving)
+    monkeypatch.setattr("qa.copilot.inspect", inspect)
+    assert await wake(run, run.root / "config.yaml", post) == "github:1"
+    assert released and state == "waiting_instruction"
+
+
+async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbox(
+    store, repo, snapshot
+):
+    (repo / "test_checkout.py").write_text(
+        "import subprocess\nfrom pathlib import Path\n"
+        "def test_clone(tmp_path):\n"
+        "    subprocess.run(['git','clone','-q','--local',str(Path.cwd()),"
+        "str(tmp_path/'copy')],check=True)\n"
+    )
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "clone-dependent project check", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    task_id = store.register(snapshot["url"], repo, sha, snapshot)
+    store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "fixture")
+    data = await Quality(
+        store, Config(checks=[[sys.executable, "-c", pytest_snapshot_script()]])
+    ).run(store.task(task_id), "checks")
+    assert data["passed"], data["commands"]
+    tree = (await command("git", "rev-parse", "HEAD^{tree}", cwd=str(repo))).strip()
+    assert "QA_SOURCE_TREE=" + tree in data["commands"][0]["stdout"]["tail"]
 
 
 @pytest.mark.parametrize("scene", ["loop", "smoke"])

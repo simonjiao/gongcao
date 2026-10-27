@@ -6,6 +6,8 @@ import math
 import time
 
 from .config import Config
+from .control import Controls
+from .events import Redactor
 from .github import GitHub
 from .model import Stage, State
 from .recovery import Recovery
@@ -60,9 +62,33 @@ class Scheduler:
                 )
 
     async def advance(self, task_id: int) -> None:
+        if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+            if self.config.copilot_operators:
+                task = self.store.task(task_id)
+                if self.store.db.execute(
+                    "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
+                ).fetchone():
+                    return
+                try:
+                    self.store.sync(task_id, await self.github.task_snapshot(task))
+                    await Controls(self.store).poll(task_id, self.config, self.github)
+                except Exception as exc:
+                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                        self.store.halt(
+                            task_id,
+                            State.WAITING_INSTRUCTION,
+                            Redactor().text(f"Instruction poll failed: {exc}"),
+                        )
+                    return
+            if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                return
         async with self.semaphore:
             task = self.store.task(task_id)
-            if task["stage"] == Stage.MERGED or task["cancel_requested"]:
+            if (
+                task["stage"] == Stage.MERGED
+                or task["cancel_requested"]
+                or task["state"] == State.WAITING_INSTRUCTION
+            ):
                 return
             due = self.store.db.execute(
                 "SELECT next_at FROM retries WHERE task_id=?", (task_id,)
@@ -70,6 +96,7 @@ class Scheduler:
             if due and due[0] > time.time():
                 return
             workflow = Workflow(self.store, self.config, self.github)
+            workflow.watch_instructions = False
             self.workflows.append(workflow)
             try:
                 await workflow.run(task_id)
@@ -86,7 +113,11 @@ class Scheduler:
                 with self.store.db:
                     self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))
 
-    async def serve(self, *, once: bool = False, poll: float = 5) -> None:
+    async def serve(self, *, once: bool = False, poll: float = 5.0) -> None:
+        async with Controls(self.store).listen(self.config, self.github):
+            await self.execute(once=once, poll=poll)
+
+    async def execute(self, *, once: bool, poll: float) -> None:
         if not math.isfinite(poll) or poll < 1:
             raise ValueError("Poll interval must be at least one second")
         recovery = Recovery(self.store, self.github)
