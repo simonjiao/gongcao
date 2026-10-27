@@ -21,9 +21,12 @@ See `docs/acceptance-copilot.md` for the historical feature-branch evidence.
 
 Current feature work: configured discovery, confirmed claiming and the single GitHub
 status publisher, https://github.com/simonjiao/gongcao/issues/56.
-Implementation `22da0d4` passes Python 3.12/3.13 CI (266 tests each) and both review axes.
-See `docs/issue56-discovery.md`. Real GitHub/Codex acceptance requires explicit
-authorization and remains pending; keep the implementation PR draft and #56 open.
+Implementation `af363b8` passes Python 3.12/3.13 CI (266 tests each) and both review axes.
+Authorized real GitHub/Codex Run `25d018afb9d04bf9886a1a105a2f8d95` passed and its
+three issues, unmerged PR #75, two labels, branch and workspaces were safely cleaned.
+See `docs/issue56-discovery.md` and `docs/evidence/discovery-af363b8.json`.
+Implementation PR: https://github.com/simonjiao/gongcao/pull/68. Keep #56 open pending
+human review and merge; no automated merge or release.
 
 Keep the parent issue open until QA is accepted and final-main integration evidence is recorded.
 The product

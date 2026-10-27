@@ -1,5 +1,9 @@
 # Issue #56：发现、领取和状态同步
 
+最新状态（2026-10-27）：实现 `af363b8` 的双版本 CI 与完整真实 GitHub/Codex 验收通过，
+归档复核通过，测试资源已安全清理。[结构化证据](evidence/discovery-af363b8.json)。
+实现 PR：[#68](https://github.com/simonjiao/gongcao/pull/68)，待人工审查和合并。
+
 需求来源：https://github.com/simonjiao/gongcao/issues/56 。基于已合并的 PR #66，
 起点为 `221ff3f4afeb153e09d3096d08ef63f1f25e1b5e`。不包含 #67 的同秒评论时间优化。
 
@@ -63,6 +67,8 @@ QA 适配超出 Issue 的 80–160 行初估：新增三 Issue/两标签的持�
 GitHub 协议夹具、归档验收反例和独立于 operators 的终态回归；CLI 用例在 120 行以内。
 双版本可并行测试使用各自唯一的假仓库名，避免真实共享锁正确拦截彼此；没有替换锁路径或 OS 检查。
 正式代码仍在 420–710 行估算范围内。
+实际接口验收进一步补齐了领取已写入、尚未登记时的只读对账与清理：须精确回读作者、标记、ID
+和已有意图正文才能记为已确认；不重发 POST，不登记任务，不启动 Agent。
 
 ## Standards
 
@@ -79,16 +85,45 @@ CI 首启并发还复现 WAL 初始化竞争，Store 以状态目录内的 OS �
 
 ## 当前验收状态
 
-- 正式代码基准提交：`22da0d4b50fe0d0bfbdfafa3e03d5457a8df661d`。
-  [CI 40464547843](https://github.com/simonjiao/gongcao/actions/runs/40464547843)
+- 正式代码基准提交：`af363b8084b32b62b7b84b758cf7d7e4a32cc0fc`。
+  [CI 40467867638](https://github.com/simonjiao/gongcao/actions/runs/40467867638)
   在 Python 3.12/3.13 上均通过 locked sync、Ruff、format、mypy、实际 OS 离线 QA 与全量测试：
-  分别 **266 passed / 70.92s**、**266 passed / 86.12s**。
+  分别 **266 passed / 91.89s**、**266 passed / 90.23s**。
 - 本地修复后的状态/升级/CLI 定向回归 42 项通过；最终共享夹具和 jobs 回归 3.12 为 28 项通过，
   3.13 的实际 CLI 回归 3 项通过。本地离线 QA 验证宿主凭证、仓库、外部写入不可访问。
+  真实接口修复后，3.12 的发现/CLI/QA 回归 38 项通过，3.13 的发现/CLI 回归 15 项通过。
 - 双轴最终复核：Standards 0、Spec 0；初始化锁的补充审查 0。
-- 真实 GitHub + Codex QA 尚未运行，需用户为 #56 明确授权；没有将离线协议替代作为真实验收。
-- 不自动合并，不关闭 #56；正式完成以当前提交及真实验收证据为准。
+- 用户明确授权后，真实 Run `25d018afb9d04bf9886a1a105a2f8d95` **passed + cleaned**，
+  `qa verify` 重新核验所有归档摘要并通过。真实接口修复亦经两轴复核，无剩余发现。
+- 不自动合并，不关闭 #56；功能分支证据供 PR 审查，主干保持 `221ff3f`。
 
-相对基点的最终新增/删除（不含证据与使用文档）：正式 Python **+630/-59**，
-内部测试 **+317/-7**，CLI 测试 **+116/-1**，QA 场景及适配 **+351/-22**，
-合计 **+1414/-89**。正式代码在估算范围内；测试与 QA 超量原因见上述独立安全边界说明。
+相对基点的最终新增/删除（不含证据与使用文档）：正式 Python **+634/-59**，
+内部测试 **+320/-7**，CLI 测试 **+116/-1**，QA 场景及适配 **+385/-22**，
+合计 **+1455/-89**。正式代码在估算范围内；测试与 QA 超量原因见上述独立安全边界说明。
+
+## 真实验收证据
+
+来源标签独立领取 auto [Issue #72](https://github.com/simonjiao/gongcao/issues/72) 和 step
+[Issue #73](https://github.com/simonjiao/gongcao/issues/73)，无标签的
+[Issue #74](https://github.com/simonjiao/gongcao/issues/74) 未登记。两条自有状态评论 ID 为
+`6436348010`、`6436353537`，重复扫描后仍各自唯一，待同步和未知意图均为空。
+step 只运行一次分析并暂停；可信评论 `6436368631` 的 pause 指令有 consumed 审计记录。
+
+auto 完成六个真实角色会话及一次独立审查修订，最终为 mergeable/completed。
+初始 SHA `9c4a9881dc696600e916d3f644d521cdf3a8d52d` 的本地检查虽通过，独立审查仍拒绝其
+预埋负数缺陷；修订 SHA `777d38e3072504a07a44538e3e00b113ae2de170` 的检查、复审、真实边界探针、
+精确 SHA CI 和验证均通过。[测试 PR #75](https://github.com/simonjiao/gongcao/pull/75) 的
+[CI 40468973813](https://github.com/simonjiao/gongcao/actions/runs/40468973813) 具有实际 checkout
+日志及 base/head 双父提交证明；旧 SHA 被独立验收器拒绝。重复扫描和重复执行未增加角色会话、PR 或评审。
+
+两轮质量沙箱的完整源码拷贝 tree 均与 GitHub 对应提交一致。目标测试仓库是固定 main `221ff3f`
+加动态夹具，因此两轮为 251 项测试及 5/9 个 subtest；它与上面的实现分支 266 项 CI 分别记录。
+所有 Run/Thread ID、SHA、来源 tree、归档摘要和清理确认均在结构化证据中。
+
+验收后 72/73/74 三个 Issue 已关闭，PR #75 未合并后关闭，专用分支和两个临时标签已删除，
+Run 的 clone/worktree 及模型认证副本已清理；日志、上下文和 SQLite 保留。默认分支未改变。
+
+此前 Run `df2a1929323040a5a0d62d55a7b9da18` 在 `77405f1` 上因 GitHub 列表/详情的
+`user.avatar_url` 差异而被作者对象整体比较拒绝，保持未登记且 **0 Agent**。停止后，使用修复版
+只读核验评论 ID/作者/标记/正文，确认已存在的 POST，再清理 69/70/71 和其两个临时标签。
+该 Run 保留 failed 历史，后续 cleaned=true；没有将其作为通过证据或重放评论写入。
