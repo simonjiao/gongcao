@@ -376,6 +376,12 @@ def verify_archived(run: Run) -> dict[str, Any]:
                         and checkpoint["state"] == "waiting_instruction",
                         "Control checkpoint continuity failed",
                     )
+            elif run.value["scenario"] == "discovery":
+                from .discovery import verify
+
+                verify(
+                    json.loads((run.root / "discovery.json").read_text()), run.value["github_login"]
+                )
             else:
                 missing = json.loads((run.root / "missing-gate.json").read_text())
                 require(

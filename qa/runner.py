@@ -27,10 +27,10 @@ from .resources import Unconfirmed, cleanup, create_issue, settled
 from .scenarios import VERSION, fixture, version_digest
 
 
-def inspect(run: Run) -> dict[str, Any]:
+def inspect(run: Run, task_id: int | None = None) -> dict[str, Any]:
     store = Store(run.root / "state")
     try:
-        task = store.task(run.value["task_id"])
+        task = store.task(run.value["task_id"] if task_id is None else task_id)
         return task | {
             "runs": store.runs(task["id"]),
             "evidence": store.evidence(task["id"]),
@@ -207,6 +207,11 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     run.check_cancelled()
     issue = await create_issue(run, requirement, github)
     run.check_cancelled()
+    if run.value["scenario"] == "discovery":
+        from .discovery import exercise
+
+        await exercise(run, github)
+        return
     require(
         await core(
             run, "register", issue["url"], "--repo", str(source), "--config", str(config_path)
@@ -271,7 +276,7 @@ async def execute(
                     from .copilot import exercise
 
                     await exercise(run, github)
-                elif run.value["scenario"] != "cancel":
+                elif run.value["scenario"] not in {"cancel", "discovery"}:
                     await missing_gate(run)
                 injected = False
                 deadline = time.monotonic() + 3600

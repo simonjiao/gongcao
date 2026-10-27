@@ -7,6 +7,7 @@ import time
 
 from .config import Config
 from .control import Controls
+from .discovery import Discovery
 from .events import Redactor
 from .github import GitHub
 from .model import Stage, State
@@ -129,27 +130,39 @@ class Scheduler:
                 ).fetchone()
             ):
                 await recovery.recover(task["id"])
-        while True:
-            pending = [asyncio.create_task(self.advance(t["id"])) for t in self.store.tasks()]
-            group = asyncio.gather(*pending)
-            try:
-                await asyncio.shield(group)
-            except BaseException:
-                for workflow in self.workflows:
-                    if workflow.lease:
-                        workflow.lease.lost = True
-                for task_run in pending:
-                    task_run.cancel()
-                closing = asyncio.gather(*pending, return_exceptions=True)
-                while not closing.done():
-                    try:
-                        await asyncio.shield(closing)
-                    except asyncio.CancelledError:
-                        continue
-                closing.result()
-                # Retrieve the original group's cancellation/exception too.
+        async with Discovery(self.store, self.config, self.github).active(once=once):
+            await self.schedule(once=once, poll=poll)
+
+    async def schedule(self, *, once: bool, poll: float) -> None:
+        pending: dict[int, asyncio.Task[None]] = {}
+        group = None
+        try:
+            while True:
+                for task_id, task_run in list(pending.items()):
+                    if task_run.done():
+                        task_run.result()
+                        del pending[task_id]
+                for task in self.store.tasks():
+                    if task["id"] not in pending:
+                        pending[task["id"]] = asyncio.create_task(self.advance(task["id"]))
+                if once:
+                    group = asyncio.gather(*pending.values())
+                    await asyncio.shield(group)
+                    return
+                await asyncio.sleep(poll)
+        except BaseException:
+            for workflow in self.workflows:
+                if workflow.lease:
+                    workflow.lease.lost = True
+            for task_run in pending.values():
+                task_run.cancel()
+            closing = asyncio.gather(*pending.values(), return_exceptions=True)
+            while not closing.done():
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    continue
+            closing.result()
+            if group is not None:
                 await asyncio.gather(group, return_exceptions=True)
-                raise
-            if once:
-                return
-            await asyncio.sleep(poll)
+            raise

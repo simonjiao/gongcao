@@ -11,6 +11,7 @@ from .github import GitHub
 from .leases import Lease
 from .model import Role, Stage, State, same_version
 from .quality import Quality, ci_gate
+from .recovery import Recovery
 from .remote import Controlled, UncertainWrite
 from .runner import Runner
 from .sandbox import IsolationError
@@ -28,7 +29,7 @@ class Workflow:
 
     async def sync(self, task_id: int) -> dict[str, Any]:
         task = self.store.task(task_id)
-        self.store.sync(task_id, await self.github.task_snapshot(task))
+        await Recovery(self.store, self.github).sync(task)
         return self.store.task(task_id)
 
     async def confirm(self, expected: dict[str, Any]) -> dict[str, Any]:

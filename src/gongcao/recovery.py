@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from .control import Controls
+from .control import Controls, InstructionChanged
 from .events import Redactor
 from .github import GitHub, Target, command
 from .leases import Lease, identity, session_alive
@@ -19,6 +19,44 @@ from .workspace import repository
 class Recovery:
     def __init__(self, store: Store, github: GitHub):
         self.store, self.github = store, github
+
+    async def default_base(self, task: dict[str, Any]) -> str:
+        await repository(Path(task["repo_path"]), Target.parse(task["url"]))
+        repo = task["snapshot"]["repository"]
+        metadata = await self.github.read(f"repos/{repo}")
+        ref = await self.github.read(f"repos/{repo}/git/ref/heads/{metadata['default_branch']}")
+        sha: str = ref["object"]["sha"]
+        try:
+            await command("git", "cat-file", "-e", f"{sha}^{{commit}}", cwd=task["repo_path"])
+        except RuntimeError:
+            await command("git", "fetch", "origin", sha, cwd=task["repo_path"])
+        return sha
+
+    async def sync(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Discovery baselines are remote facts, including immediately before writes."""
+        snapshot = await self.github.task_snapshot(task)
+        row = self.store.db.execute(
+            "SELECT data FROM claims WHERE task_id=?", (task["id"],)
+        ).fetchone()
+        if row:
+            data = json.loads(row["data"])
+            sha = await self.default_base(task)
+            if sha != data["base_sha"]:
+                self.store.sync(task["id"], snapshot)
+                if task["pr_number"] or self.store.evidence(task["id"])["operations"]:
+                    self.store.halt(
+                        task["id"],
+                        State.RECONCILE,
+                        "Default branch changed after remote intent/publication; "
+                        "manual reconciliation required",
+                    )
+                else:
+                    with self.store.db:
+                        self.store.db.execute("BEGIN IMMEDIATE")
+                        self.store.refresh_base(task["id"], sha)
+                raise InstructionChanged("Default branch changed; previous evidence cannot advance")
+        self.store.sync(task["id"], snapshot)
+        return snapshot
 
     async def observe(self, task: dict[str, Any], op: dict[str, Any]) -> dict[str, Any] | None:
         payload = op["payload"]
@@ -245,22 +283,7 @@ class Recovery:
                     raise ValueError(
                         "Only unpublished issues without remote intents can refresh their baseline"
                     )
-                repo = task["snapshot"]["repository"]
-                metadata = await self.github.read(f"repos/{repo}")
-                ref = await self.github.read(
-                    f"repos/{repo}/git/ref/heads/{metadata['default_branch']}"
-                )
-                refreshed_sha = ref["object"]["sha"]
-                try:
-                    await command(
-                        "git",
-                        "cat-file",
-                        "-e",
-                        f"{refreshed_sha}^{{commit}}",
-                        cwd=task["repo_path"],
-                    )
-                except RuntimeError:
-                    await command("git", "fetch", "origin", refreshed_sha, cwd=task["repo_path"])
+                refreshed_sha = await self.default_base(task)
                 self.store.sync(task_id, await self.github.task_snapshot(task))
                 task = self.store.task(task_id)
             if (
@@ -272,19 +295,7 @@ class Recovery:
             with self.store.db:
                 self.store.db.execute("BEGIN IMMEDIATE")
                 if refreshed_sha != task["target_sha"]:
-                    self.store.db.execute(
-                        "UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,)
-                    )
-                    self.store.db.execute(
-                        "UPDATE artifacts SET valid=0 WHERE task_id=?", (task_id,)
-                    )
-                    self.store.db.execute(
-                        "UPDATE tasks SET target_sha=?,stage=? WHERE id=?",
-                        (refreshed_sha, Stage.ANALYSIS, task_id),
-                    )
-                    Controls(self.store).invalidate(
-                        task_id, "Baseline refreshed; renew instruction"
-                    )
+                    self.store.refresh_base(task_id, refreshed_sha)
                 self.store.db.execute(
                     "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
                     "(state!='completed' OR json_extract(result,'$.conclusion')!='ready' "

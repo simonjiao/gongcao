@@ -14,6 +14,7 @@ from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage
+from .recovery import Recovery
 from .sandbox import Sandbox
 from .store import Store
 from .workspace import repository, worktree
@@ -42,8 +43,7 @@ class Controlled:
         self, expected: dict[str, Any], kind: str, *, finish_operation: bool = False
     ) -> dict[str, Any]:
         target = Target.parse(expected["url"])
-        latest = await self.github.task_snapshot(expected)
-        self.store.sync(expected["id"], latest)
+        latest = await Recovery(self.store, self.github).sync(expected)
         if latest.get("head_sha", expected["target_sha"]) != expected["target_sha"] or any(
             latest.get(key) != expected["snapshot"].get(key) for key in VERSION_FIELDS
         ):

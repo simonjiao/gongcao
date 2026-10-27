@@ -1,6 +1,6 @@
 # Gongcao
 
-Gongcao 是单机运行、状态机驱动的本地 Agent 调度器。任务由 CLI 显式登记，
+Gongcao 是单机运行、状态机驱动的本地 Agent 调度器。任务可由 CLI 显式登记，或按配置发现领取，
 GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 
 实现计划与验收边界见 [Issue #1](https://github.com/simonjiao/gongcao/issues/1)。
@@ -89,9 +89,46 @@ Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
 请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
-旧 SQLite 在事务内依次升级到模式版本 3；更高版本数据库会被拒绝打开，不静默降级。
+旧 SQLite 在事务内依次升级到模式版本 4；更高版本数据库会被拒绝打开，不静默降级。
 运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
 验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。
+
+## 自动发现与状态同步
+
+在现有质量配置中加入以下来源，再执行 `gongcao serve --config gongcao.yaml`：
+
+```yaml
+discovery:
+  enabled: true
+  interval_seconds: 60
+  max_new_per_scan: 10
+  sources:
+    - repo: OWNER/REPO
+      path: /absolute/local/checkout
+      label: agent-ready
+      mode: step
+```
+
+默认关闭发现。`agent-ready` 只允许发现与领取；默认 `step` 在完成一个阶段后等待指示，
+来源显式配置 `auto` 才连续推进。互斥的 `gongcao:*` 模式标签优先于来源模式，
+标签冲突会暂停。GitHub 评论控制还须配置下文的 `copilot.operators`，默认为空；
+本地 `gongcao control` 始终可用。
+
+`serve --once` 扫描一次并完成一次调度周期，周期内仍遵守各任务的 step/until/auto 策略。
+每轮新增数和未终结的自动领取积压均以 `max_new_per_scan` 为上限（1–100）。
+已登记对象、PR、已分配给他人、历史处理或关联 PR、其他控制器标记均跳过并记录原因。
+领取时核验 origin 并使用远端默认分支 SHA，只按需 fetch，不移动用户 checkout 的 HEAD。
+
+控制器先保存领取意图，再创建和回读唯一状态评论，确认作者、标记、评论 ID 后才登记任务。
+中断或写入结果不明时先对账；无法确认则保留记录并告警，禁止盲目重发或启动 Agent。
+任务变更会持久标记待同步，`serve` 维护同一条评论；`status` 的 `status_sync` 显示同步状态。
+普通进度同步失败不打断 Agent。停用发现只停止新领取，已领取任务继续调度、同步。
+
+同用户、同文件系统命名空间内，以 `/tmp/gongcao-claims-UID/仓库哈希.lock` 跨 state-dir
+互斥领取与状态发布。首版不支持无协调的多机抢单，GitHub 评论不提供跨主机原子锁。
+默认分支变化时，未发布且没有远端意图的任务失效旧证据、刷新基线并等待新指示；
+已有 PR 或远端意图则进入待核对。始终由 GitHub 确认终态，不自动合并或关闭 Issue。
+设计、规模和验收记录见 [Issue #56 实施记录](docs/issue56-discovery.md)。
 
 ## 按指示推进
 

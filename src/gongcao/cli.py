@@ -137,6 +137,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                         "cancel_requested",
                         "pr_number",
                         "control",
+                        "status_sync",
                     )
                 }
                 | {

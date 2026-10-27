@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from gongcao import remote
 from gongcao.cli import main as native_main
@@ -32,7 +33,11 @@ class OfflineGitHub(GitHub):
         self.path.write_text(json.dumps(self.data))
 
     async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
-        return list(json.loads(self.path.read_text()).get("comments", []))
+        number = Target.parse(task["url"]).number
+        data = json.loads(self.path.read_text())
+        return list(data.get("comments", [])) + [
+            row for row in data.get("status_comments", []) if row["issue"] == number
+        ]
 
     async def head(self) -> str:
         return (
@@ -47,10 +52,23 @@ class OfflineGitHub(GitHub):
 
     async def snapshot(self, target: Target) -> dict[str, Any]:
         if target.kind == "issues":
-            return dict(self.data["issue"])
+            rows = self.data.get("issues", [self.data["issue"]])
+            return dict(next(row for row in rows if row["number"] == target.number))
         return dict(self.data["pull"]) | {"head_sha": await self.head()}
 
     async def read(self, path: str) -> Any:
+        if path == "user":
+            return {"login": "owner"}
+        if "/issues/comments/" in path:
+            return next(
+                row
+                for row in self.data["status_comments"]
+                if row["id"] == int(path.rsplit("/", 1)[1])
+            )
+        if "/issues/" in path:
+            return await self.snapshot(
+                Target("example/demo", "issues", int(path.rsplit("/", 1)[1]))
+            )
         return (
             {"object": {"sha": self.data["sha"]}}
             if "/git/ref/" in path
@@ -58,10 +76,21 @@ class OfflineGitHub(GitHub):
         )
 
     async def pages(self, path: str, field: str | None = None) -> list[dict[str, Any]]:
+        route = urlparse(path).path
+        if route.endswith("/timeline"):
+            return []
+        if route.endswith("/labels"):
+            number = int(route.split("/issues/")[1].split("/")[0])
+            return (await self.snapshot(Target("example/demo", "issues", number))).get("labels", [])  # type: ignore[no-any-return]
+        if route.endswith("/issues"):
+            return list(self.data.get("issues", []))
         if "/reviews" in path:
             return self.data["reviews"]  # type: ignore[no-any-return]
         if "/comments" in path:
-            return list(self.data.get("comments", []))
+            number = int(route.split("/issues/")[1].split("/")[0])
+            return await self.instructions(
+                {"url": f"https://github.com/example/demo/issues/{number}"}
+            )
         if not self.data.get("pull"):
             return []
         pull = self.data["pull"]
@@ -75,9 +104,24 @@ class OfflineGitHub(GitHub):
             }
         ]
 
-    async def mutate(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def mutate(
+        self, path: str, payload: dict[str, Any], *, method: str = "POST"
+    ) -> dict[str, Any]:
         self.data["writes"].append({"path": path, "payload": payload})
-        if path.endswith("/reviews"):
+        if "/comments" in path:
+            rows = self.data.setdefault("status_comments", [])
+            if method == "POST":
+                result = {
+                    "id": 100 + len(rows),
+                    "issue": int(path.split("/issues/")[1].split("/")[0]),
+                    "user": {"login": "owner"},
+                    **payload,
+                }
+                rows.append(result)
+            else:
+                result = next(row for row in rows if row["id"] == int(path.rsplit("/", 1)[1]))
+                result.update(payload)
+        elif path.endswith("/reviews"):
             result = payload | {"id": len(self.data["reviews"]) + 1, "state": "COMMENTED"}
             self.data["reviews"].append(result)
         else:
@@ -139,7 +183,8 @@ def main() -> None:
 
     def argv(self: Sandbox, *payload: str) -> list[str]:
         if payload[1:3] == ("-m", "gongcao.worker"):
-            payload = (sys.executable, "-c", WORKER)
+            worker = ("import time; time.sleep(3)\n" if fixture.data.get("slow") else "") + WORKER
+            payload = (sys.executable, "-c", worker)
         return original_argv(self, *payload)
 
     async def routed(*args: str, **kwargs: Any) -> str:
