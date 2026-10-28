@@ -125,6 +125,10 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
             plan = await quality.plan(task)
             if args.real_check is not None and not args.real:
                 raise ValueError("Real QA requires --real and --plan-hash")
+
+            async def before_real() -> None:
+                await Controlled(store, config, github).before(task, "qa")
+
             result = (
                 (
                     await quality.run(
@@ -132,6 +136,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                         include_e2e=True,
                         real_check=args.real_check,
                         approved_plan=args.plan_hash,
+                        before_real=before_real,
                     )
                 )
                 if args.run

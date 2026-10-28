@@ -19,6 +19,11 @@ from gongcao.workflow import Workflow
 from gongcao.workspace import context
 
 
+async def authorized_fixture() -> None:
+    # Explicit host execution is restricted to temporary, test-owned QA scripts.
+    pass
+
+
 def items(entry, environment="sandbox"):
     return [
         {
@@ -124,9 +129,29 @@ async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store,
         await quality.run(
             store.task(task_id), include_e2e=True, real_check=2, approved_plan="stale"
         )
+
+    async def paused():
+        from gongcao.control import Paused
+
+        raise Paused("Controller pause before host QA")
+
+    from gongcao.control import Paused
+
+    with pytest.raises(Paused):
+        await quality.run(
+            store.task(task_id),
+            include_e2e=True,
+            real_check=2,
+            approved_plan=plan["plan_hash"],
+            before_real=paused,
+        )
     for index in (2, 3):
         result = await quality.run(
-            store.task(task_id), include_e2e=True, real_check=index, approved_plan=plan["plan_hash"]
+            store.task(task_id),
+            include_e2e=True,
+            real_check=index,
+            approved_plan=plan["plan_hash"],
+            before_real=authorized_fixture,
         )
     assert verdict(result) == "passed"
     assert all("real controlled entry" in row["stdout"]["tail"] for row in result["items"][2:])
@@ -271,7 +296,11 @@ async def test_check_cannot_change_fixed_sha_or_feed_code_to_host_qa(
         checks[0]["entry"] = ["true"]
     plan = quality.confirm(store.task(task_id), checks)
     result = await quality.run(
-        store.task(task_id), include_e2e=True, real_check=2, approved_plan=plan["plan_hash"]
+        store.task(task_id),
+        include_e2e=True,
+        real_check=2,
+        approved_plan=plan["plan_hash"],
+        before_real=authorized_fixture,
     )
     assert verdict(result) == ("passed" if mode == "ignored" else "failed")
     assert "HOST_ONLY_DUMMY_DATA" not in json.dumps(result)

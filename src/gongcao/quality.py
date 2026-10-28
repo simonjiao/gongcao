@@ -6,6 +6,7 @@ import platform
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,7 @@ class Quality:
         include_e2e: bool = False,
         real_check: int | None = None,
         approved_plan: str | None = None,
+        before_real: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         plan = await self.plan(task)
         if real_check is not None and approved_plan != plan["plan_hash"]:
@@ -178,6 +180,9 @@ class Quality:
                     repo, real_workspace, task["target_sha"], Role.DEVELOPER, f"{key}-real-{index}"
                 )
                 controlled_entry(real_workspace, argv)
+                if before_real is None:
+                    raise ValueError("Real QA requires a controller authorization checkpoint")
+                await before_real()
                 process = await launch(*expanded, cwd=str(real_workspace))
             else:
                 process = await launch(
