@@ -1,0 +1,356 @@
+{
+  "sha": "ac297e80a184eda8a3fcfeb44af9454242b34fb7",
+  "mode": "all collected tests, partitioned into disjoint file groups",
+  "real": false,
+  "versions": [
+    {
+      "python": "3.12",
+      "groups": [
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py"
+          ],
+          "files": [
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 94.38,
+          "log_sha256": "887f82eec0461676131a4927d3dd0f2649cb1177899f6e8338fd4b69ef7eaad9"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "files": [
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 130.62,
+          "log_sha256": "2891abd8042b3003a060e9fb626139c0bd5f149a81a8440b029ee96c9c09200b"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "files": [
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 115.22,
+          "log_sha256": "762752e552d1144193a1209a31d8ad3e185149024b69dfb929cb77110aaef8a6"
+        }
+      ],
+      "quality": [
+        {
+          "name": "ruff",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "ruff",
+            "check",
+            "."
+          ],
+          "exit_code": 0,
+          "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+        },
+        {
+          "name": "format",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "ruff",
+            "format",
+            "--check",
+            "."
+          ],
+          "exit_code": 0,
+          "log_sha256": "b75cbfdc648a3350a77e0c7831035d830c486ab9918dbdf3f315551293017f8e"
+        },
+        {
+          "name": "mypy",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "mypy"
+          ],
+          "exit_code": 0,
+          "log_sha256": "81b8a767756bd649de91d7b0c104614fe1e706bce451b754a92161491825cfde"
+        },
+        {
+          "name": "offline_qa",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "python",
+            "-m",
+            "qa",
+            "check",
+            "--offline"
+          ],
+          "exit_code": 0,
+          "log_sha256": "2abc53ac6267a864cecc0e2ff96ce00d0cfb962a2c3f45e3de9a8536723d26ca"
+        }
+      ],
+      "passed": 282,
+      "seconds": 131.62,
+      "success": true
+    },
+    {
+      "python": "3.13",
+      "groups": [
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py"
+          ],
+          "files": [
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 95.76,
+          "log_sha256": "2fe336fa9a5ffa1853832f1733281f8047412e551de42de779b0d2a1448a8f33"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "files": [
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 133.18,
+          "log_sha256": "33549b5e6b6807e4d4153be9227694630633e79ac24b16f0c141e40a8ae10523"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "files": [
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 121.1,
+          "log_sha256": "6f78ee63da965f0b6e325439232b4cc13ba094891a18a508448695bb7b3efde7"
+        }
+      ],
+      "quality": [
+        {
+          "name": "ruff",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "ruff",
+            "check",
+            "."
+          ],
+          "exit_code": 0,
+          "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+        },
+        {
+          "name": "format",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "ruff",
+            "format",
+            "--check",
+            "."
+          ],
+          "exit_code": 0,
+          "log_sha256": "b75cbfdc648a3350a77e0c7831035d830c486ab9918dbdf3f315551293017f8e"
+        },
+        {
+          "name": "mypy",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "mypy"
+          ],
+          "exit_code": 0,
+          "log_sha256": "81b8a767756bd649de91d7b0c104614fe1e706bce451b754a92161491825cfde"
+        },
+        {
+          "name": "offline_qa",
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "python",
+            "-m",
+            "qa",
+            "check",
+            "--offline"
+          ],
+          "exit_code": 0,
+          "log_sha256": "934beba7632b909a0d0e1e012ea9bb04ae2c29654002bda612c95a619f1d6d98"
+        }
+      ],
+      "passed": 282,
+      "seconds": 134.16,
+      "success": true
+    }
+  ],
+  "baseline": "5aa58cd6e36d9330cb60d11d81c94a3d6d4d5e2d",
+  "environment": "local WSL/Linux; Python 3.12.3 and 3.13.13; no Docker",
+  "regressions": [
+    {
+      "case": "accepted A2 unverifiable; late B1",
+      "before": "failed on 5aa58cd: B1 replaced A2 and resumed",
+      "after": "B1 rejected; A row and reference preserved; paused; no Agent or remote write"
+    },
+    {
+      "case": "controller conflict/reached-target pauses followed by older B",
+      "before": "failed on f056f03: controller pause superseded unverified A",
+      "after": "A preserved across both internal pause paths; old B rejected; larger B replaces atomically"
+    },
+    {
+      "case": "replacement rollback and retired history",
+      "after": "task and receipts roll back together on injected retirement failure; fresh poll after valid replacement does not change evidence"
+    }
+  ],
+  "reviews": {
+    "standards": 0,
+    "spec": 0,
+    "resolved_spec_finding": "Internal pause must retain unverified accepted A and its ID constraint",
+    "kind": "local dual-axis review; not formal GitHub approval"
+  },
+  "github_ci": {
+    "used_for_validation": false,
+    "claimed_passed": false,
+    "prior_platform_evidence": "docs/evidence/pr76-local-e465e25.json",
+    "scope": "No claim about current hosted CI or real-model acceptance"
+  },
+  "real_github": {
+    "run": false,
+    "prior_revision_deletion_smoke": "docs/evidence/issue67-comments-1b2da50.json",
+    "scope": "Historical evidence only; B recovery has not been retested against real GitHub"
+  }
+}
