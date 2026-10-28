@@ -74,7 +74,10 @@ with tempfile.TemporaryDirectory(prefix='gongcao-pytest-') as temporary:
     tree = subprocess.check_output(
         ['git', 'rev-parse', 'HEAD^{tree}'], cwd=source, text=True).strip()
     print('QA_SOURCE_TREE=' + tree, flush=True)
-    env = os.environ | {'PYTHONPATH': os.pathsep.join((str(source/'src'), str(source)))}
+    host_home = Path(temporary) / 'host-home'
+    host_home.mkdir()
+    env = os.environ | {'HOME': str(host_home),
+                        'PYTHONPATH': os.pathsep.join((str(source/'src'), str(source)))}
     print('Testing a full source copy of target {sha}', flush=True)
     subprocess.run([sys.executable, '-m', 'pytest', '-q'], cwd=source, env=env, check=True)
 """.strip()

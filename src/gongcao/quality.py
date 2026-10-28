@@ -141,8 +141,23 @@ class Quality:
         items = [i for i in items if i["entry"] or i["category"] not in covered]
         for candidate in proposal:
             item = Check.model_validate(candidate).model_dump()
-            if item not in items:
+            same = next(
+                (
+                    i
+                    for i in items
+                    if all(
+                        i[k] == item[k]
+                        for k in ("category", "entry", "environment", "network", "variables")
+                    )
+                ),
+                None,
+            )
+            if same is None:
                 items.append(item)
+            else:
+                same["required"] |= item["required"]
+                same["scope"] = list(dict.fromkeys([*same["scope"], *item["scope"]]))
+                same["reason"] += "; " + item["reason"]
         if {i["category"] for i in proposal} != {"build", "internal", "e2e"}:
             items.append(
                 Check(

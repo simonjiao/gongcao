@@ -66,6 +66,19 @@ async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbo
         "def test_clone(tmp_path):\n"
         "    subprocess.run(['git','clone','-q','--local',str(Path.cwd()),"
         "str(tmp_path/'copy')],check=True)\n"
+        "def test_nested_home_isolation(tmp_path):\n"
+        "    host_secret = Path.home() / '.codex/auth.json'\n"
+        "    host_secret.parent.mkdir(parents=True)\n"
+        "    host_secret.write_text('DUMMY_OUTER_SECRET')\n"
+        "    inner_home = tmp_path / 'inner-home'\n"
+        "    inner_home.mkdir(); (inner_home/'.codex').mkdir()\n"
+        "    (inner_home/'.codex/auth.json').write_text('{}')\n"
+        "    subprocess.run(['bwrap','--ro-bind','/usr','/usr','--ro-bind','/lib','/lib',\n"
+        "        '--ro-bind','/lib64','/lib64','--bind',str(inner_home),'/home/agent',\n"
+        "        '--unshare-user','--unshare-pid','--proc','/proc','/usr/bin/python3.12','-c',\n"
+        "        'from pathlib import Path; assert not Path('"
+        "+repr(str(host_secret))+').exists()'],\n"
+        "        check=True)\n"
     )
     await command("git", "add", ".", cwd=str(repo))
     await command("git", "commit", "-qm", "clone-dependent project check", cwd=str(repo))

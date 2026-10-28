@@ -88,6 +88,8 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
             if "mypy" in body:
                 add("build", ["uv", "run", "--locked", "mypy"], ".")
             if "pytest" in body:
+                from qa.scenarios import pytest_snapshot_script
+
                 add(
                     "internal",
                     [
@@ -96,8 +98,7 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
                         "--locked",
                         "python",
                         "-c",
-                        "from qa.scenarios import pytest_snapshot_script; "
-                        "exec(pytest_snapshot_script())",
+                        pytest_snapshot_script(),
                     ]
                     if "qa/scenarios.py" in files
                     else ["uv", "run", "--locked", "pytest", "-q"],

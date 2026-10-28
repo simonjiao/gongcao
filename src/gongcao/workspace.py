@@ -94,5 +94,8 @@ async def context(
             "patch": diff,
             "sha256": hashlib.sha256(diff.encode()).hexdigest(),
         }
+    from .plan import propose
+
+    data["validation_candidates"] = propose(data)
     digest = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return data, digest
