@@ -1,6 +1,7 @@
 """Persistent permissions for the existing workflow, never a second stage machine."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import time
@@ -358,11 +359,7 @@ class Controls:
     def check_policy(self, task_id: int, policy: str, *, operators: set[str] | None = None) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
-            if (
-                task["state"] in UNSAFE
-                or task["state"] == State.COMPLETED
-                or task["stage"] == Stage.MERGED
-            ):
+            if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
                 return False
             self.fence(task_id)
             control = task["control"]
@@ -469,6 +466,17 @@ class Controls:
                 )
 
     async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
+        # Serialize transport snapshots across foreground/background collectors and stores.
+        with (self.store.root / f"instructions-{task_id}.lock").open("a") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+            await self._collect(task_id, config, github)
+
+    async def _collect(self, task_id: int, config: Config, github: GitHub) -> None:
         task = self.store.task(task_id)
         if (
             not config.copilot_operators
@@ -535,10 +543,11 @@ class Controls:
                 ).fetchone()
                 edited = comment.get("updated_at") != comment["created_at"]
                 if known:
+                    original = json.loads(known["data"])
                     if (
-                        edited
-                        or json.loads(known["data"]).get("fingerprint", fingerprint) != fingerprint
-                        or json.loads(known["data"])["actor"].casefold()
+                        (edited and original.get("updated_at") != comment.get("updated_at"))
+                        or original.get("fingerprint", fingerprint) != fingerprint
+                        or original["actor"].casefold()
                         != comment.get("user", {}).get("login", "").casefold()
                     ):
                         self.mark(task_id, command_id, "stale", "Comment content was edited")
@@ -569,6 +578,7 @@ class Controls:
                         "created": datetime.fromisoformat(
                             comment["created_at"].replace("Z", "+00:00")
                         ).timestamp(),
+                        "updated_at": comment.get("updated_at"),
                         "fingerprint": fingerprint,
                         "mode": words[0] if words else "",
                         "target": words[1] if len(words) == 2 else None,

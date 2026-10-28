@@ -171,6 +171,8 @@ async def test_initial_edit_is_rejected_and_changed_active_step_stays_stale(
     comment["updated_at"] = "2099-01-01T00:00:00Z"
     await controls.poll(task_id, config, comments)
     assert store.evidence(task_id)["instructions"][0]["status"] == "rejected"
+    await controls.poll(task_id, config, comments)
+    assert store.evidence(task_id)["instructions"][0]["status"] == "rejected"
     grant = comments.post("/gongcao step")
     await controls.poll(task_id, config, comments)
     run = store.begin_run(task_id, Role.ANALYST)
@@ -179,6 +181,47 @@ async def test_initial_edit_is_rejected_and_changed_active_step_stays_stale(
     store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ready")
     assert store.evidence(task_id)["instructions"][1]["status"] == "stale"
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+
+
+async def test_failed_foreground_poll_cannot_consume_a_concurrent_unverified_receipt(
+    store, task_id, comments
+):
+    config, controls = Config(copilot_operators=["owner"]), Controls(store)
+    controls.issue(task_id, "pause")
+    comments.post("/gongcao auto")
+    entered, release, background_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class SlowFailed(Comments):
+        async def instructions(self, task):
+            entered.set()
+            await release.wait()
+            raise PermissionError("HTTP 403 on page two")
+
+    class Background(Comments):
+        async def instructions(self, task):
+            background_entered.set()
+            return comments.comments
+
+    restarted = Store(store.root)
+    foreground = asyncio.create_task(controls.poll(task_id, config, SlowFailed()))
+    await entered.wait()
+    background = asyncio.create_task(Controls(restarted).collect(task_id, config, Background()))
+    try:
+        await asyncio.sleep(0)  # A second Store must also respect the real OS lock.
+        assert not background_entered.is_set()
+        release.set()
+        await asyncio.gather(foreground, background)
+        assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        row = next(r for r in store.evidence(task_id)["instructions"] if r["id"] == "github:1")
+        assert row["status"] == "pending"
+        await controls.poll(task_id, config, comments)
+        assert store.task(task_id)["state"] == State.QUEUED
+    finally:
+        release.set()
+        for pending in (foreground, background):
+            pending.cancel()
+        await asyncio.gather(foreground, background, return_exceptions=True)
+        restarted.close()
 
 
 @pytest.mark.parametrize("override", [False, True])
