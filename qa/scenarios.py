@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 8
+VERSION = 9
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -37,55 +37,12 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
         "lower-bound defect, ready only after the full contract and tests are implemented. "
         "Return exact context target_sha. No credentials or remote writes.",
         "validator": "Read only. Independently inspect quality_evidence for passing project "
-        "checks, required real checks, and CI with exact PR/base/head checkout proof. "
+        "all required plan checks, including E2E, with exact repository/base/head/plan binding. "
         "Draft/merge protection status is controlled separately after validation. "
         "Return ready only for actual passing evidence at exact context target_sha; "
         "revise for code defects or blocked for missing evidence. No credentials or writes.",
     }
-    prefix = [
-        "/usr/bin/env",
-        "HOME=/tmp/gongcao-check-home",
-        "UV_CACHE_DIR=/workspace/.venv/uv-cache",
-        "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
-        "UV_LINK_MODE=copy",
-        "uv",
-        "run",
-        "--locked",
-        "--python",
-        "{python}",
-    ]
-    config: dict[str, Any] = {
-        "timeout_seconds": 900,
-        "max_revisions": 3,
-        "roles": roles,
-        "quality": {
-            "checks": [
-                prefix + argv
-                for argv in (
-                    ["ruff", "check", "."],
-                    ["ruff", "format", "--check", "."],
-                    ["mypy"],
-                    ["python", "-c", pytest_snapshot_script()],
-                )
-            ],
-            "ci_workflows": ["ci.yml"],
-            "require_real_checks": True,
-            "real_checks": [
-                [
-                    "uv",
-                    "run",
-                    "--offline",
-                    "--no-project",
-                    "--python",
-                    "{python}",
-                    "python",
-                    "-B",
-                    "-c",
-                    vector_script(module),
-                ]
-            ],
-        },
-    }
+    config: dict[str, Any] = {"timeout_seconds": 900, "max_revisions": 3, "roles": roles}
     if model:
         config["model"] = model
     return requirement, config

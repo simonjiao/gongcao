@@ -10,7 +10,7 @@ from .events import Redactor
 from .github import GitHub
 from .leases import Lease
 from .model import Role, Stage, State, same_version
-from .quality import Quality, ci_gate
+from .quality import Quality, verdict
 from .recovery import Recovery
 from .remote import Controlled, UncertainWrite
 from .runner import Runner
@@ -127,18 +127,6 @@ class Workflow:
                     "Existing PR is ready for independent review",
                 )
             return
-        if (
-            not self.config.checks
-            or not self.config.ci_workflows
-            or (self.config.require_real_checks and not self.config.real_checks)
-        ):
-            self.store.transition(
-                self.safe(task),
-                stage,
-                State.WAITING_ENVIRONMENT,
-                "Configure target-project checks, CI workflows and required real checks",
-            )
-            return
         if stage in {Stage.DEVELOPMENT, Stage.REVISION}:
             findings = (
                 self.store.artifact(task["id"], "revision", self.config.policy_hash)
@@ -162,8 +150,13 @@ class Workflow:
             )
             return
         if stage == Stage.REVIEW:
-            checks = await self.quality.run(task, "checks")
-            if not checks["passed"]:
+            checks = await self.quality.run(task)
+            if verdict(checks, include_e2e=False) == "blocked":
+                self.store.halt(
+                    task["id"], State.WAITING_ENVIRONMENT, "Required plan checks are blocked"
+                )
+                return
+            if verdict(checks, include_e2e=False) == "failed":
                 self.revision(task, checks)
                 return
             run = await self.agent(task, Role.REVIEWER, checks)
@@ -187,12 +180,14 @@ class Workflow:
             return
         if stage in {Stage.VALIDATION, Stage.MERGEABLE}:
             review = self.cached_run(task, Role.REVIEWER)
-            checks = self.store.artifact(task["id"], "checks", self.config.policy_hash)
+            plan = await self.quality.plan(task)
+            checks = self.store.artifact(task["id"], "quality-results", plan["plan_hash"])
+            review = self.cached_run(task, Role.REVIEWER)
             if (
                 review is None
                 or json.loads(review["result"])["conclusion"] != "ready"
                 or not checks
-                or not checks["passed"]
+                or verdict(checks, include_e2e=False) != "passed"
             ):
                 self.store.transition(
                     self.safe(task),
@@ -201,21 +196,18 @@ class Workflow:
                     "Current-version review/check evidence is missing",
                 )
                 return
-            facts = await self.github.gates(task)
-            state, reason = ci_gate(task, facts, self.config.ci_workflows)
-            if state == State.FAILED:
-                self.revision(task, {"conclusion": "revise", "summary": reason, "ci": facts})
+            evidence = await self.quality.run(task, include_e2e=True)
+            status = verdict(evidence)
+            if status == "failed":
+                self.revision(task, evidence)
                 return
-            if state != State.COMPLETED:
-                self.store.transition(task, Stage.VALIDATION, state, reason)
+            if status == "blocked":
+                self.store.halt(
+                    task["id"],
+                    State.WAITING_ENVIRONMENT,
+                    "Required E2E/environment evidence is blocked",
+                )
                 return
-            evidence = {"checks": checks, "ci": facts}
-            if self.config.real_checks:
-                real = await self.quality.run(task, "real")
-                if not real["passed"]:
-                    self.revision(task, real)
-                    return
-                evidence["real"] = real
             run = await self.agent(task, Role.VALIDATOR, evidence)
             if run is None:
                 return
@@ -232,9 +224,10 @@ class Workflow:
                 raise UncertainWrite("Validation evidence became invalid during readiness update")
             final = await self.github.gates(current)
             current = await self.confirm(task)
-            state, reason = ci_gate(current, final, self.config.ci_workflows)
-            if state == State.COMPLETED and (
-                final["reviewDecision"] not in {"", "APPROVED"}
+            state, reason = State.COMPLETED, "Current plan passed; ready for human merge"
+            if (
+                final["headRefOid"] != current["target_sha"]
+                or final["reviewDecision"] not in {"", "APPROVED"}
                 or final["mergeable"] != "MERGEABLE"
                 or final["mergeStateStatus"] != "CLEAN"
                 or final["isDraft"]
@@ -247,7 +240,12 @@ class Workflow:
                 current,
                 "validation",
                 self.config.policy_hash,
-                {"target_sha": current["target_sha"], "result": result, "github": final},
+                {
+                    "target_sha": current["target_sha"],
+                    "plan_hash": evidence["plan_hash"],
+                    "result": result,
+                    "github": final,
+                },
             )
             self.store.transition(
                 self.safe(current, complete=True),

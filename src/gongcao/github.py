@@ -1,11 +1,9 @@
 """GitHub facts and low-level transport. Only the controller authorizes mutations."""
 
 import asyncio
-import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from .events import Redactor
@@ -185,121 +183,4 @@ class GitHub:
                 "headRefOid,isDraft,reviewDecision,mergeStateStatus,mergeable,author",
             )
         )
-        data["workflows"] = await self.pages(
-            f"repos/{repository}/actions/runs?head_sha={task['target_sha']}&event=pull_request&per_page=100",
-            "workflow_runs",
-        )
-        # Some workflow-run payloads omit pull_requests. Prove the actual checkout
-        # belongs to this PR and has exactly the current base/head merge parents.
-        for run in data["workflows"]:
-            if run["status"] == "completed":
-                try:
-                    run["target_proof"] = await self.checkout_proof(task, run)
-                except (RuntimeError, OSError, ValueError) as exc:
-                    run["target_proof"] = None
-                    run["proof_error"] = Redactor().text(f"{type(exc).__name__}: {exc}")
         return data  # type: ignore[no-any-return]
-
-    async def checkout_proof(
-        self, task: dict[str, Any], run: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        if run.get("conclusion") not in {"success", "failure", "timed_out"}:
-            return None
-        repository = task["snapshot"]["repository"]
-        attempt = run.get("run_attempt", 1)
-        timeline = await self.pages(
-            f"repos/{repository}/issues/{task['pr_number']}/timeline?per_page=100"
-        )
-        base_changes = [
-            event
-            for event in timeline
-            if event.get("event") in {"base_ref_changed", "automatic_base_change_succeeded"}
-        ]
-        created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
-        if any(
-            created <= datetime.fromisoformat(event["created_at"].replace("Z", "+00:00"))
-            for event in base_changes
-        ):
-            return None
-        jobs = await self.pages(
-            f"repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
-            "jobs",
-        )
-        for job in sorted(jobs, key=lambda item: item["conclusion"] != "failure"):
-            if run.get("conclusion") != "success" and job["conclusion"] not in {
-                "failure",
-                "timed_out",
-            }:
-                continue
-            steps = job.get("steps") or []
-            checkout_ok = any(
-                "actions/checkout@" in step["name"] and step["conclusion"] == "success"
-                for step in steps
-            )
-            if not checkout_ok and not (
-                not steps and run["conclusion"] == "success" and job["conclusion"] == "success"
-            ):
-                continue
-            log = await read_command(
-                "gh", "api", f"repos/{repository}/actions/jobs/{job['id']}/logs"
-            )
-            sha = checkout_sha(log, task["pr_number"])
-            if sha is None:
-                continue
-            commit = await self.read(f"repos/{repository}/git/commits/{sha}")
-            parents = [parent["sha"] for parent in commit["parents"]]
-            if parents != [task["snapshot"]["base_sha"], task["target_sha"]]:
-                continue
-            proof = {
-                "pr_number": task["pr_number"],
-                "repository": repository,
-                "base_sha": parents[0],
-                "head_sha": parents[1],
-                "base_ref": task["snapshot"]["base_ref"],
-                "base_ref_basis": "current ref + complete retarget history before run creation",
-                "run_created_at": run["created_at"],
-                "last_base_change": max((e["created_at"] for e in base_changes), default=None),
-                "timeline_sha256": hashlib.sha256(
-                    json.dumps(timeline, sort_keys=True).encode()
-                ).hexdigest(),
-                "checkout_sha": sha,
-                "run_id": run["id"],
-                "attempt": attempt,
-                "job_id": job["id"],
-                "source": "actions/checkout job log + GitHub commit parents",
-                "checkout_basis": (
-                    "successful checkout step"
-                    if checkout_ok
-                    else "successful job and checkout log; step metadata unavailable"
-                ),
-                "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
-            }
-            if run.get("conclusion") != "success":
-                clean = Redactor().text(log)
-                proof["failure_tail"] = clean.encode()[-20000:].decode(errors="replace")
-                proof["failure_tail_truncated"] = len(log.encode()) > 20000
-            return proof
-        return None
-
-
-def checkout_sha(log: str, number: int) -> str | None:
-    """Only accept checkout's own PR merge ref and following full git-log SHA."""
-    block = False
-    ref = False
-    expect_sha = False
-    for line in log.splitlines():
-        if "##[group]Run actions/checkout@" in line:
-            block, ref, expect_sha = True, False, False
-        elif block and "##[group]Run " in line:
-            block = False
-        if not block:
-            continue
-        if re.search(rf"\[command\].*git checkout .* refs/remotes/pull/{number}/merge$", line):
-            ref = True
-        if ref and re.search(r"\[command\].*git log -1 --format=%H$", line):
-            expect_sha = True
-            continue
-        if expect_sha:
-            match = re.fullmatch(r"\S+Z ([0-9a-f]{40})", line)
-            return match[1] if match else None
-    return None

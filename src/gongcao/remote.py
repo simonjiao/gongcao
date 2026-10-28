@@ -55,6 +55,8 @@ class Controlled:
         if any(run["state"] == "running" for run in self.store.runs(current["id"])):
             raise ValueError("An active agent cannot authorize a remote mutation")
         allowed = {
+            "archive": set(Stage) - {Stage.MERGED},
+            "archive-link": set(Stage) - {Stage.MERGED},
             "push": {Stage.DEVELOPMENT, Stage.REVISION},
             "pull": {Stage.DEVELOPMENT, Stage.REVISION},
             "review": {Stage.REVIEW},

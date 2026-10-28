@@ -72,12 +72,27 @@ async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbo
     sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
     task_id = store.register(snapshot["url"], repo, sha, snapshot)
     store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "fixture")
-    data = await Quality(
-        store, Config(checks=[[sys.executable, "-c", pytest_snapshot_script()]])
-    ).run(store.task(task_id), "checks")
-    assert data["passed"], data["commands"]
+    quality = Quality(store, Config())
+    quality.confirm(
+        store.task(task_id),
+        [
+            {
+                "category": category,
+                "entry": [sys.executable, "-c", pytest_snapshot_script()]
+                if category == "internal"
+                else [],
+                "scope": ["tests"],
+                "required": category == "internal",
+                "reason": "Source snapshot probe",
+                "environment": "sandbox",
+            }
+            for category in ("build", "internal", "e2e")
+        ],
+    )
+    data = await quality.run(store.task(task_id))
+    assert data["passed"], data["items"]
     tree = (await command("git", "rev-parse", "HEAD^{tree}", cwd=str(repo))).strip()
-    assert "QA_SOURCE_TREE=" + tree in data["commands"][0]["stdout"]["tail"]
+    assert "QA_SOURCE_TREE=" + tree in data["items"][1]["stdout"]["tail"]
 
 
 @pytest.mark.parametrize("scene", ["loop", "smoke"])

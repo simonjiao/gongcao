@@ -7,8 +7,10 @@ from typing import Any
 
 from gongcao.config import Config
 from gongcao.github import GitHub, command
-from gongcao.model import Role, State, same_version
-from gongcao.quality import ci_gate
+from gongcao.model import Role, same_version
+from gongcao.plan import binding
+from gongcao.plan import digest as plan_digest
+from gongcao.quality import verdict
 from gongcao.sandbox import Sandbox
 
 from .ledger import Run, digest
@@ -122,43 +124,32 @@ def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dic
     require(
         all(not a["valid"] for a in artifacts if a["sha"] != sha), "Old SHA artifacts remain valid"
     )
-    for kind, expected in (("checks", config.checks), ("real", config.real_checks)):
-        current = [
-            a
-            for a in artifacts
-            if a["kind"] == kind
-            and a["valid"]
-            and a["sha"] == sha
-            and a["policy"] == config.policy_hash
-        ]
-        require(current, f"Missing {kind} evidence for current policy/SHA")
-        data = current[-1]["data"]
-        commands = data.get("commands", [])
+    plans = [
+        a["data"]
+        for a in artifacts
+        if a["kind"] == "quality-plan" and a["valid"] and a["sha"] == sha
+    ]
+    require(plans, "Missing current validation plan")
+    plan = plans[-1]
+    require(all(plan.get(k) == v for k, v in binding(task).items()), "Plan version mismatch")
+    require(
+        plan["plan_hash"] == plan_digest({k: v for k, v in plan.items() if k != "plan_hash"}),
+        "Plan hash mismatch",
+    )
+    results = [
+        a["data"]
+        for a in artifacts
+        if a["kind"] == "quality-results" and a["valid"] and a["policy"] == plan["plan_hash"]
+    ]
+    require(results and verdict(results[-1]) == "passed", "Missing or failed required plan results")
+    require(len(results[-1]["items"]) == len(plan["items"]), "Incomplete plan results")
+    for item, expected in zip(results[-1]["items"], plan["items"], strict=True):
         require(
-            data.get("passed")
-            and data.get("target_sha") == sha
-            and data.get("policy") == config.policy_hash
-            and len(commands) == len(expected)
-            and len(commands) > 0
-            and all(c["exit_code"] == 0 for c in commands),
-            f"Incomplete or failed {kind}",
+            all(item.get(k) == v for k, v in expected.items()), "Result entry differs from plan"
         )
-        for observed, expected_argv in zip(commands, expected, strict=True):
-            actual = observed.get("argv", [])
-            require(len(actual) == len(expected_argv), f"Wrong command recorded for {kind}")
-            for argument, template in zip(actual, expected_argv, strict=True):
-                if template == "{python}":
-                    require(
-                        Path(argument).is_absolute() and Path(argument).name == "python3",
-                        "Invalid quality interpreter binding",
-                    )
-                else:
-                    require(
-                        argument == template.replace("{sha}", sha),
-                        f"Recorded {kind} command differs from configured policy",
-                    )
-    state, reason = ci_gate(task, facts, config.ci_workflows)
-    require(state == State.COMPLETED, reason)
+        if item["required"]:
+            require(item.get("exit_code") == 0 and item.get("argv"), "Missing actual execution")
+    require(facts["headRefOid"] == sha, "PR head changed")
     require(
         not facts["isDraft"]
         and facts["mergeable"] == "MERGEABLE"
@@ -172,20 +163,7 @@ def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dic
         "target_sha": sha,
         "revision_count": task["revision_count"],
         "initial_sha": old_reviews[0]["target_sha"],
-        "ci_runs": [
-            {
-                k: r.get(k)
-                for k in (
-                    "id",
-                    "run_attempt",
-                    "head_sha",
-                    "path",
-                    "conclusion",
-                    "target_proof",
-                )
-            }
-            for r in facts["workflows"]
-        ],
+        "plan_hash": plan["plan_hash"],
         "sessions": [
             {
                 k: r[k]
@@ -381,13 +359,6 @@ def verify_archived(run: Run) -> dict[str, Any]:
 
                 verify(
                     json.loads((run.root / "discovery.json").read_text()), run.value["github_login"]
-                )
-            else:
-                missing = json.loads((run.root / "missing-gate.json").read_text())
-                require(
-                    missing["state"] == "waiting_environment"
-                    and not missing["evidence"]["operations"],
-                    "Missing gate probe did not block",
                 )
             boundaries = result["boundary_probe"]
             require(

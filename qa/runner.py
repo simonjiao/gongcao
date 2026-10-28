@@ -230,29 +230,6 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     run.check_cancelled()
 
 
-async def missing_gate(run: Run) -> None:
-    run.check_cancelled()
-    config = yaml.safe_load((run.root / "config.yaml").read_text())
-    config["quality"] = {}
-    path = run.root / "missing-gate.yaml"
-    path.write_text(yaml.safe_dump(config))
-    await core(run, "run", str(run.value["task_id"]), "--config", str(path))
-    run.check_cancelled()
-    task = inspect(run)
-    require(
-        task["state"] == "waiting_environment"
-        and not task["evidence"]["operations"]
-        and not task["pr_number"],
-        "Missing gate did not block remote writes",
-    )
-    before = signature(task)
-    await core(run, "run", str(run.value["task_id"]), "--config", str(path))
-    run.check_cancelled()
-    require(signature(inspect(run)) == before, "Blocked repeat created new effects")
-    run.archive("missing-gate", task)
-    run.event("missing-gate-blocked", repeat_unchanged=True)
-
-
 async def execute(
     run: Run, *, model: str | None, clean: bool, peers: list[Run] | None = None
 ) -> None:
@@ -276,8 +253,6 @@ async def execute(
                     from .copilot import exercise
 
                     await exercise(run, github)
-                elif run.value["scenario"] not in {"cancel", "discovery"}:
-                    await missing_gate(run)
                 injected = False
                 deadline = time.monotonic() + 3600
                 for _ in range(120):

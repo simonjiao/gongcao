@@ -20,7 +20,6 @@ from gongcao.github import command as git_command
 from gongcao.leases import Lease, identity, session_alive
 from gongcao.model import AgentResult, Role, Stage, State
 from gongcao.processes import CleanupError, launch, stop
-from gongcao.quality import Quality
 from gongcao.recovery import Recovery, diagnose
 from gongcao.remote import Controlled
 from gongcao.runner import Runner
@@ -115,7 +114,7 @@ async def test_heartbeat_renews_and_late_results_require_the_original_owner(stor
         with store.db:
             store.db.execute("UPDATE leases SET owner='replacement'")
         with pytest.raises(ValueError, match="lease lost"):
-            store.record(store.task(task_id), "checks", "policy", {"passed": True})
+            store.record(store.task(task_id), "quality-results", "policy", {"passed": True})
         store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late", "{}")
         assert store.task(task_id)["state"] == State.RECONCILE
         assert not store.runs(task_id)[0]["evidence_valid"]
@@ -344,7 +343,7 @@ async def test_parallel_developers_write_distinct_worktrees_and_leave_source_unc
         raise OSError("Fixture stops before remote writes")
 
     monkeypatch.setattr(Controlled, "publish", publish)
-    config = Config(auth_file=auth_file, checks=[["true"]], ci_workflows=["ci.yml"])
+    config = Config(auth_file=auth_file)
     scheduler = Scheduler(store, config, RegisteredGitHub(store), 2)
     running = asyncio.create_task(scheduler.serve(once=True))
     try:
@@ -563,16 +562,16 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
         assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
 
 
-async def test_manual_retry_runs_failed_quality_checks_again(store, task_id):
-    config = Config(checks=[["{python}", "-c", "assert 1+1==2"]])
-    store.record(store.task(task_id), "checks", config.policy_hash, {"passed": False})
-    store.record(store.task(task_id), "real", config.policy_hash, {"passed": False})
+async def test_manual_retry_runs_failed_quality_checks_again(store, task_id, planned_quality):
+    quality = planned_quality(["{python}", "-c", "assert 1+1==2"])
+    plan = await quality.plan(store.task(task_id))
+    store.record(store.task(task_id), "quality-results", plan["plan_hash"], {"passed": False})
     store.halt(task_id, State.HUMAN, "Environment fixed by operator")
     assert (await Recovery(store, RegisteredGitHub(store)).retry(task_id))["recovered"]
-    assert store.artifact(task_id, "real", config.policy_hash) is None
+    assert store.artifact(task_id, "quality-results", plan["plan_hash"]) is None
     async with Lease(store, task_id):
-        result = await Quality(store, config).run(store.task(task_id), "checks")
-    assert result["passed"] and result["commands"][0]["exit_code"] == 0
+        result = await quality.run(store.task(task_id))
+    assert result["passed"] and result["items"][0]["exit_code"] == 0
 
 
 async def test_service_shutdown_leaves_interrupted_work_recoverable(

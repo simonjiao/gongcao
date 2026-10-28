@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .plan import Check
+
 VERSION_FIELDS = (
     "title",
     "body",
@@ -70,6 +72,7 @@ class AgentResult(BaseModel):
     basis: list[str] = Field(min_length=1, max_length=50)
     target_sha: str = Field(pattern="^[0-9a-f]{40,64}$")
     next_steps: list[str] = Field(min_length=1, max_length=50)
+    validation_plan: list[Check] = Field(default_factory=list)
 
 
 def after_run(stage: Stage, role: Role, result: AgentResult, sha: str) -> tuple[Stage, State, str]:

@@ -1,6 +1,7 @@
 """Project-supplied checks execute in disposable, credential-free OS sandboxes."""
 
 import asyncio
+import json
 import sys
 import time
 import uuid
@@ -8,26 +9,92 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .control import Controls
 from .events import Redactor
 from .model import Role, Stage, State
+from .plan import Check, binding, digest, propose
 from .processes import launch, stop
 from .sandbox import Sandbox
 from .store import Store
-from .workspace import worktree
+from .workspace import context, worktree
 
 
 class Quality:
     def __init__(self, store: Store, config: Config):
         self.store, self.config = store, config
 
-    async def run(self, task: dict[str, Any], kind: str) -> dict[str, Any]:
-        cached = self.store.artifact(task["id"], kind, self.config.policy_hash)
-        if cached is not None:
+    def confirm(self, task: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
+        checks = [Check.model_validate(item).model_dump() for item in items]
+        if {item["category"] for item in checks} != {"build", "internal", "e2e"}:
+            raise ValueError("Plan must explicitly cover build, internal and e2e")
+        data = binding(task) | {"items": checks, "policy": self.config.policy_hash}
+        data["plan_hash"] = digest(data)
+        previous = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
+        if previous == data:
+            return data
+        with self.store.db:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            Controls(self.store).fence(task["id"])
+            self.store.guard(task)
+            self.store.db.execute(
+                "UPDATE artifacts SET valid=0 WHERE task_id=? AND kind IN "
+                "('quality-plan','quality-results','validation')",
+                (task["id"],),
+            )
+            self.store.db.execute(
+                "UPDATE runs SET evidence_valid=0 WHERE task_id=? "
+                "AND role IN ('reviewer','validator')",
+                (task["id"],),
+            )
+            self.store.db.execute(
+                "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
+                (
+                    task["id"],
+                    task["target_sha"],
+                    "quality-plan",
+                    self.config.policy_hash,
+                    json.dumps(data),
+                ),
+            )
+        return data
+
+    async def plan(self, task: dict[str, Any]) -> dict[str, Any]:
+        current = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
+        if current and all(current.get(k) == v for k, v in binding(task).items()):
+            return current
+        data, _ = await context(Path(task["repo_path"]), task, Role.REVIEWER, self.config, None)
+        items = propose(data)
+        analyses = [
+            json.loads(r["result"])
+            for r in self.store.runs(task["id"])
+            if r["role"] == Role.ANALYST and r["state"] == State.COMPLETED and r["result"]
+        ]
+        for candidate in analyses[-1].get("validation_plan", []) if analyses else []:
+            item = Check.model_validate(candidate).model_dump()
+            if item["required"] and item["entry"]:
+                items = [i for i in items if i["entry"] or i["category"] != item["category"]]
+                if item not in items:
+                    items.append(item)
+        return self.confirm(task, items)
+
+    async def run(
+        self,
+        task: dict[str, Any],
+        *,
+        include_e2e: bool = False,
+        real_check: int | None = None,
+        approved_plan: str | None = None,
+    ) -> dict[str, Any]:
+        plan = await self.plan(task)
+        if real_check is not None and approved_plan != plan["plan_hash"]:
+            raise ValueError("Explicit real QA authorization must name the current plan hash")
+        cached = self.store.artifact(task["id"], "quality-results", plan["plan_hash"])
+        if cached and verdict(cached, include_e2e=include_e2e) == "passed":
             return cached
-        commands = self.config.checks if kind == "checks" else self.config.real_checks
-        if not commands:
-            raise ValueError(f"No target-project commands configured for {kind}")
-        self.store.transition(task, Stage(task["stage"]), State.RUNNING, f"Running {kind}")
+        commands = plan["items"]
+        self.store.transition(
+            task, Stage(task["stage"]), State.RUNNING, "Executing validation plan"
+        )
         key = f"check-{uuid.uuid4().hex}"
         directory = self.store.root / "checks" / key
         directory.mkdir(parents=True, mode=0o700)
@@ -39,7 +106,27 @@ class Quality:
         isolation = await sandbox.verify(repo)
         started = time.time()
         results = []
-        for argv in commands:
+        for index, item in enumerate(commands):
+            if not item["required"]:
+                results.append(item | {"status": "not_applicable"})
+                continue
+            if cached and cached["items"][index]["status"] == "passed":
+                results.append(cached["items"][index])
+                continue
+            if (
+                not item["entry"]
+                or (item["environment"] == "controlled" and index != real_check)
+                or (item["category"] == "e2e" and not include_e2e)
+            ):
+                results.append(
+                    item
+                    | {
+                        "status": "blocked",
+                        "detail": "Entry/environment or explicit real authorization required",
+                    }
+                )
+                continue
+            argv = item["entry"]
             command_started = time.time()
             expanded = [
                 arg.replace("{python}", str(Path(sys.base_prefix) / "bin/python3")).replace(
@@ -47,18 +134,29 @@ class Quality:
                 )
                 for arg in argv
             ]
-            process = await launch(
-                *sandbox.argv("/usr/bin/env", "-u", "PYTHONPATH", *expanded),
-            )
+            if item["environment"] == "controlled":
+                entry = next((arg for arg in argv[:2] if arg.startswith("qa/")), "")
+                script = (workspace / entry).resolve()
+                if not entry or not script.is_file() or not script.is_relative_to(workspace / "qa"):
+                    raise ValueError("Real checks must invoke an existing repository qa/ entry")
+                process = await launch(*expanded, cwd=str(workspace))
+            else:
+                process = await launch(*sandbox.argv("/usr/bin/env", "-u", "PYTHONPATH", *expanded))
 
-            async def output(stream: asyncio.StreamReader | None) -> dict[str, Any]:
+            async def output(
+                stream: asyncio.StreamReader | None, name: str, index: int = index
+            ) -> dict[str, Any]:
                 assert stream is not None
                 tail = b""
                 line = b""
                 size = 0
                 dropping = False
                 omitted = False
+                raw = directory / f"{index}-{name}.raw"
+                raw.touch(mode=0o600)
                 while chunk := await stream.read(65536):
+                    with raw.open("ab") as log:
+                        log.write(chunk)
                     size += len(chunk)
                     for part in chunk.splitlines(keepends=True):
                         if not dropping:
@@ -87,8 +185,8 @@ class Quality:
                 }
 
             readers = [
-                asyncio.create_task(output(process.stdout)),
-                asyncio.create_task(output(process.stderr)),
+                asyncio.create_task(output(process.stdout, "stdout")),
+                asyncio.create_task(output(process.stderr, "stderr")),
             ]
             pending = asyncio.gather(*readers, process.wait())
             try:
@@ -98,12 +196,16 @@ class Quality:
                             raise asyncio.CancelledError
                         await asyncio.wait({pending}, timeout=0.2)
                     stdout, stderr, code = pending.result()
+            except TimeoutError:
+                stdout, stderr, code = {}, {"tail": "Check timed out"}, 124
             finally:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
                 await stop(process, readers)
             results.append(
-                {
+                item
+                | {
+                    "status": "passed" if code == 0 else "blocked" if code == 127 else "failed",
                     "argv": [Redactor().text(arg) for arg in expanded],
                     "exit_code": code,
                     "stdout": stdout,
@@ -112,59 +214,25 @@ class Quality:
                     "ended": time.time(),
                 }
             )
-            if code:
-                break
-        data = {
-            "target_sha": task["target_sha"],
-            "policy": self.config.policy_hash,
-            "passed": all(row["exit_code"] == 0 for row in results),
-            "commands": results,
+        data = plan | {
+            "run_id": key,
+            "items": results,
             "isolation": isolation,
             "directory": str(directory),
             "started": started,
             "ended": time.time(),
         }
-        self.store.record(task, kind, self.config.policy_hash, data)
+        data["passed"] = verdict(data, include_e2e=include_e2e) == "passed"
+        self.store.record(task, "quality-results", plan["plan_hash"], data)
         return data
 
 
-def ci_gate(task: dict[str, Any], facts: dict[str, Any], workflows: list[str]) -> tuple[State, str]:
-    if facts.get("headRefOid") != task["target_sha"]:
-        return State.RECONCILE, "GitHub CI facts refer to a different head"
-    if not workflows:
-        return State.WAITING_ENVIRONMENT, "Configure required target-repository CI workflows"
-    for name in workflows:
-        candidates = [
-            run
-            for run in facts["workflows"]
-            if run["head_sha"] == task["target_sha"]
-            and run["event"] == "pull_request"
-            and run["head_branch"] == task["snapshot"]["head_ref"]
-            and run["path"].split("@", 1)[0] == f".github/workflows/{name}"
-        ]
-        if not candidates:
-            return State.WAITING_DEPENDENCY, f"No CI run for {name} at the target SHA"
-        latest = max(candidates, key=lambda run: (run["id"], run.get("run_attempt", 1)))
-        if latest["status"] != "completed":
-            return State.WAITING_DEPENDENCY, f"CI {name} is {latest['status']}"
-        if latest["conclusion"] not in {"success", "failure", "timed_out"}:
-            return State.WAITING_DEPENDENCY, f"CI {name} concluded {latest['conclusion']}"
-        proof = latest.get("target_proof") or {}
-        if any(
-            proof.get(key) != value
-            for key, value in {
-                "repository": task["snapshot"]["repository"],
-                "pr_number": task["pr_number"],
-                "head_sha": task["target_sha"],
-                "base_sha": task["snapshot"]["base_sha"],
-                "base_ref": task["snapshot"]["base_ref"],
-                "run_id": latest["id"],
-                "attempt": latest.get("run_attempt", 1),
-            }.items()
-        ):
-            return State.WAITING_DEPENDENCY, f"CI {name} has no verified current PR/base checkout"
-        if latest["conclusion"] != "success":
-            if not proof.get("failure_tail"):
-                return State.WAITING_DEPENDENCY, f"CI {name} has no bound failure diagnostics"
-            return State.FAILED, f"CI {name} concluded {latest['conclusion']}"
-    return State.COMPLETED, "Required CI workflows passed at the target SHA"
+def verdict(data: dict[str, Any], *, include_e2e: bool = True) -> str:
+    required = [
+        item
+        for item in data["items"]
+        if item["required"] and (include_e2e or item["category"] != "e2e")
+    ]
+    if any(item["status"] == "failed" for item in required):
+        return "failed"
+    return "passed" if all(item["status"] == "passed" for item in required) else "blocked"

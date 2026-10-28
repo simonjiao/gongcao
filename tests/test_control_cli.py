@@ -30,11 +30,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         )
     )
     config = tmp_path / "config.yaml"
-    config.write_text(
-        f"auth_file: {auth_file}\ncopilot:\n  mode: step\n  operators: [owner]\nquality:\n"
-        "  ci_workflows: [ci.yml]\n"
-        "  checks: [['{python}', '-c', \"assert open('sample.txt').read() == 'complete\\\\n'\"]]\n"
-    )
+    config.write_text(f"auth_file: {auth_file}\ncopilot:\n  mode: step\n  operators: [owner]\n")
     root = Path(__file__).resolve().parents[1]
     env = {
         **os.environ,
