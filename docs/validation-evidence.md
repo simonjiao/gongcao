@@ -41,10 +41,14 @@ README.md、manifest.json、SHA256SUMS。独立孤立提交起步，后续追加
 分工按最新 Issue 正文执行：#78 负责 doctor/示例配置；本次仅删除失效 quality 示例段。
 #80 随后整理剩余 test_pr2/跨文件夹具/长期文档；#55 再做 E2E 去重和扩展，本次不搬迁剩余测试。
 
-固定实现 `368f331fa030db13d26856e09ba7d5964bb3e914`：Python 3.12/3.13 各 278 项全量通过，
-Ruff、format、mypy、离线 QA 通过，Standards/Spec 均无剩余问题。使用全部收集文件的互斥分组，
-墙钟分别 147.0/160.24 秒；不依赖 CI，未使用 Docker。
-本地完整记录保存在 `.qa-runs/quality-368f331-local.json`；证据 JSON 不合入业务分支。
+固定实现 `906bc4fe2f6e2b80152d82185437d561d7419f94`：Python 3.12/3.13 各 284 项全量通过，
+Ruff、format、mypy、离线 QA 通过；本地复审无阻断项。验证在本机 WSL/Bubblewrap 执行，不依赖 CI，未使用 Docker。
+本地全量记录保存在 `.qa-runs/issue79-906bc4f-matrix/report.json`；原始日志、SQLite、会话不进入业务分支。
+
+真实模型/GitHub E2E `ba29ce0aa41f4460a8f7fe8f3ba12bc1` 已通过：开发→审查退回→修订→新 SHA 重新分析/测试→Reviewer/Validator→生产归档回读。
+修订后目标测试 287 项通过，旧 SHA 拒绝及完成后重复执行无新写入均已验证；QA Issue #88/PR #89 已关闭且未合并，清理完成。
+[完整脱敏验收记录（含失败历史）](https://github.com/simonjiao/gongcao/tree/6d9c908802cbcb3370526c1369dbf7ec7894cf41/qa/acceptance/issue-79/906bc4fe2f6e2b80152d82185437d561d7419f94/e2e-ba29ce0aa41f4460a8f7fe8f3ba12bc1)；[生产质量归档](https://github.com/simonjiao/gongcao/tree/2952e928e14b20a1b829f2a704726a56790cef07/qa/acceptance/issue-88/ab71d2e0db19899dbe1bd9817be26a324adba089/check-006281db898e4cf4a9ced0d2648486ab)。
+AirDB 在固定 `345f3b2` 的实际 Issue/PR/AGENTS/构建上下文验证 Maven/npm 选择，属于只读适配检查，不声明 AirDB 业务引擎/浏览器 E2E 通过。
 
 用户授权的真实归档验收已通过，专用 [QA Issue #82](https://github.com/simonjiao/gongcao/issues/82) 已关闭，Agent 运行数为 0。
 [成功执行证据](https://github.com/simonjiao/gongcao/tree/63b71666c677786d8f3d1ecc88291495a7a628e4/qa/acceptance/issue-82/368f331fa030db13d26856e09ba7d5964bb3e914/check-328edf353a3047378529e42222d077ba)。
