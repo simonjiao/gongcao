@@ -132,7 +132,9 @@ async def test_failed_foreground_poll_cannot_consume_a_concurrent_unverified_rec
         assert store.task(task_id)["state"] == State.QUEUED
 
 
-@pytest.mark.parametrize("recovery", ["visible", "local", "new", "stale", "unauthorized"])
+@pytest.mark.parametrize(
+    "recovery", ["visible", "local", "new", "stale", "unauthorized", "conflict", "published"]
+)
 async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permission(
     store, task_id, comments, copilot, monkeypatch, recovery
 ):
@@ -154,11 +156,18 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
             controls.issue(task_id, "until", "review", policy=copilot.policy_hash)
         else:
             comments.post(
-                "/gongcao auto", actor="stranger" if recovery == "unauthorized" else "owner"
+                "/gongcao until development" if recovery == "published" else "/gongcao auto",
+                actor="stranger" if recovery == "unauthorized" else "owner",
             )
+            if recovery == "conflict":
+                comments.post("/gongcao step")
             await controls.collect(task_id, copilot, comments)
-            if recovery == "stale":
+            if recovery in {"stale", "conflict"}:
                 store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": "0" * 40})
+            if recovery == "published":
+                store.halt(task_id, State.QUEUED, "publication acknowledgment")
+                store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "published")
+                controls.apply_pending(task_id, copilot, defer_checkpoint=True)
             if recovery == "new":
                 before = restarted.task(task_id), restarted.evidence(task_id)
                 mark = controls.mark
@@ -175,14 +184,14 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
                 assert before == (restarted.task(task_id), restarted.evidence(task_id))
         await controls.poll(task_id, copilot, comments)
         rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
-        invalid = recovery in {"stale", "unauthorized"}
+        invalid = recovery in {"stale", "unauthorized", "conflict", "published"}
         assert restarted.task(task_id)["state"] == (
             State.WAITING_INSTRUCTION if invalid else State.QUEUED
         )
         assert rows["github:1"]["status"] == (
             "pending" if invalid else "accepted" if recovery == "visible" else "superseded"
         )
-        if recovery in {"new", "stale", "unauthorized"}:
+        if recovery not in {"visible", "local"}:
             assert rows["github:2"]["status"] == ("rejected" if invalid else "accepted")
 
 

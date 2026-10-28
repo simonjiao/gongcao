@@ -187,6 +187,7 @@ class Controls:
         safe: bool = False,
         received: dict[str, Any] | None = None,
         defer_checkpoint: bool = False,
+        replace_pending: bool = True,
     ) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
@@ -239,7 +240,7 @@ class Controls:
             self.record(task_id, command_id, data, "rejected" if reason else "accepted", reason)
             if reason:
                 return False
-            if received is None:
+            if received is None and replace_pending:
                 self.db.execute(
                     "UPDATE instructions SET status='superseded',reason='New local instruction' "
                     "WHERE task_id=? AND status='pending'",
@@ -431,7 +432,13 @@ class Controls:
             if len(fingerprints) > 1:
                 for key, _ in pending:
                     self.mark(task_id, key, "rejected", "Conflicting comment IDs")
-                self.issue(task_id, "pause", safe=True, defer_checkpoint=defer_checkpoint)
+                self.issue(
+                    task_id,
+                    "pause",
+                    safe=True,
+                    defer_checkpoint=defer_checkpoint,
+                    replace_pending=False,
+                )
                 control = self.store.task(task_id)["control"]
                 self.save(task_id, control | {"pause_reason": "Conflicting GitHub instructions"})
                 if not defer_checkpoint:
@@ -452,7 +459,9 @@ class Controls:
                 reached = data["mode"] == "until" and task["stage"] == TARGETS[data["target"]]
                 if reached and defer_checkpoint and data["target"] == "development":
                     self.mark(task_id, key, "rejected", "Target entry completed during publication")
-                    self.issue(task_id, "pause", safe=True, defer_checkpoint=True)
+                    self.issue(
+                        task_id, "pause", safe=True, defer_checkpoint=True, replace_pending=False
+                    )
                     return
                 accepted = self.issue(
                     task_id,

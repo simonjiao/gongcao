@@ -128,6 +128,8 @@ wakes the paused task, publishes once, and stops at review with no lease held.
 This is offline evidence, not real model/GitHub acceptance.
 The optional real run is `uv run python -m qa run copilot --real --repo OWNER/REPO --cleanup`;
 execute it only with explicit authorization for real QA.
+The deleted pending comment must be superseded by the next verified comment; the
+scene does not issue a local pause to bypass an unverified receipt (scenario v8).
 
 `verify-batch --require-isolation` checks slot events, independent resource IDs,
 overlapping real SDK session intervals, a queued third Run, and cancellation
