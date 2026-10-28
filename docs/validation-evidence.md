@@ -22,6 +22,7 @@ uv run gongcao quality TASK --archive --real
 不开放宿主 Docker socket、SSH、GitHub 或模型凭据。入口依赖这些宿主权限时须使用隔离 QA 环境，缺失则 blocked。
 普通与受控质量沙箱均不挂载宿主控制器源码 `/app`、控制器虚拟环境或设置其 PYTHONPATH；
 检查入口须从目标工作树加载源码，或安装该版本的项目环境。基础 Python/系统工具仍可用。
+隔离策略 `target-source-v1` 绑定计划哈希；升级前可能使用宿主源码的缓存不能充当当前验收，须重新执行。
 退出 77/127 记录环境 blocked，其他非零退出记录 failed。离线 CLI 回归归 internal，不凭测试文件名认定真实 E2E。
 项目 QA 入口负责其真实环境预检、资源清理及不明远端操作处理；这里不增加第二套 QA 平台。
 

@@ -27,7 +27,11 @@ from .workspace import context, worktree
 class Quality:
     def __init__(self, store: Store, config: Config):
         self.store, self.config = store, config
-        self.runtime = {"python": platform.python_version(), "platform": platform.platform()}
+        self.runtime = {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "quality_isolation": "target-source-v1",
+        }
 
     def confirm(
         self,

@@ -61,6 +61,15 @@ async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_
 async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbox(
     store, repo, snapshot
 ):
+    from pathlib import Path
+    from shutil import copyfile, copytree, ignore_patterns
+
+    # This fixture owns its pytest dependencies at the target SHA. Quality no longer
+    # exposes the host controller's virtualenv, and this regression stays offline.
+    for name in ("pytest", "_pytest", "pluggy", "packaging", "iniconfig", "pygments"):
+        package = Path(__import__(name).__file__).parent
+        copytree(package, repo / name, ignore=ignore_patterns("__pycache__"))
+    copyfile(__import__("py").__file__, repo / "py.py")
     (repo / "test_checkout.py").write_text(
         "import subprocess\nfrom pathlib import Path\n"
         "def test_clone(tmp_path):\n"
@@ -91,7 +100,7 @@ async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbo
         [
             {
                 "category": category,
-                "entry": [sys.executable, "-c", pytest_snapshot_script()]
+                "entry": ["{python}", "-c", pytest_snapshot_script()]
                 if category == "internal"
                 else [],
                 "scope": ["tests"],

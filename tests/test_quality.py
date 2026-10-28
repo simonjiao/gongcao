@@ -490,6 +490,20 @@ async def test_invalid_analysis_cannot_fill_a_current_plan(store, task_id):
     assert all(item["reason"] != "STALE_ANALYSIS_SENTINEL" for item in renewed["items"])
 
 
+async def test_new_isolation_policy_rejects_previously_cached_pass(store, task_id):
+    old = Quality(store, Config())
+    old.runtime.pop("quality_isolation")
+    before = old.confirm(store.task(task_id), items(["true"]))
+    previous_result = await old.run(store.task(task_id), include_e2e=True)
+    assert verdict(previous_result) == "passed"
+    current = Quality(store, Config())
+    result = await current.run(store.task(task_id), include_e2e=True)
+    assert result["plan_hash"] != before["plan_hash"]
+    assert result["run_id"] != previous_result["run_id"]
+    assert result["runtime"]["quality_isolation"] == "target-source-v1"
+    assert store.artifact(task_id, "quality-results", before["plan_hash"]) is None
+
+
 def test_controlled_entry_matches_actual_invocation(tmp_path):
     from gongcao.plan import controlled_entry
 
