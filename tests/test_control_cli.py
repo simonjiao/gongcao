@@ -76,9 +76,8 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         text=True,
     )
     try:
-        time.sleep(max(0, waiting["control"]["since"] + 1.1 - time.time()))
         data = json.loads(fixture.read_text())
-        stamp = datetime.now(UTC).isoformat()
+        stamp = datetime.fromtimestamp(int(waiting["control"]["since"]), UTC).isoformat()
         data["comments"] = [
             {
                 "id": 1,

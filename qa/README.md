@@ -104,7 +104,8 @@ This does not provide cross-process/global scheduling.
 - `copilot`: requires `--real --repo`. Posts actual Issue comments from the API account,
   first excluded from operators (rejected), then explicitly allowed. Uses step for
   analysis and development/publication, until-validation for review/revision, then
-  auto for the existing exact-SHA gates. Edited and expired comments must be rejected.
+  auto for the existing exact-SHA gates. Initially edited comments are rejected;
+  deleting a pending comment must preserve a verification warning and prevent execution.
   A continuously running native serve must wake an already-paused task from an
   authorized comment; the test does not restart serve to cause that first wakeup.
   Each permission is consumed once across

@@ -62,7 +62,6 @@ def rejection(
     task: dict[str, Any],
     data: dict[str, Any],
     *,
-    remote: bool,
     received: dict[str, Any] | None = None,
 ) -> str:
     """The same immutable command rules apply at receipt and again at consumption."""
@@ -71,13 +70,12 @@ def rejection(
         target not in TARGETS if mode == "until" else target is not None
     ):
         return "Invalid instruction or target"
-    if task["stage"] == Stage.MERGED or (
-        task["state"] in UNSAFE and (mode != "pause" or data["feedback"])
+    if (
+        task["stage"] == Stage.MERGED
+        or task["state"] == State.COMPLETED
+        or (task["state"] in UNSAFE and (mode != "pause" or data["feedback"]))
     ):
         return "Task requires manual recovery or is terminal"
-    cutoff = "request_since" if received or mode == "pause" else "since"
-    if remote and data["created"] < task["control"].get(cutoff, task["updated"]):
-        return "Comment predates the current stage/request baseline"
     if received and (
         received["sha"] != task["target_sha"]
         or received["baseline"] != baseline(task)
@@ -105,7 +103,8 @@ class Controls:
 
     def mark(self, task_id: int, command_id: str, status: str, reason: str) -> None:
         self.db.execute(
-            "UPDATE instructions SET status=?,reason=? WHERE task_id=? AND id=?",
+            "UPDATE instructions SET status=?,reason=? WHERE task_id=? AND id=?"
+            + (" AND status='accepted' AND reason=''" if status == "consumed" else ""),
             (status, reason, task_id, command_id),
         )
 
@@ -216,9 +215,7 @@ class Controls:
                     or hashlib.sha256(json.dumps([mode, target, feedback]).encode()).hexdigest(),
                 },
             )
-            reason = rejection(
-                task, data, remote=command_id.startswith("github:"), received=received
-            )
+            reason = rejection(task, data, received=received)
             occupied = self.db.execute(
                 "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
             ).fetchone()
@@ -242,6 +239,12 @@ class Controls:
             self.record(task_id, command_id, data, "rejected" if reason else "accepted", reason)
             if reason:
                 return False
+            if received is None:
+                self.db.execute(
+                    "UPDATE instructions SET status='superseded',reason='New local instruction' "
+                    "WHERE task_id=? AND status='pending'",
+                    (task_id,),
+                )
             self.db.execute(
                 "UPDATE instructions SET status='superseded',reason='New instruction' "
                 "WHERE task_id=? AND id=? AND status='accepted'",
@@ -355,7 +358,11 @@ class Controls:
     def check_policy(self, task_id: int, policy: str, *, operators: set[str] | None = None) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
-            if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
+            if (
+                task["state"] in UNSAFE
+                or task["state"] == State.COMPLETED
+                or task["stage"] == Stage.MERGED
+            ):
                 return False
             self.fence(task_id)
             control = task["control"]
@@ -387,10 +394,17 @@ class Controls:
         with self.transaction():
             if not self.owns_checkpoint(task_id):
                 return
+            if self.db.execute(
+                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason!=''",
+                (task_id,),
+            ).fetchone():
+                return
             operators = {name.casefold() for name in config.copilot_operators}
             pending = []
             for row in self.db.execute(
-                "SELECT id,data FROM instructions WHERE task_id=? AND status='pending'", (task_id,)
+                "SELECT id,data FROM instructions WHERE task_id=? AND status='pending' "
+                "AND reason=''",
+                (task_id,),
             ):
                 data = json.loads(row["data"])
                 if data["actor"].casefold() in operators:
@@ -399,23 +413,24 @@ class Controls:
                     self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
             if not pending:
                 return
-            pending.sort(key=lambda item: (item[1]["created"], item[0]), reverse=True)
+            pending.sort(key=lambda item: int(item[0].split(":")[1]), reverse=True)
             task = self.store.task(task_id)
-            newest = pending[0][1]["created"]
-            fingerprints = {
-                data.get("fingerprint", key) for key, data in pending if data["created"] == newest
-            }
+            fingerprints = {data.get("fingerprint", key) for key, data in pending}
             row = self.db.execute(
-                "SELECT id,data FROM instructions WHERE task_id=? AND id=?",
+                "SELECT id,data FROM instructions WHERE task_id=? AND id=? AND status='accepted'",
                 (task_id, task["control"].get("command_id")),
             ).fetchone()
             if row:
                 current = json.loads(row["data"])
-                if current["created"] == newest and current["actor"].casefold() in operators:
+                if (
+                    not task["control"].get("pause_requested")
+                    and not task["control"].get("spent")
+                    and current["actor"].casefold() in operators
+                ):
                     fingerprints.add(current.get("fingerprint", row["id"]))
             if len(fingerprints) > 1:
                 for key, _ in pending:
-                    self.mark(task_id, key, "rejected", "Conflicting commands at the same time")
+                    self.mark(task_id, key, "rejected", "Conflicting comment IDs")
                 self.issue(task_id, "pause", safe=True, defer_checkpoint=defer_checkpoint)
                 control = self.store.task(task_id)["control"]
                 self.save(task_id, control | {"pause_reason": "Conflicting GitHub instructions"})
@@ -454,15 +469,62 @@ class Controls:
                 )
 
     async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
+        task = self.store.task(task_id)
         if (
             not config.copilot_operators
-            or self.store.task(task_id)["snapshot"].get("kind") != "issues"
+            or task["snapshot"].get("kind") != "issues"
+            or task["state"] == State.COMPLETED
+            or task["stage"] == Stage.MERGED
         ):
             return
-        comments = await github.instructions(self.store.task(task_id))
+        watched = {
+            row["id"]: row["status"]
+            for row in self.db.execute(
+                "SELECT id,status FROM instructions WHERE task_id=? AND "
+                "(status='pending' OR (id=? AND status='accepted'))",
+                (task_id, task["control"].get("command_id")),
+            )
+            if row["id"].startswith("github:")
+        }
+        failures = {}
+        try:
+            comments = list(await github.instructions(task))  # Requires complete pagination.
+        except Exception as exc:
+            comments = []
+            failures = dict.fromkeys(watched, Redactor().text(str(exc)))
+        else:
+            present = {"github:" + str(comment["id"]) for comment in comments}
+            for key in watched.keys() - present:
+                try:
+                    comment = await github.read(
+                        f"repos/{task['snapshot']['repository']}/issues/comments/{key.split(':')[1]}"
+                    )
+                    if "github:" + str(comment["id"]) != key:
+                        raise ValueError("Comment ID did not match the direct read")
+                    comments.append(comment)
+                except Exception as exc:
+                    failures[key] = Redactor().text(str(exc))
         operators = {name.casefold() for name in config.copilot_operators}
         with self.transaction():
             task = self.store.task(task_id)
+            if task["state"] == State.COMPLETED or task["stage"] == Stage.MERGED:
+                return
+            for key, error in failures.items():
+                reason = "Instruction verification pending: " + error
+                changed = self.db.execute(
+                    "UPDATE instructions SET reason=? WHERE task_id=? AND id=? "
+                    "AND status IN ('pending','accepted')",
+                    (reason, task_id, key),
+                )
+                if not changed.rowcount:
+                    continue  # A newer checkpoint may already have retired this permission.
+                if watched[key] == "pending" or (
+                    task["control"].get("command_id") == key and not task["control"].get("spent")
+                ):
+                    self.save(
+                        task_id, task["control"] | {"pause_requested": True, "pause_reason": reason}
+                    )
+                    task = self.store.task(task_id)
             for comment in comments:
                 body = comment.get("body") or ""
                 command_id = "github:" + str(comment["id"])
@@ -473,12 +535,16 @@ class Controls:
                 ).fetchone()
                 edited = comment.get("updated_at") != comment["created_at"]
                 if known:
-                    if known["status"] != "rejected" and (
+                    if (
                         edited
                         or json.loads(known["data"]).get("fingerprint", fingerprint) != fingerprint
+                        or json.loads(known["data"])["actor"].casefold()
+                        != comment.get("user", {}).get("login", "").casefold()
                     ):
                         self.mark(task_id, command_id, "stale", "Comment content was edited")
-                        if task["control"].get("command_id") == command_id:
+                        if task["control"].get("command_id") == command_id and not task[
+                            "control"
+                        ].get("spent"):
                             self.save(
                                 task_id,
                                 task["control"]
@@ -487,6 +553,9 @@ class Controls:
                                     "pause_reason": "Authorized comment was edited",
                                 },
                             )
+                            task = self.store.task(task_id)
+                    elif known["status"] in {"pending", "accepted"}:
+                        self.mark(task_id, command_id, known["status"], "")
                     continue
                 header, _, feedback = body.strip().partition("\n")
                 if not header.startswith("/gongcao "):
@@ -515,9 +584,7 @@ class Controls:
                     if edited
                     else "Invalid command syntax"
                     if len(words) not in {1, 2}
-                    else rejection(
-                        task, data, remote=True, received=data if data["feedback"] else None
-                    )
+                    else rejection(task, data)
                 )
                 self.record(task_id, command_id, data, "rejected" if reason else "pending", reason)
 
