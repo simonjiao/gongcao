@@ -48,8 +48,25 @@ GitHub 状态码依据：[评论读取 API](https://docs.github.com/en/rest/issu
 
 ## 交付检查
 
-按用户要求不依赖 GitHub CI，使用本地 Python 3.12/3.13 验证。Ruff、格式、严格 mypy
-已通过；完整 pytest、离线 QA（含真实 OS 隔离探针）及双轴复审结果随固定提交补充。
+固定实现提交：`eb731e3e318dc7f62f34af6a3aa42c022641ca3a`；基点：
+`e8d1fc007c0f2ef9b371a856f314c9f3514c4b52`。
+
+按用户要求不依赖 GitHub CI，使用 WSL/Linux 本地环境验证，并非 Docker：
+
+| 检查 | Python 3.12.3 | Python 3.13.13 |
+| --- | --- | --- |
+| `uv run ruff check .` | 通过 | 通过 |
+| `uv run ruff format --check .` | 通过，67 文件 | 通过，67 文件 |
+| `uv run mypy` | 通过，33 文件 | 通过，33 文件 |
+| `uv run pytest -q` | 290 通过，238.80 秒 | 290 通过，217.31 秒 |
+| `uv run python -m qa check --offline` | 通过 | 通过 |
+
+离线 QA 使用真实 Bubblewrap 探针，确认宿主凭据、仓库及工作区外写入被阻断。
+3.13 使用独立虚拟环境；uv 的解释器别名链接在沙箱内不可见，将该测试环境的 Python
+链接指向实际版本目录后，以 `uv run --no-sync --python 3.13` 运行上述检查。
+未调整生产沙箱挂载或安全约束。
+
+双轴复审（相同固定提交）：Standards 0 项，Spec 0 项。
 首次审查发现的配置失效、并发登记和首次编辑状态三处问题已修复并补充回归。
 Issue 保持开放，未经最终验收不关闭。
 
