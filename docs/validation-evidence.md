@@ -20,12 +20,16 @@ uv run gongcao quality TASK --archive --real
 真实 QA 只接受当前版本 qa/ 脚本或 npm test:e2e，以明确授权的计划哈希执行；每项使用独立干净工作树和无凭据 Bubblewrap，
 不继承宿主文件或权限。网络默认关闭；计划中的 `network` 和 `variables` 显式授予网络及具名 QA/引擎/浏览器变量，其值摘要绑定计划。
 不开放宿主 Docker socket、SSH、GitHub 或模型凭据。入口依赖这些宿主权限时须使用隔离 QA 环境，缺失则 blocked。
+普通与受控质量沙箱均不挂载宿主控制器源码 `/app`、控制器虚拟环境或设置其 PYTHONPATH；
+检查入口须从目标工作树加载源码，或安装该版本的项目环境。基础 Python/系统工具仍可用。
 退出 77/127 记录环境 blocked，其他非零退出记录 failed。离线 CLI 回归归 internal，不凭测试文件名认定真实 E2E。
 项目 QA 入口负责其真实环境预检、资源清理及不明远端操作处理；这里不增加第二套 QA 平台。
 
 REVIEW 使用必需 build/internal 的真实结果；VALIDATION 核对全部必需项后才调用 Validator。
 新 PR SHA 先重新分析当前 Issue/AGENTS 验收；缺少完整评估时 blocked。同 SHA 计划变更在同一事务撤销完成状态及审查/验证证据，状态发布同步标记更新。
 PR 头版本、审查/合并保护、租约、暂停和人工合并仍由原控制器核验。无 CI 不构成新阻塞。
+`quality-results.passed` 只表示已声明计划的执行结论；全部标为不适用时也可能为 true，不等于任务验收或可合并。
+Reviewer/Validator 独立读取当前 Issue、AGENTS 与计划，检查验收义务是否被错误省略；自然语言适用性仍依赖独立判断和人工合并。
 
 原始 stdout/stderr、SQLite 和会话留在本地私有目录。归档只发布新格式脱敏清单和摘要：
 `qa/issue-N-evidence` 分支的 `qa/acceptance/issue-N/TARGET_SHA/RUN_ID/`，包括
@@ -49,6 +53,12 @@ Ruff、format、mypy、离线 QA 通过；本地复审无阻断项。验证在�
 修订后目标测试 287 项通过，旧 SHA 拒绝及完成后重复执行无新写入均已验证；QA Issue #88/PR #89 已关闭且未合并，清理完成。
 [完整脱敏验收记录（含失败历史）](https://github.com/simonjiao/gongcao/tree/6d9c908802cbcb3370526c1369dbf7ec7894cf41/qa/acceptance/issue-79/906bc4fe2f6e2b80152d82185437d561d7419f94/e2e-ba29ce0aa41f4460a8f7fe8f3ba12bc1)；[生产质量归档](https://github.com/simonjiao/gongcao/tree/2952e928e14b20a1b829f2a704726a56790cef07/qa/acceptance/issue-88/ab71d2e0db19899dbe1bd9817be26a324adba089/check-006281db898e4cf4a9ced0d2648486ab)。
 AirDB 在固定 `345f3b2` 的实际 Issue/PR/AGENTS/构建上下文验证 Maven/npm 选择，属于只读适配检查，不声明 AirDB 业务引擎/浏览器 E2E 通过。
+
+2026-10-28 补充复审：宿主/目标 `gongcao` 内容不同的实际 Bubblewrap 导入反例修复前失败，修复后普通与受控入口均加载目标源码。
+另将明确要求浏览器/引擎验收的 Issue/AGENTS 配上 Analyst 全部不适用的错误提案，实际模型 `gpt-6.1-sol` 的
+Reviewer `553c61f8d2494c5da636e80f6d405e47` 和 Validator `1fc275658f7f456ab5ecaab8f2487abe` 均返回 revise，控制器进入修订，未放行。
+这是两次独立只读 SDK 会话，GitHub 运输为本地替身，无远端写入；未运行浏览器/引擎，也不重复声明完整远程闭环。
+记录在 `.qa-runs/issue79-acceptance-boundary-r2/report.json`；离线回归另核对错误计划上下文传递及两角色 blocked 时不会进入可合并。
 
 用户授权的真实归档验收已通过，专用 [QA Issue #82](https://github.com/simonjiao/gongcao/issues/82) 已关闭，Agent 运行数为 0。
 [成功执行证据](https://github.com/simonjiao/gongcao/tree/63b71666c677786d8f3d1ecc88291495a7a628e4/qa/acceptance/issue-82/368f331fa030db13d26856e09ba7d5964bb3e914/check-328edf353a3047378529e42222d077ba)。

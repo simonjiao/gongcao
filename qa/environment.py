@@ -45,7 +45,24 @@ async def check(*, real: bool = False, repository: str | None = None) -> dict[st
         sandbox = Sandbox(workspace, private, Role.REVIEWER)
         sandbox.prepare(Config(), authentication=False)
         isolation = await sandbox.verify(host)
-    result: dict[str, Any] = {"versions": versions, "isolation": isolation, "real": real}
+        sandbox.controller_runtime = False
+        quality_isolation = await sandbox.verify(host)
+        await command(
+            *sandbox.argv(
+                str(Path(sys.base_prefix) / "bin/python3"),
+                "-c",
+                "import pathlib, sys; assert not pathlib.Path('/app').exists(); "
+                f"assert {sys.prefix == sys.base_prefix!r} or "
+                f"not pathlib.Path({sys.prefix!r}).exists(); "
+                "assert '/app' not in sys.path",
+            )
+        )
+    result: dict[str, Any] = {
+        "versions": versions,
+        "isolation": isolation,
+        "quality_isolation": quality_isolation,
+        "real": real,
+    }
     if real:
         if repository is None:
             raise ValueError("--repo OWNER/REPO is required for real QA")

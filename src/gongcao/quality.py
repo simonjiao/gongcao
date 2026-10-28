@@ -197,7 +197,7 @@ class Quality:
         workspace = self.store.root / "worktrees" / key
         repo = Path(task["repo_path"])
         await worktree(repo, workspace, task["target_sha"], Role.DEVELOPER, key)
-        sandbox = Sandbox(workspace, directory, Role.DEVELOPER)
+        sandbox = Sandbox(workspace, directory, Role.DEVELOPER, controller_runtime=False)
         sandbox.prepare(self.config, authentication=False)
         isolation = await sandbox.verify(repo)
         started = time.time()
@@ -243,7 +243,12 @@ class Quality:
                 if before_real is None:
                     raise ValueError("Real QA requires a controller authorization checkpoint")
                 await before_real()
-                real_sandbox = Sandbox(real_workspace, directory / f"real-{index}", Role.DEVELOPER)
+                real_sandbox = Sandbox(
+                    real_workspace,
+                    directory / f"real-{index}",
+                    Role.DEVELOPER,
+                    controller_runtime=False,
+                )
                 real_sandbox.prepare(self.config, authentication=False)
                 await real_sandbox.verify(repo)
                 isolated = real_sandbox.argv(*expanded)

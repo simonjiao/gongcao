@@ -166,6 +166,75 @@ async def test_new_head_cannot_drop_unconfirmed_issue_acceptance(store, task_id,
     assert data["repository_instructions"] == (repo / "AGENTS.md").read_text()
 
 
+@pytest.mark.parametrize("role", [Role.REVIEWER, Role.VALIDATOR])
+async def test_not_applicable_plan_still_needs_independent_acceptance(
+    store, task_id, repo, fixture_github, policy, monkeypatch, role
+):
+    from test_runner import install_worker
+
+    requirement = "Require real browser and engine acceptance; missing evidence blocks readiness."
+    (repo / "AGENTS.md").write_text(requirement)
+    (repo / "Makefile").unlink()
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "Explicit integration acceptance", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    fixture_github.issue.update(body=requirement, head_sha=sha)
+    fixture_github.sha = sha
+    store.sync(task_id, fixture_github.issue)
+    proposal = items([])
+    for item in proposal:
+        item.update(required=False, entry=[], reason="Mistaken analyst: all checks inapplicable")
+    run = store.begin_run(task_id, Role.ANALYST)
+    store.finish(
+        run,
+        State.COMPLETED,
+        Stage.REVIEW,
+        State.QUEUED,
+        "Injected incorrect assessment",
+        json.dumps({"target_sha": sha, "conclusion": "ready", "validation_plan": proposal}),
+    )
+    quality = Quality(store, policy)
+    evidence = await quality.run(store.task(task_id), include_e2e=True)
+    assert verdict(evidence) == "passed"  # Only the declared plan, not acceptance/readiness.
+    assert not any(item["required"] for item in evidence["items"])
+    store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "Plan execution complete")
+    if role == Role.VALIDATOR:
+        run = store.begin_run(task_id, Role.REVIEWER)
+        store.finish(
+            run,
+            State.COMPLETED,
+            Stage.VALIDATION,
+            State.QUEUED,
+            "Injected review approval",
+            json.dumps({"target_sha": sha, "conclusion": "ready"}),
+        )
+    # This is a protocol regression. Real-model judgement is checked separately.
+    install_worker(
+        monkeypatch,
+        """
+import json
+data = json.loads(input())['context']
+assert 'real browser and engine' in data['github']['body']
+assert 'real browser and engine' in data['repository_instructions']
+assert data['quality_evidence']['passed']
+assert not any(i['required'] for i in data['quality_evidence']['items'])
+print(json.dumps({'kind':'thread','data':{'thread_id':'independent-acceptance-review'}}))
+print(json.dumps({'kind':'result','data':{
+    'conclusion':'blocked','summary':'Required real browser/engine evidence is absent',
+    'basis':['Issue and AGENTS contradict the not-applicable assessment'],
+    'target_sha':data['target_sha'],'next_steps':['Supply required real acceptance'],
+    'validation_plan':[]}}))
+""",
+    )
+    await Workflow(store, policy, fixture_github).step(store.task(task_id))
+    task = store.task(task_id)
+    assert task["state"] == State.HUMAN
+    assert task["stage"] == (Stage.REVIEW if role == Role.REVIEWER else Stage.VALIDATION)
+    assert not fixture_github.writes
+    assert store.artifact(task_id, "validation", policy.policy_hash) is None
+    assert store.runs(task_id)[-1]["role"] == role
+
+
 @pytest.mark.parametrize(
     "entry,status",
     [(["sh", "-c", "exit 1"], "failed"), (["missing-executable-79"], "blocked"), ([], "blocked")],
@@ -221,6 +290,42 @@ async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store,
         )
     assert verdict(result) == "passed"
     assert all("real controlled entry" in row["stdout"]["tail"] for row in result["items"][2:])
+
+
+@pytest.mark.parametrize("environment", ["sandbox", "controlled"])
+async def test_quality_imports_target_source_without_host_runtime(
+    store, task_id, repo, environment
+):
+    import sys
+
+    (repo / "src/gongcao").mkdir(parents=True)
+    (repo / "src/gongcao/__init__.py").write_text("VERSION = 'fixed-target-version'\n")
+    (repo / "qa").mkdir()
+    (repo / "qa/probe.py").write_text(
+        "import pathlib, sys\n"
+        "sys.path.append('/workspace/src')\n"
+        "import gongcao\n"
+        "assert gongcao.VERSION == 'fixed-target-version'\n"
+        "assert gongcao.__file__ == '/workspace/src/gongcao/__init__.py'\n"
+        "assert not pathlib.Path('/app/gongcao/quality.py').exists()\n"
+        f"assert {sys.prefix == sys.base_prefix!r} or not pathlib.Path({sys.prefix!r}).exists()\n"
+        "print(gongcao.__file__)\n"
+    )
+    (repo / ".gitignore").write_text("__pycache__/\n")
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "Target-source import probe", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": sha})
+    quality = Quality(store, Config())
+    plan = quality.confirm(store.task(task_id), items(["{python}", "qa/probe.py"], environment))
+    result = await quality.run(
+        store.task(task_id),
+        include_e2e=True,
+        real_check=2 if environment == "controlled" else None,
+        approved_plan=plan["plan_hash"],
+        before_real=authorized_fixture,
+    )
+    assert verdict(result) == "passed", result["items"]
 
 
 async def test_real_qa_denies_host_secrets_and_requires_explicit_network(
