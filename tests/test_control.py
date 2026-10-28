@@ -161,6 +161,20 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
         else:
             if recovery == "accepted":
                 before = restarted.evidence(task_id)["instructions"][-1]
+                comments.post("/gongcao step")
+                comments.post("/gongcao auto")
+                await controls.poll(task_id, copilot, comments)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before  # Conflict cannot retire A.
+                restarted.halt(task_id, State.QUEUED, "publication acknowledgment")
+                restarted.transition(
+                    restarted.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "published"
+                )
+                comments.post("/gongcao until development")
+                await controls.collect(task_id, copilot, comments)
+                controls.apply_pending(task_id, copilot, defer_checkpoint=True)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before  # Reached target cannot retire A.
                 older = comments.post("/gongcao auto")
                 older["id"] = old["id"] - 1  # Previously invisible B predates accepted A.
                 await controls.poll(task_id, copilot, comments)

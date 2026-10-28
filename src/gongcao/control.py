@@ -187,7 +187,7 @@ class Controls:
         safe: bool = False,
         received: dict[str, Any] | None = None,
         defer_checkpoint: bool = False,
-        replace_pending: bool = True,
+        replace_unverified: bool = True,
     ) -> bool:
         with self.transaction():
             task = self.store.task(task_id)
@@ -237,10 +237,26 @@ class Controls:
                     reason = (
                         "Existing PR analysis proceeds directly to review; target is unreachable"
                     )
+            if (
+                not reason
+                and mode == "pause"
+                and not replace_unverified
+                and not control.get("spent")
+                and self.db.execute(
+                    "SELECT 1 FROM instructions WHERE task_id=? AND id=? "
+                    "AND status='accepted' AND reason!=''",
+                    (task_id, control.get("command_id")),
+                ).fetchone()
+            ):
+                # Controller pauses preserve an unverified receipt and its ID-order constraint.
+                self.save(task_id, control | {"pause_requested": True})
+                if not defer_checkpoint:
+                    self.checkpoint(task_id)
+                return True
             self.record(task_id, command_id, data, "rejected" if reason else "accepted", reason)
             if reason:
                 return False
-            if received is None and replace_pending:
+            if received is None and replace_unverified:
                 self.db.execute(
                     "UPDATE instructions SET status='superseded',reason='New local instruction' "
                     "WHERE task_id=? AND status='pending'",
@@ -447,7 +463,7 @@ class Controls:
                     "pause",
                     safe=True,
                     defer_checkpoint=defer_checkpoint,
-                    replace_pending=False,
+                    replace_unverified=False,
                 )
                 control = self.store.task(task_id)["control"]
                 self.save(task_id, control | {"pause_reason": "Conflicting GitHub instructions"})
@@ -470,7 +486,7 @@ class Controls:
                 if reached and defer_checkpoint and data["target"] == "development":
                     self.mark(task_id, key, "rejected", "Target entry completed during publication")
                     self.issue(
-                        task_id, "pause", safe=True, defer_checkpoint=True, replace_pending=False
+                        task_id, "pause", safe=True, defer_checkpoint=True, replace_unverified=False
                     )
                     return
                 accepted = self.issue(
