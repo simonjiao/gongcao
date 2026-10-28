@@ -2,6 +2,8 @@
 
 - Use Python 3.12+ and `uv`. Manage metadata, dependencies and tool configuration in
   `pyproject.toml`; commit `uv.lock` and keep CI on `uv sync --locked`.
+- Keep this repository's GitHub Actions workflows manual-only with `workflow_dispatch`,
+  including newly added workflows. Add automatic triggers only when the user explicitly requests them.
 - Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`, and
   `uv run pytest -q` before proposing a change. pytest enables beartype for `gongcao` and `qa`.
 - Keep stages separate from execution states. Only the controller changes either;

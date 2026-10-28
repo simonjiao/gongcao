@@ -31,6 +31,13 @@ Ruff 检查代码和格式，mypy 严格检查静态类型，pytest 执行行为
 [beartype](https://beartype.readthedocs.io/en/latest/api_claw/)
 对 `gongcao` 函数启用运行时类型检查。CI 在 Python 3.12/3.13 上执行同样的检查。
 
+本仓库的 GitHub Actions 仅手动触发，推送提交或更新 PR 不会自动运行 CI。
+需要检查时，在 GitHub 的 **Actions → CI → Run workflow** 中选择待检查分支，
+或执行 `gh workflow run ci.yml --repo simonjiao/gongcao --ref <branch>`。
+新增工作流也应仅使用 `workflow_dispatch`。
+调度器的 CI 门禁目前只接受绑定当前 PR/base/head 的 `pull_request` 运行；
+手动运行不能满足该门禁，因此使用调度器处理本仓库任务时，必需的 CI 门禁会保持等待。
+
 ## 运行单个任务
 
 先用 `gh auth login` 登录 GitHub。SDK 默认读取 `~/.codex/auth.json` 的模型认证，
