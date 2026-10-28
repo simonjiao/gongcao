@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -86,7 +86,21 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
             if "mypy" in body:
                 add("build", ["uv", "run", "--locked", "mypy"], ".")
             if "pytest" in body:
-                add("internal", ["uv", "run", "--locked", "pytest", "-q"], "tests")
+                add(
+                    "internal",
+                    [
+                        "uv",
+                        "run",
+                        "--locked",
+                        "python",
+                        "-c",
+                        "from qa.scenarios import pytest_snapshot_script; "
+                        "exec(pytest_snapshot_script())",
+                    ]
+                    if "qa/scenarios.py" in files
+                    else ["uv", "run", "--locked", "pytest", "-q"],
+                    "tests",
+                )
             cli = [p for p in files if p.startswith("tests/") and p.endswith("_cli.py")]
             if cli:
                 add("e2e", ["uv", "run", "--locked", "pytest", "-q", *cli], "tests/*_cli.py")
@@ -108,3 +122,22 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
                 ).model_dump()
             )
     return items
+
+
+def controlled_entry(workspace: Path, argv: list[str]) -> None:
+    if len(argv) == 5 and argv[0:2] == ["npm", "--prefix"] and argv[3:] == ["run", "test:e2e"]:
+        package = (workspace / argv[2] / "package.json").resolve()
+        if package.is_relative_to(workspace) and package.is_file():
+            if "test:e2e" in json.loads(package.read_text()).get("scripts", {}):
+                return
+    script = (
+        argv[1]
+        if len(argv) > 1 and argv[0] in {"{python}", "python", "python3", "bash", "sh"}
+        else argv[0]
+        if argv
+        else ""
+    )
+    path = (workspace / script).resolve()
+    if script.startswith("qa/") and path.is_file() and path.is_relative_to(workspace / "qa"):
+        return
+    raise ValueError("Real checks must invoke an existing QA script or npm test:e2e entry")

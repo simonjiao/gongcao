@@ -33,6 +33,17 @@ async def observe(
     return {"sha": payload["sha"], "url": payload["url"], "path": payload["path"]}
 
 
+async def observe_link(payload: dict[str, Any], github: GitHub) -> dict[str, Any] | None:
+    rows = [
+        r
+        for r in await github.pages(payload["endpoint"] + "?per_page=100")
+        if r.get("body") == payload["body"]
+    ]
+    if len(rows) > 1:
+        raise UncertainWrite("Duplicate archive links require reconciliation")
+    return {"id": rows[0]["id"]} if rows else None
+
+
 async def publish(
     remote: Controlled, task: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
@@ -57,7 +68,7 @@ async def publish(
         # Only this schema leaves the private state directory; no SQLite, sessions or raw logs.
         manifest = {
             k: result[k]
-            for k in (*binding(task), "plan_hash", "run_id", "items", "started", "ended")
+            for k in (*binding(task), "plan_hash", "run_id", "runtime", "items", "started", "ended")
         }
         clean = Redactor().text(json.dumps(manifest, ensure_ascii=False, indent=2)) + "\n"
         statuses = [f"- {i['category']}: {i['status']} ({i['reason']})" for i in manifest["items"]]
@@ -142,14 +153,7 @@ async def publish(
         body = f"Gongcao evidence ({key}): {confirmed['url']}"
 
         async def linked(endpoint: str = endpoint, body: str = body) -> dict[str, Any] | None:
-            rows = [
-                r
-                for r in await remote.github.pages(endpoint + "?per_page=100")
-                if r.get("body") == body
-            ]
-            if len(rows) > 1:
-                raise UncertainWrite("Duplicate archive links require reconciliation")
-            return {"id": rows[0]["id"]} if rows else None
+            return await observe_link({"endpoint": endpoint, "body": body}, remote.github)
 
         async def link(endpoint: str = endpoint, body: str = body) -> dict[str, Any]:
             return await remote.github.mutate(endpoint, {"body": body})

@@ -200,7 +200,7 @@ async def prepare(run: Run, github: GitHub, model: str | None) -> None:
         str(source),
     )
     await command("git", "checkout", "--detach", run.value["base_sha"], cwd=str(source))
-    for path in ("pyproject.toml", "uv.lock", ".github/workflows/ci.yml", "src/gongcao/cli.py"):
+    for path in ("pyproject.toml", "uv.lock", "src/gongcao/cli.py"):
         require(
             (source / path).is_file(), "This fixture requires a Gongcao-compatible test repository"
         )

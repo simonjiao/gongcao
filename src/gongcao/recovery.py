@@ -63,12 +63,9 @@ class Recovery:
         payload = op["payload"]
         repo = task["snapshot"]["repository"]
         if op["kind"] == "archive-link":
-            rows = [
-                r
-                for r in await self.github.pages(payload["endpoint"] + "?per_page=100")
-                if r.get("body") == payload["body"]
-            ]
-            return {"id": rows[0]["id"]} if len(rows) == 1 else None
+            from .archive import observe_link
+
+            return await observe_link(payload, self.github)
         if op["kind"] == "archive":
             from .archive import observe
 

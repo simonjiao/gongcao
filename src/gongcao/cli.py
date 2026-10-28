@@ -16,7 +16,7 @@ from .leases import Lease
 from .model import State
 from .quality import Quality
 from .recovery import Recovery, diagnose
-from .remote import Controlled
+from .remote import Controlled, UncertainWrite
 from .scheduler import Scheduler
 from .store import Store
 from .workflow import Workflow
@@ -151,9 +151,19 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                 result = result or store.artifact(args.task, "quality-results", plan["plan_hash"])
                 if not result:
                     raise ValueError("No current execution evidence to archive")
-                output(
-                    await publish(Controlled(store, config, github), store.task(args.task), result)
-                )
+                try:
+                    output(
+                        await publish(
+                            Controlled(store, config, github), store.task(args.task), result
+                        )
+                    )
+                except UncertainWrite:
+                    store.halt(
+                        args.task,
+                        State.RECONCILE,
+                        "Archive write unconfirmed; reconcile before retry",
+                    )
+                    raise
             else:
                 output(result or plan)
     elif args.command == "control":

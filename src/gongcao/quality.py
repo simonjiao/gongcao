@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import platform
 import sys
 import time
 import uuid
@@ -11,6 +12,7 @@ from typing import Any
 from .config import Config
 from .control import Controls
 from .events import Redactor
+from .github import command
 from .model import Role, Stage, State
 from .plan import Check, binding, digest, propose
 from .processes import launch, stop
@@ -22,12 +24,26 @@ from .workspace import context, worktree
 class Quality:
     def __init__(self, store: Store, config: Config):
         self.store, self.config = store, config
+        self.runtime = {"python": platform.python_version(), "platform": platform.platform()}
 
-    def confirm(self, task: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
+    def confirm(
+        self,
+        task: dict[str, Any],
+        items: list[dict[str, Any]],
+        *,
+        source: str = "operator",
+        analysis_hash: str = "",
+    ) -> dict[str, Any]:
         checks = [Check.model_validate(item).model_dump() for item in items]
         if {item["category"] for item in checks} != {"build", "internal", "e2e"}:
             raise ValueError("Plan must explicitly cover build, internal and e2e")
-        data = binding(task) | {"items": checks, "policy": self.config.policy_hash}
+        data = binding(task) | {
+            "items": checks,
+            "policy": self.config.policy_hash,
+            "source": source,
+            "analysis_hash": analysis_hash,
+            "runtime": self.runtime,
+        }
         data["plan_hash"] = digest(data)
         previous = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
         if previous == data:
@@ -59,23 +75,41 @@ class Quality:
         return data
 
     async def plan(self, task: dict[str, Any]) -> dict[str, Any]:
-        current = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
-        if current and all(current.get(k) == v for k, v in binding(task).items()):
-            return current
-        data, _ = await context(Path(task["repo_path"]), task, Role.REVIEWER, self.config, None)
-        items = propose(data)
         analyses = [
             json.loads(r["result"])
             for r in self.store.runs(task["id"])
-            if r["role"] == Role.ANALYST and r["state"] == State.COMPLETED and r["result"]
+            if r["role"] == Role.ANALYST
+            and r["state"] == State.COMPLETED
+            and r["result"]
+            and r["evidence_valid"]
+            and r["target_sha"] == task["target_sha"]
+            and json.loads(r["result"])["target_sha"] == task["target_sha"]
         ]
+        proposal = analyses[-1].get("validation_plan", []) if analyses else []
+        current = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
+        if (
+            current
+            and current["source"] == "operator"
+            and all(current.get(k) == v for k, v in binding(task).items())
+            and current["runtime"] != self.runtime
+        ):
+            return self.confirm(task, current["items"])
+        if (
+            current
+            and current["runtime"] == self.runtime
+            and all(current.get(k) == v for k, v in binding(task).items())
+            and (current["source"] == "operator" or current["analysis_hash"] == digest(proposal))
+        ):
+            return current
+        data, _ = await context(Path(task["repo_path"]), task, Role.REVIEWER, self.config, None)
+        items = propose(data)
         for candidate in analyses[-1].get("validation_plan", []) if analyses else []:
             item = Check.model_validate(candidate).model_dump()
             if item["required"] and item["entry"]:
                 items = [i for i in items if i["entry"] or i["category"] != item["category"]]
                 if item not in items:
                     items.append(item)
-        return self.confirm(task, items)
+        return self.confirm(task, items, source="repository", analysis_hash=digest(proposal))
 
     async def run(
         self,
@@ -106,6 +140,7 @@ class Quality:
         isolation = await sandbox.verify(repo)
         started = time.time()
         results = []
+        tainted = False
         for index, item in enumerate(commands):
             if not item["required"]:
                 results.append(item | {"status": "not_applicable"})
@@ -114,7 +149,8 @@ class Quality:
                 results.append(cached["items"][index])
                 continue
             if (
-                not item["entry"]
+                tainted
+                or not item["entry"]
                 or (item["environment"] == "controlled" and index != real_check)
                 or (item["category"] == "e2e" and not include_e2e)
             ):
@@ -135,13 +171,26 @@ class Quality:
                 for arg in argv
             ]
             if item["environment"] == "controlled":
-                entry = next((arg for arg in argv[:2] if arg.startswith("qa/")), "")
-                script = (workspace / entry).resolve()
-                if not entry or not script.is_file() or not script.is_relative_to(workspace / "qa"):
-                    raise ValueError("Real checks must invoke an existing repository qa/ entry")
-                process = await launch(*expanded, cwd=str(workspace))
+                from .plan import controlled_entry
+
+                real_workspace = self.store.root / "worktrees" / f"{key}-real-{index}"
+                await worktree(
+                    repo, real_workspace, task["target_sha"], Role.DEVELOPER, f"{key}-real-{index}"
+                )
+                controlled_entry(real_workspace, argv)
+                process = await launch(*expanded, cwd=str(real_workspace))
             else:
-                process = await launch(*sandbox.argv("/usr/bin/env", "-u", "PYTHONPATH", *expanded))
+                process = await launch(
+                    *sandbox.argv(
+                        "/usr/bin/env",
+                        "-u",
+                        "PYTHONPATH",
+                        "UV_PROJECT_ENVIRONMENT=/tmp/quality-venv",
+                        "UV_CACHE_DIR=/workspace/.venv/uv-cache",
+                        "UV_LINK_MODE=copy",
+                        *expanded,
+                    )
+                )
 
             async def output(
                 stream: asyncio.StreamReader | None, name: str, index: int = index
@@ -202,10 +251,28 @@ class Quality:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
                 await stop(process, readers)
+            checked_workspace = real_workspace if item["environment"] == "controlled" else workspace
+            dirty = await command(
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                cwd=str(checked_workspace),
+            )
+            if dirty:
+                tainted = True
+                code, stderr = (
+                    1,
+                    {"tail": "Source changed or unignored files added; SHA evidence rejected"},
+                )
             results.append(
                 item
                 | {
-                    "status": "passed" if code == 0 else "blocked" if code == 127 else "failed",
+                    "status": "passed"
+                    if code == 0
+                    else "blocked"
+                    if code in {77, 127}
+                    else "failed",
                     "argv": [Redactor().text(arg) for arg in expanded],
                     "exit_code": code,
                     "stdout": stdout,

@@ -196,3 +196,9 @@ For Issue #1 closure, repeat real integrated acceptance at the fixed final `main
 SHA **after** all functional and QA changes have merged, and record that SHA,
 CI/Run/Thread IDs, failure boundaries and cleanup results in the acceptance record.
 Feature-branch evidence does not replace this final integration requirement.
+
+Issue #79 uses version-bound build/internal/e2e plans instead of configured command/CI gates.
+Offline `tests/test_quality.py` exercises actual sandboxes, current-SHA execution, plan invalidation,
+controlled QA entry authorization, and append/readback against a local bare Git repository.
+GitHub archive acceptance is separate and requires explicit `--real` authorization; these transport
+fixtures do not claim real engine/browser acceptance. See `docs/issue79-quality.md`.

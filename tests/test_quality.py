@@ -11,7 +11,7 @@ from gongcao.archive import publish
 from gongcao.config import Config
 from gongcao.github import command
 from gongcao.leases import Lease
-from gongcao.model import Role, State
+from gongcao.model import Role, Stage, State
 from gongcao.plan import propose
 from gongcao.quality import Quality, verdict
 from gongcao.remote import Controlled, UncertainWrite
@@ -203,3 +203,69 @@ async def test_archive_append_redaction_readback_and_unknown_write(
     bad = payload | {"hashes": {"manifest.json": "0" * 64}}
     with pytest.raises(UncertainWrite, match="hash mismatch"):
         await archive.observe(task, bad, fixture_github)
+
+
+async def test_invalid_analysis_cannot_fill_a_current_plan(store, task_id):
+    task = store.task(task_id)
+    quality = Quality(store, Config())
+    before = await quality.plan(task)
+    run = store.begin_run(task_id, Role.ANALYST)
+    proposal = items(["true"])
+    for item in proposal:
+        item["reason"] = "STALE_ANALYSIS_SENTINEL"
+    store.finish(
+        run,
+        State.COMPLETED,
+        Stage.DEVELOPMENT,
+        State.QUEUED,
+        "analysis",
+        json.dumps({"target_sha": task["target_sha"], "validation_plan": proposal}),
+    )
+    current = await quality.plan(store.task(task_id))
+    assert current["plan_hash"] != before["plan_hash"]
+    store.sync(task_id, task["snapshot"] | {"body": "New requirements"})
+    renewed = await quality.plan(store.task(task_id))
+    assert all(item["reason"] != "STALE_ANALYSIS_SENTINEL" for item in renewed["items"])
+
+
+def test_controlled_entry_matches_actual_invocation(tmp_path):
+    from gongcao.plan import controlled_entry
+
+    (tmp_path / "qa").mkdir()
+    (tmp_path / "qa/probe.py").touch()
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend/package.json").write_text('{"scripts":{"test:e2e":"playwright test"}}')
+    controlled_entry(tmp_path, ["npm", "--prefix", "frontend", "run", "test:e2e"])
+    controlled_entry(tmp_path, ["python3", "qa/probe.py"])
+    with pytest.raises(ValueError, match="invoke"):
+        controlled_entry(tmp_path, ["cp", "qa/probe.py", "/tmp/outside"])
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+async def test_check_cannot_change_fixed_sha_or_feed_code_to_host_qa(
+    store, task_id, repo, tmp_path, ignored
+):
+    sentinel = tmp_path / "host-private-sentinel"
+    sentinel.write_text("HOST_ONLY_DUMMY_DATA")
+    (repo / "qa").mkdir()
+    (repo / "qa/probe.py").write_text(
+        "try:\n import generated\nexcept ImportError:\n print('approved')\n"
+    )
+    (repo / ".gitignore").write_text("qa/generated.py\n**/__pycache__/\n")
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "QA boundary probe", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": sha})
+    quality = Quality(store, Config())
+    checks = items(["{python}", "qa/probe.py"], "controlled")
+    target = "qa/generated.py" if ignored else "qa/probe.py"
+    payload = f"print(open({str(sentinel)!r}).read())\n"
+    checks[0]["entry"] = ["{python}", "-c", f"open({target!r},'w').write({payload!r})"]
+    plan = quality.confirm(store.task(task_id), checks)
+    result = await quality.run(
+        store.task(task_id), include_e2e=True, real_check=2, approved_plan=plan["plan_hash"]
+    )
+    assert verdict(result) == ("passed" if ignored else "failed")
+    assert "HOST_ONLY_DUMMY_DATA" not in json.dumps(result)
+    if ignored:
+        assert result["items"][-1]["stdout"]["tail"].strip() == "approved"

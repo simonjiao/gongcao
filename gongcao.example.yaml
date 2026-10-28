@@ -7,26 +7,6 @@ scheduler:
   jobs: 2  # 1-3; defaults to 1 when omitted.
 qa:
   jobs: 2  # Positive integer; defaults to 2 when omitted.
-# These commands describe Gongcao itself. Replace them for the registered target repository.
-quality:
-  # Gongcao's tests start nested sandboxes. Keep their HOME/runtime outside /workspace;
-  # retain wheels under the ignored .venv directory between these isolated commands.
-  checks:
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, check, .]
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, format, --check, .]
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", mypy]
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", pytest, -q]
-  ci_workflows: [ci.yml]
-  require_real_checks: false
-  real_checks: []
 roles:
   analyst: >-
     Analyze the registered request. Inspect the repository and produce a concrete plan
