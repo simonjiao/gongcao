@@ -14,8 +14,8 @@
   writes and exact-SHA quality gates. Agents
   never receive GitHub credentials; only the controller publishes commits/PRs/review comments.
   A same-account Agent COMMENT is never a formal GitHub approval. Never auto-merge or publish.
-- Configure checks and required CI workflows for the target repository; do not hard-code
-  Gongcao's tools for other projects. Schema changes require versioned upgrade/restart tests.
+- Derive version-bound validation plans from the target repository and task; do not hard-code
+  Gongcao's tools for other projects or require GitHub CI. Schema changes require versioned upgrade/restart tests.
 - The third stage uses shared-state leases and OS locks. Never clear unknown writes,
   uncertain descendant cleanup or another owner's resource reservation to force progress.
   Recovery preserves interrupted work and creates fresh sessions; see docs/stage3.md.

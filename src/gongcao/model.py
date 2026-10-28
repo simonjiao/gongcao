@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .plan import Check
+
 VERSION_FIELDS = (
     "title",
     "body",
@@ -63,13 +65,14 @@ class Role(StrEnum):
 
 
 class AgentResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", json_schema_serialization_defaults_required=True)
 
     conclusion: str = Field(pattern="^(ready|revise|blocked|failed)$")
     summary: str = Field(min_length=1, max_length=8000)
     basis: list[str] = Field(min_length=1, max_length=50)
     target_sha: str = Field(pattern="^[0-9a-f]{40,64}$")
     next_steps: list[str] = Field(min_length=1, max_length=50)
+    validation_plan: list[Check] = Field(default_factory=list)
 
 
 def after_run(stage: Stage, role: Role, result: AgentResult, sha: str) -> tuple[Stage, State, str]:

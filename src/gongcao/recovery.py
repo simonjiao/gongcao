@@ -62,6 +62,14 @@ class Recovery:
     async def observe(self, task: dict[str, Any], op: dict[str, Any]) -> dict[str, Any] | None:
         payload = op["payload"]
         repo = task["snapshot"]["repository"]
+        if op["kind"] == "archive-link":
+            from .archive import observe_link
+
+            return await observe_link(payload, self.github)
+        if op["kind"] == "archive":
+            from .archive import observe
+
+            return await observe(task, payload, self.github)
         if op["kind"] == "push":
             refs = (
                 await command(
@@ -306,7 +314,7 @@ class Recovery:
                 )
                 self.store.db.execute(
                     "UPDATE artifacts SET valid=0 WHERE task_id=? "
-                    "AND kind IN ('checks','real','validation')",
+                    "AND kind IN ('quality-results','validation')",
                     (task_id,),
                 )
                 self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))

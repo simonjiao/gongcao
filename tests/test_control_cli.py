@@ -30,11 +30,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         )
     )
     config = tmp_path / "config.yaml"
-    config.write_text(
-        f"auth_file: {auth_file}\ncopilot:\n  mode: step\n  operators: [owner]\nquality:\n"
-        "  ci_workflows: [ci.yml]\n"
-        "  checks: [['{python}', '-c', \"assert open('sample.txt').read() == 'complete\\\\n'\"]]\n"
-    )
+    config.write_text(f"auth_file: {auth_file}\ncopilot:\n  mode: step\n  operators: [owner]\n")
     root = Path(__file__).resolve().parents[1]
     env = {
         **os.environ,
@@ -113,7 +109,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
     assert published["pr_number"] == 9 and published["target_sha"] != sha
     cli("control", number, "--until", "validation", "--config", str(config))
     reviewed = drive(Stage.VALIDATION)
-    assert [r["role"] for r in reviewed["runs"]] == ["analyst", "developer", "reviewer"]
+    assert [r["role"] for r in reviewed["runs"]] == ["analyst", "developer", "analyst", "reviewer"]
     cli("control", number, "--auto", "--config", str(config))
     cli("run", number, "--config", str(config))
     final = cli("inspect", number)
@@ -121,7 +117,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
     assert final["id"] == published["id"] and final["pr_number"] == published["pr_number"]
     assert final["target_sha"] == published["target_sha"] == reviewed["target_sha"]
     assert all(op["state"] == "succeeded" for op in final["evidence"]["operations"])
-    assert len(final["runs"]) == len({r["thread_id"] for r in final["runs"]}) == 4
+    assert len(final["runs"]) == len({r["thread_id"] for r in final["runs"]}) == 5
     before = fixture.read_text(), [r["id"] for r in final["runs"]]
     cli("run", number, "--config", str(config))
     assert before == (fixture.read_text(), [r["id"] for r in cli("inspect", number)["runs"]])

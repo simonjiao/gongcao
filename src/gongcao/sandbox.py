@@ -25,6 +25,7 @@ class Sandbox:
     workspace: Path
     run_dir: Path
     role: Role
+    controller_runtime: bool = True
 
     def prepare(self, config: Config, *, authentication: bool = True) -> list[str]:
         if sys.platform != "linux" or shutil.which("bwrap") is None:
@@ -117,16 +118,27 @@ class Sandbox:
             if Path(mount).exists():
                 args += ["--ro-bind", mount, mount]
         # uv-managed Python and CI interpreters may live outside /usr; include only their roots.
-        for prefix in {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}:
+        prefixes = {Path(sys.base_prefix).resolve()}
+        if self.controller_runtime:
+            prefixes.add(Path(sys.prefix).resolve())
+        for prefix in prefixes:
             if not prefix.is_relative_to("/usr"):
                 args += ["--ro-bind", str(prefix), str(prefix)]
+        # Only SDK workers need the controller implementation and its dependencies.
+        # Project checks must resolve code from their fixed-SHA workspace/environment.
+        if self.controller_runtime:
+            args += [
+                "--ro-bind",
+                str(Path(__file__).resolve().parent.parent),
+                "/app",
+                "--setenv",
+                "PYTHONPATH",
+                "/app",
+            ]
         args += [
             "--ro-bind",
             uv.find_uv_bin(),
             "/tools/uv",
-            "--ro-bind",
-            str(Path(__file__).resolve().parent.parent),
-            "/app",
             "--bind",
             str(self.run_dir / "home"),
             "/home/agent",
@@ -145,9 +157,6 @@ class Sandbox:
             "--setenv",
             "PATH",
             "/tools:/usr/bin:/bin",
-            "--setenv",
-            "PYTHONPATH",
-            "/app",
             "--setenv",
             "LANG",
             "C.UTF-8",
@@ -215,7 +224,9 @@ print(json.dumps({'host_credentials': 'blocked', 'host_repository': 'blocked',
         try:
             output = await command(
                 *self.argv(
-                    sys.executable,
+                    sys.executable
+                    if self.controller_runtime
+                    else str(Path(sys.base_prefix) / "bin/python3"),
                     "-c",
                     script,
                     json.dumps(blocked),

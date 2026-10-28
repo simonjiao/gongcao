@@ -71,19 +71,27 @@ run 在前台推进已登记任务，直到外部依赖未满足、人工介入�
 它会由控制器提交/推送分支、创建草稿 PR、发布 COMMENT 评审并转为可审查；不会合并或发布。
 可在另一个终端观察日志或取消；没有新日志不代表超时，配置期限约束每次 Agent/检查执行。
 
-YAML 的 quality 必须按目标仓库配置：checks 为命令参数列表，ci_workflows 为必须成功的
-GitHub Actions workflow 文件名；需要真实验证时设置 require_real_checks 并提供 real_checks。
-缺少配置会等待环境，不执行 GitHub 写入。示例文件中的 Ruff/mypy/pytest 只适用于 Gongcao。
-检查使用独立 Worktree、没有模型认证的沙箱，不继承 Gongcao 的 Python 导入路径。
+验证计划按目标版本的 AGENTS.md、构建入口、Issue 和实际 PR 差异生成，不配置全局质量命令，
+也不依赖 GitHub CI。每项记录 build/internal/e2e、入口、范围、必要性、原因和环境；缺少必需
+入口或真实环境会阻断验收。普通检查在固定 SHA、无凭据 Bubblewrap 中执行。
+
+`gongcao quality TASK` 查看计划；把输出保存后修改 items，用 `--plan FILE` 确认当前版本计划。
+`--run` 执行普通检查；真实 QA 需明确选择 `--run --real --real-check INDEX --plan-hash HASH`，
+且入口必须属于目标版本已有 qa/ 脚本。Agent 建议不是通过证据。
+同 SHA 修改计划也会使旧检查及 Reviewer/Validator 结论失效。
+
+`gongcao quality TASK --archive --real` 把当前执行结果追加到独立证据分支，并在 Issue/PR
+记录固定 commit 链接；失败结果同样保留，原始日志/SQLite/会话留在本地。
+详见 [#79 验证与归档](docs/validation-evidence.md)。
 
 每个角色使用独立上下文/线程；审查只读。修订最多 max_revisions 次，超限转人工。
-等待 CI 时可稍后再次 run；只读重新核验当前 SHA 的事实，不重复发布已确认的远端对象。
+缺环境时可在补齐证据后再次 run，不重复发布已确认的远端对象。
 同身份 Agent 的 COMMENT 不算 GitHub 正式批准，GitHub 的保护规则仍必须满足。
 GitHub PR head、base SHA/目标分支或请求正文/标题变化会使旧证据失效。
 关闭的对象进入 needs_human，重新打开也不会自动恢复；旧结果不能继续推进。
 recover 先核对进程、会话引用、工作区和远端事实；无法确认时仍待核对，不重放副作用。
 retry 是显式人工重试，检查/审查证据重新建立，旧工作区保留；不要修改数据库绕过状态。
-serve 启动时核对遗留执行，连续三次执行/环境失败后转人工处理，普通 CI 等待不计失败。
+serve 启动时核对遗留执行，连续三次执行/环境失败后转人工处理，外部依赖等待不计失败。
 并行数统一使用 `--jobs`；正式 `serve` 取命令行显式值、YAML `scheduler.jobs`、默认 1
 中优先级最高的一项，且只接受整数 1–3。旧选项 `--concurrency` 已移除。
 同一 YAML 的 `qa.jobs` 只控制 QA 批次，默认 2，接受任意正整数；两类任务额度独立。

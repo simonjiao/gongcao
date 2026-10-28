@@ -8,26 +8,32 @@ import pytest
 from test_runner import install_worker
 
 from gongcao.config import Config
-from gongcao.github import GitHub, checkout_sha, command
+from gongcao.github import GitHub, command
 from gongcao.model import Role, Stage, State
-from gongcao.quality import Quality, ci_gate
+from gongcao.quality import Quality
 from gongcao.remote import Controlled, UncertainWrite
 from gongcao.store import Store
 from gongcao.workflow import Workflow
 
 WORKER = """
 import json, pathlib, sys, uuid
+from gongcao.plan import propose
 data = json.loads(sys.stdin.readline())['context']
 role = data['role']
 sample = pathlib.Path('/workspace/sample.txt')
 if role == 'developer':
     sample.write_text('complete\\n' if data['confirmed_findings'] else 'incomplete\\n')
 conclusion = 'revise' if role == 'reviewer' and sample.read_text() == 'incomplete\\n' else 'ready'
+plan = propose(data) if role=='analyst' else []
+for item in plan:
+    if item['category']=='e2e':
+        item.update(required=False,reason='Offline protocol fixture; real E2E is not claimed')
 print(json.dumps({'kind':'thread','data':{'thread_id':str(uuid.uuid4())}}))
 print(json.dumps({'kind':'result','data':{
     'conclusion':conclusion,'summary':'Inspected the exact worktree',
     'basis':['sample.txt must be complete'],'target_sha':data['target_sha'],
-    'next_steps':['Fix incomplete output' if conclusion=='revise' else 'Check controller gates']}}))
+    'next_steps':['Fix incomplete output' if conclusion=='revise' else 'Check controller gates'],
+    'validation_plan':plan}}))
 """
 
 
@@ -154,19 +160,7 @@ def fixture_github(tmp_path, repo, sha, snapshot, monkeypatch):
 
 @pytest.fixture
 def policy(auth_file):
-    return Config(
-        auth_file=auth_file,
-        checks=[["{python}", "-c", "from pathlib import Path; assert Path('sample.txt').exists()"]],
-        real_checks=[
-            [
-                "{python}",
-                "-c",
-                "from pathlib import Path; assert Path('sample.txt').read_text()=='complete\\n'",
-            ]
-        ],
-        ci_workflows=["ci.yml"],
-        require_real_checks=True,
-    )
+    return Config(auth_file=auth_file)
 
 
 async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
@@ -183,14 +177,16 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
     assert [r["role"] for r in runs] == [
         "analyst",
         "developer",
+        "analyst",
         "reviewer",
         "developer",
+        "analyst",
         "reviewer",
         "validator",
     ]
-    assert len({r["thread_id"] for r in runs}) == 6
-    assert len({r["worktree"] for r in runs}) == 6
-    assert not [r for r in runs[:-2] if r["evidence_valid"]]
+    assert len({r["thread_id"] for r in runs}) == 8
+    assert len({r["worktree"] for r in runs}) == 8
+    assert not [r for r in runs if r["target_sha"] != task["target_sha"] and r["evidence_valid"]]
     assert all(
         payload["event"] == "COMMENT"
         for path, payload in fixture_github.writes
@@ -201,23 +197,21 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
         store.db.execute('SELECT count(*) FROM operations WHERE state="succeeded"').fetchone()[0]
         == 6
     )
-    context = json.loads((store.root / "runs" / runs[2]["id"] / "context.json").read_text())
+    context = json.loads((store.root / "runs" / runs[3]["id"] / "context.json").read_text())
     assert context["confirmed_analysis"] is None
     assert context["quality_evidence"]["passed"]
-    assert context["diff"]["head_sha"] == runs[2]["target_sha"]
-    assert store.artifact(task_id, "real", policy.policy_hash)["passed"]
+    assert context["diff"]["head_sha"] == runs[3]["target_sha"]
+    assert (await Quality(store, policy).run(task, include_e2e=True))["passed"]
     # Repeating the command neither calls a new agent nor duplicates any remote mutation.
     writes = len(fixture_github.writes)
     assert await Workflow(store, policy, fixture_github).run(task_id) == []
     assert len(fixture_github.writes) == writes
 
 
-@pytest.mark.parametrize("blocker", ["pending_ci", "formal_approval", "revision_limit"])
+@pytest.mark.parametrize("blocker", ["formal_approval", "revision_limit"])
 async def test_missing_external_evidence_cannot_be_replaced_by_agent_claims(
     store, task_id, fixture_github, policy, blocker
 ):
-    if blocker == "pending_ci":
-        fixture_github.ci = None
     if blocker == "formal_approval":
         fixture_github.decision = "REVIEW_REQUIRED"
     if blocker == "revision_limit":
@@ -240,12 +234,11 @@ async def test_changed_quality_policy_invalidates_review_and_validation(
     old = [r["id"] for r in store.runs(task_id) if r["role"] == "reviewer" and r["evidence_valid"]]
     changed = replace(
         policy,
-        checks=[["{python}", "-c", "raise SystemExit(1)"]],
-        ci_workflows=["ci.yml"],
+        model="changed-policy",
         max_revisions=0,
     )
     await Workflow(store, changed, fixture_github).run(task_id)
-    assert store.task(task_id)["state"] == State.HUMAN
+    assert store.task(task_id)["state"] == State.COMPLETED
     assert not [r for r in store.runs(task_id) if r["id"] in old and r["evidence_valid"]]
     assert store.artifact(task_id, "validation", policy.policy_hash) is None
 
@@ -301,9 +294,9 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
 
 def test_target_change_invalidates_quality_artifacts(store, task_id, snapshot):
     task = store.task(task_id)
-    store.record(task, "checks", "policy", {"passed": True})
+    store.record(task, "quality-results", "policy", {"passed": True})
     store.sync(task_id, snapshot | {"base_sha": "0" * 40})
-    assert store.artifact(task_id, "checks", "policy") is None
+    assert store.artifact(task_id, "quality-results", "policy") is None
 
 
 @pytest.mark.parametrize("run_state", ["completed", "running"])
@@ -371,87 +364,6 @@ def test_future_schema_is_rejected_without_rewriting(tmp_path):
     db.close()
 
 
-def test_ci_must_belong_to_required_workflow_branch_and_exact_sha(sha, snapshot):
-    task = {
-        "target_sha": sha,
-        "pr_number": 9,
-        "snapshot": snapshot | {"head_ref": "work", "base_sha": "1" * 40, "base_ref": "main"},
-    }
-    facts = {
-        "headRefOid": sha,
-        "workflows": [
-            {
-                "id": 1,
-                "head_sha": "0" * 40,
-                "event": "pull_request",
-                "head_branch": "work",
-                "path": ".github/workflows/ci.yml",
-                "status": "completed",
-                "conclusion": "success",
-            }
-        ],
-    }
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
-    facts["workflows"][0]["head_sha"] = sha
-    facts["workflows"][0]["target_proof"] = {
-        "pr_number": 9,
-        "repository": snapshot["repository"],
-        "head_sha": sha,
-        "base_sha": "1" * 40,
-        "base_ref": "main",
-        "run_id": 1,
-        "attempt": 1,
-    }
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.COMPLETED
-    facts["workflows"][0]["conclusion"] = "skipped"
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
-    facts["workflows"][0]["conclusion"] = "failure"
-    facts["workflows"][0]["target_proof"]["failure_tail"] = "Confirmed test failure"
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.FAILED
-    facts["workflows"][0]["conclusion"] = "cancelled"
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
-
-
-@pytest.mark.parametrize("conclusion", ["success", "failure"])
-@pytest.mark.parametrize(
-    "field,value", [("pr_number", 10), ("base_sha", "2" * 40), ("base_ref", "release")]
-)
-def test_ci_from_another_pr_or_old_base_never_satisfies_gate(
-    snapshot, sha, field, value, conclusion
-):
-    task = {
-        "target_sha": sha,
-        "pr_number": 9,
-        "snapshot": snapshot | {"head_ref": "work", "base_ref": "main", "base_sha": "1" * 40},
-    }
-    proof = {
-        "repository": snapshot["repository"],
-        "pr_number": 9,
-        "head_sha": sha,
-        "base_ref": "main",
-        "base_sha": "1" * 40,
-        "run_id": 1,
-        "attempt": 1,
-    }
-    proof[field] = value
-    facts = {
-        "headRefOid": sha,
-        "workflows": [
-            {
-                "id": 1,
-                "head_sha": sha,
-                "head_branch": "work",
-                "event": "pull_request",
-                "path": ".github/workflows/ci.yml",
-                "status": "completed",
-                "conclusion": conclusion,
-                "target_proof": proof,
-            }
-        ],
-    }
-    assert ci_gate(task, facts, ["ci.yml"])[0] == State.WAITING_DEPENDENCY
-
-
 @pytest.mark.parametrize(
     "change", ["head_after_ready", "base_after_ready", "head_after_review", "merged"]
 )
@@ -489,113 +401,12 @@ async def test_policy_change_can_publish_new_same_sha_review(
     sha = store.task(task_id)["target_sha"]
     changed = replace(
         policy,
-        checks=policy.checks + [["{python}", "-c", "assert 1+1==2"]],
-        ci_workflows=policy.ci_workflows,
+        model="changed-policy",
     )
     await Workflow(store, changed, fixture_github).run(task_id)
     assert store.task(task_id)["stage"] == Stage.MERGEABLE, store.task(task_id)["reason"]
     assert store.task(task_id)["target_sha"] == sha
     assert len(fixture_github.reviews) == 3
-
-
-def checkout_log(number, sha):
-    return "\n".join(
-        [
-            "2026-01-01T00:00:00Z ##[group]Run actions/checkout@v4",
-            "2026-01-01T00:00:00Z [command]/usr/bin/git checkout --progress --force "
-            f"refs/remotes/pull/{number}/merge",
-            "2026-01-01T00:00:00Z [command]/usr/bin/git log -1 --format=%H",
-            f"2026-01-01T00:00:00Z {sha}",
-            "2026-01-01T00:00:00Z ##[group]Run user test",
-        ]
-    )
-
-
-@pytest.mark.parametrize("valid", [True, False])
-@pytest.mark.parametrize("checkout_conclusion", ["success", "missing", "failure"])
-async def test_ci_checkout_proof_requires_exact_merge_parents(
-    snapshot, sha, monkeypatch, valid, checkout_conclusion
-):
-    github = GitHub()
-    task = {
-        "target_sha": sha,
-        "pr_number": 9,
-        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
-    }
-    log = checkout_log(9, "3" * 40)
-
-    async def pages(*args):
-        if "/timeline?" in args[0]:
-            return []
-        return [
-            {
-                "id": 2,
-                "conclusion": "success",
-                "steps": (
-                    [{"name": "Run actions/checkout@v4", "conclusion": checkout_conclusion}]
-                    if checkout_conclusion != "missing"
-                    else []
-                ),
-            }
-        ]
-
-    async def read(*args):
-        return {"parents": [{"sha": "1" * 40 if valid else "2" * 40}, {"sha": sha}]}
-
-    async def logs(*args):
-        return log
-
-    monkeypatch.setattr(github, "pages", pages)
-    monkeypatch.setattr(github, "read", read)
-    monkeypatch.setattr("gongcao.github.command", logs)
-    result = await github.checkout_proof(
-        task,
-        {"id": 1, "run_attempt": 1, "created_at": "2026-01-01T00:00:00Z", "conclusion": "success"},
-    )
-    assert (result is not None) == (valid and checkout_conclusion != "failure")
-    assert checkout_sha(log, 10) is None
-    assert checkout_sha(log.replace("Run actions/checkout@v4", "Run user echo"), 9) is None
-
-
-@pytest.mark.parametrize("after", [False, True])
-async def test_checkout_proof_cannot_relabel_same_sha_ci_after_retarget(
-    snapshot, sha, monkeypatch, after
-):
-    github = GitHub()
-    task = {
-        "pr_number": 9,
-        "target_sha": sha,
-        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "release"},
-    }
-
-    async def pages(path, *args):
-        if "/timeline?" in path:
-            return [{"event": "base_ref_changed", "created_at": "2026-01-01T00:00:01Z"}]
-        return [
-            {
-                "id": 2,
-                "conclusion": "success",
-                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
-            }
-        ]
-
-    async def read(*args):
-        return {"parents": [{"sha": "1" * 40}, {"sha": sha}]}
-
-    async def logs(*args):
-        return checkout_log(9, "3" * 40)
-
-    monkeypatch.setattr(github, "pages", pages)
-    monkeypatch.setattr(github, "read", read)
-    monkeypatch.setattr("gongcao.github.command", logs)
-    run = {
-        "id": 1,
-        "conclusion": "success",
-        "run_attempt": 2,
-        "created_at": "2026-01-01T00:00:02Z" if after else "2026-01-01T00:00:00Z",
-    }
-    proof = await github.checkout_proof(task, run)
-    assert (proof is not None) == after
 
 
 async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
@@ -610,110 +421,29 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
     assert "--slurp" not in calls[0]
 
 
-@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
-async def test_failed_ci_carries_bound_and_redacted_failure_log(
-    snapshot, sha, monkeypatch, conclusion
-):
-    github = GitHub()
-    task = {
-        "pr_number": 9,
-        "target_sha": sha,
-        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
-    }
-
-    async def pages(path, *args):
-        if "/timeline?" in path:
-            return []
-        return [
-            {
-                "id": 2,
-                "conclusion": "failure",
-                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
-            }
-        ]
-
-    async def read(*args):
-        return {"parents": [{"sha": "1" * 40}, {"sha": sha}]}
-
-    async def logs(*args):
-        return (
-            checkout_log(9, "3" * 40)
-            + "\nModuleNotFoundError: fixture\nkey=github_pat_"
-            + "PRIVATESEGMENT" * 100
-            + " "
-            + "x" * 19850
-        )
-
-    monkeypatch.setattr(github, "pages", pages)
-    monkeypatch.setattr(github, "read", read)
-    monkeypatch.setattr("gongcao.github.command", logs)
-    proof = await github.checkout_proof(
-        task,
-        {"id": 1, "run_attempt": 1, "conclusion": conclusion, "created_at": "2026-01-01T00:00:00Z"},
+async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id, planned_quality):
+    quality = planned_quality(
+        ["{python}", "-c", "print('github_pat_'+'PRIVATESEGMENT'*100+' '+'x'*19850)"]
     )
-    if conclusion == "cancelled":
-        assert proof is None
-        return
-    assert "ModuleNotFoundError" in proof["failure_tail"]
-    assert "PRIVATESEGMENT" not in proof["failure_tail"]
-    assert proof["pr_number"] == 9 and proof["head_sha"] == sha
-
-
-async def test_environment_failure_cannot_use_another_successful_job_as_failure_evidence(
-    snapshot, sha, monkeypatch
-):
-    github = GitHub()
-    task = {
-        "pr_number": 9,
-        "target_sha": sha,
-        "snapshot": snapshot | {"base_sha": "1" * 40, "base_ref": "main"},
-    }
-
-    async def pages(path, *args):
-        if "/timeline?" in path:
-            return []
-        return [
-            {"id": 2, "conclusion": "failure", "steps": []},
-            {
-                "id": 3,
-                "conclusion": "success",
-                "steps": [{"name": "Run actions/checkout@v4", "conclusion": "success"}],
-            },
-        ]
-
-    monkeypatch.setattr(github, "pages", pages)
-    proof = await github.checkout_proof(
-        task,
-        {"id": 1, "run_attempt": 1, "conclusion": "failure", "created_at": "2026-01-01T00:00:00Z"},
-    )
-    assert proof is None
-
-
-async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id):
-    config = Config(
-        checks=[["{python}", "-c", "print('github_pat_'+'PRIVATESEGMENT'*100+' '+'x'*19850)"]]
-    )
-    data = await Quality(store, config).run(store.task(task_id), "checks")
-    output = data["commands"][0]["stdout"]
+    data = await quality.run(store.task(task_id))
+    output = data["items"][0]["stdout"]
     assert output["truncated"] and data["passed"]
     assert "PRIVATESEGMENT" not in output["tail"]
 
 
-async def test_quality_imports_target_code_and_has_no_model_auth(store, task_id):
-    config = Config(
-        checks=[
-            [
-                "{python}",
-                "-c",
-                "import importlib.util, os; from pathlib import Path; "
-                "assert importlib.util.find_spec('gongcao') is None; "
-                "assert 'PYTHONPATH' not in os.environ; "
-                "assert (Path.home()/'.codex/auth.json').read_text() == '{}'",
-            ]
+async def test_quality_imports_target_code_and_has_no_model_auth(store, task_id, planned_quality):
+    quality = planned_quality(
+        [
+            "{python}",
+            "-c",
+            "import importlib.util, os; from pathlib import Path; "
+            "assert importlib.util.find_spec('gongcao') is None; "
+            "assert 'PYTHONPATH' not in os.environ; "
+            "assert (Path.home()/'.codex/auth.json').read_text() == '{}'",
         ]
     )
-    data = await Quality(store, config).run(store.task(task_id), "checks")
-    assert data["passed"], data["commands"]
+    data = await quality.run(store.task(task_id))
+    assert data["passed"], data["items"]
 
 
 async def test_cancelled_quality_command_has_terminal_cancel_state(
@@ -724,9 +454,9 @@ async def test_cancelled_quality_command_has_terminal_cancel_state(
     started = asyncio.Event()
     original = Quality.run
 
-    async def check(self, task, kind):
+    async def check(self, task, **kwargs):
         started.set()
-        return await original(self, task, kind)
+        return await original(self, task, **kwargs)
 
     monkeypatch.setattr(Quality, "run", check)
     future = asyncio.create_task(Workflow(store, policy, fixture_github).run(task_id))

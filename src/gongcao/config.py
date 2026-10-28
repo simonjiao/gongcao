@@ -12,12 +12,15 @@ from .github import Target
 from .model import Role
 
 PROMPTS = {
-    Role.ANALYST: "Analyze the request and give a concrete implementation plan. Read only.",
+    Role.ANALYST: "Analyze the request and give a concrete implementation plan. "
+    "Propose validation_plan items for build/internal/e2e using repository entries, "
+    "scope, required, reason and sandbox/controlled environment. Read only.",
     Role.DEVELOPER: "Implement the confirmed analysis or current-SHA revision findings "
     "in the assigned workspace. Run relevant tests.",
     Role.REVIEWER: "Independently review requirements, diff, design, security, tests and risks. "
     "Read only. Use conclusion revise for actionable defects, ready only when satisfied.",
-    Role.VALIDATOR: "Inspect actual quality and CI evidence for the exact revision. Read only. "
+    Role.VALIDATOR: "Inspect actual quality plan and execution evidence for the exact revision. "
+    "Read only. "
     "Use revise for defects, blocked for missing evidence, ready only when satisfied.",
 }
 
@@ -37,7 +40,6 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
         "max_log_bytes",
         "auth_file",
         "roles",
-        "quality",
         "max_revisions",
         "scheduler",
         "qa",
@@ -140,10 +142,6 @@ class Config:
     max_log_bytes: int = 2_000_000
     auth_file: Path = field(default_factory=lambda: Path.home() / ".codex" / "auth.json")
     prompts: dict[Role, str] = field(default_factory=lambda: dict(PROMPTS))
-    checks: list[list[str]] = field(default_factory=list)
-    real_checks: list[list[str]] = field(default_factory=list)
-    ci_workflows: list[str] = field(default_factory=list)
-    require_real_checks: bool = False
     max_revisions: int = 3
     scheduler_jobs: int = 1
     qa_jobs: int = 2
@@ -156,10 +154,6 @@ class Config:
         return hashlib.sha256(
             json.dumps(
                 {
-                    "checks": self.checks,
-                    "real_checks": self.real_checks,
-                    "ci_workflows": self.ci_workflows,
-                    "require_real_checks": self.require_real_checks,
                     "roles": {role.value: prompt for role, prompt in self.prompts.items()},
                     "model": self.model,
                 },
@@ -187,34 +181,9 @@ class Config:
         model = raw.get("model")
         if model is not None and (not isinstance(model, str) or not model.strip()):
             raise ValueError("model must be a nonempty string")
-        quality = raw.get("quality", {})
-        if not isinstance(quality, dict) or quality.keys() - {
-            "checks",
-            "real_checks",
-            "ci_workflows",
-            "require_real_checks",
-        }:
-            raise ValueError("Invalid quality policy")
-        commands = []
-        for key in ("checks", "real_checks"):
-            value = quality.get(key, [])
-            if not isinstance(value, list) or any(
-                not isinstance(argv, list)
-                or not argv
-                or any(not isinstance(arg, str) or not arg for arg in argv)
-                for argv in value
-            ):
-                raise ValueError(f"quality.{key} must contain command argument lists")
-            commands.append(value)
-        workflows = quality.get("ci_workflows", [])
-        if not isinstance(workflows, list) or any(
-            not isinstance(name, str) or not name or "/" in name for name in workflows
-        ):
-            raise ValueError("ci_workflows must contain workflow filenames")
-        real = quality.get("require_real_checks", False)
         revisions = raw.get("max_revisions", 3)
-        if type(real) is not bool or type(revisions) is not int or not 0 <= revisions <= 10:
-            raise ValueError("Invalid real check requirement or revision limit")
+        if type(revisions) is not int or not 0 <= revisions <= 10:
+            raise ValueError("Invalid revision limit")
         copilot = raw.get("copilot", {})
         if not isinstance(copilot, dict) or copilot.keys() - {"operators", "mode"}:
             raise ValueError("copilot must contain only operators and mode")
@@ -232,10 +201,6 @@ class Config:
             limit,
             Path(raw.get("auth_file", cls().auth_file)).expanduser(),
             prompts,
-            commands[0],
-            commands[1],
-            workflows,
-            real,
             revisions,
             _jobs(raw, "scheduler", 1, 3),
             _jobs(raw, "qa", 2),

@@ -61,23 +61,60 @@ async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_
 async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbox(
     store, repo, snapshot
 ):
+    from pathlib import Path
+    from shutil import copyfile, copytree, ignore_patterns
+
+    # This fixture owns its pytest dependencies at the target SHA. Quality no longer
+    # exposes the host controller's virtualenv, and this regression stays offline.
+    for name in ("pytest", "_pytest", "pluggy", "packaging", "iniconfig", "pygments"):
+        package = Path(__import__(name).__file__).parent
+        copytree(package, repo / name, ignore=ignore_patterns("__pycache__"))
+    copyfile(__import__("py").__file__, repo / "py.py")
     (repo / "test_checkout.py").write_text(
         "import subprocess\nfrom pathlib import Path\n"
         "def test_clone(tmp_path):\n"
         "    subprocess.run(['git','clone','-q','--local',str(Path.cwd()),"
         "str(tmp_path/'copy')],check=True)\n"
+        "def test_nested_home_isolation(tmp_path):\n"
+        "    host_secret = Path.home() / '.codex/auth.json'\n"
+        "    host_secret.parent.mkdir(parents=True)\n"
+        "    host_secret.write_text('DUMMY_OUTER_SECRET')\n"
+        "    inner_home = tmp_path / 'inner-home'\n"
+        "    inner_home.mkdir(); (inner_home/'.codex').mkdir()\n"
+        "    (inner_home/'.codex/auth.json').write_text('{}')\n"
+        "    subprocess.run(['bwrap','--ro-bind','/usr','/usr','--ro-bind','/lib','/lib',\n"
+        "        '--ro-bind','/lib64','/lib64','--bind',str(inner_home),'/home/agent',\n"
+        "        '--unshare-user','--unshare-pid','--proc','/proc','/usr/bin/python3.12','-c',\n"
+        "        'from pathlib import Path; assert not Path('"
+        "+repr(str(host_secret))+').exists()'],\n"
+        "        check=True)\n"
     )
     await command("git", "add", ".", cwd=str(repo))
     await command("git", "commit", "-qm", "clone-dependent project check", cwd=str(repo))
     sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
     task_id = store.register(snapshot["url"], repo, sha, snapshot)
     store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "fixture")
-    data = await Quality(
-        store, Config(checks=[[sys.executable, "-c", pytest_snapshot_script()]])
-    ).run(store.task(task_id), "checks")
-    assert data["passed"], data["commands"]
+    quality = Quality(store, Config())
+    quality.confirm(
+        store.task(task_id),
+        [
+            {
+                "category": category,
+                "entry": ["{python}", "-c", pytest_snapshot_script()]
+                if category == "internal"
+                else [],
+                "scope": ["tests"],
+                "required": category == "internal",
+                "reason": "Source snapshot probe",
+                "environment": "sandbox",
+            }
+            for category in ("build", "internal", "e2e")
+        ],
+    )
+    data = await quality.run(store.task(task_id))
+    assert data["passed"], data["items"]
     tree = (await command("git", "rev-parse", "HEAD^{tree}", cwd=str(repo))).strip()
-    assert "QA_SOURCE_TREE=" + tree in data["commands"][0]["stdout"]["tail"]
+    assert "QA_SOURCE_TREE=" + tree in data["items"][1]["stdout"]["tail"]
 
 
 @pytest.mark.parametrize("scene", ["loop", "smoke"])

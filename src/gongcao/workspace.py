@@ -49,7 +49,7 @@ async def context(
     evidence: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     sha = task["target_sha"]
-    files = (await command("git", "ls-tree", "--name-only", sha, cwd=str(repo))).splitlines()
+    files = (await command("git", "ls-tree", "-r", "--name-only", sha, cwd=str(repo))).splitlines()
     agents = (
         await command("git", "show", f"{sha}:AGENTS.md", cwd=str(repo))
         if "AGENTS.md" in files
@@ -64,6 +64,12 @@ async def context(
         "github": task["snapshot"],
         "operator_feedback": task.get("control", {}).get("feedback", []),
         "repository_instructions": agents,
+        "repository_files": files,
+        "build_files": {
+            name: await command("git", "show", f"{sha}:{name}", cwd=str(repo))
+            for name in files
+            if Path(name).name in {"pyproject.toml", "pom.xml", "package.json", "Makefile"}
+        },
         "confirmed_analysis": confirmed_analysis if role == Role.DEVELOPER else None,
         "confirmed_findings": evidence if role == Role.DEVELOPER else None,
         "quality_evidence": evidence if role in {Role.REVIEWER, Role.VALIDATOR} else None,
@@ -88,5 +94,8 @@ async def context(
             "patch": diff,
             "sha256": hashlib.sha256(diff.encode()).hexdigest(),
         }
+    from .plan import propose
+
+    data["validation_candidates"] = propose(data)
     digest = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return data, digest

@@ -248,14 +248,18 @@ def test_until_is_a_forward_entry_checkpoint(store, task_id, stage, target, pr, 
     assert (store.task(task_id)["state"] == State.WAITING_INSTRUCTION) == paused
 
 
-async def test_steps_include_publication_revision_and_pending_ci(
+async def test_steps_include_publication_revision_without_ci(
     store, task_id, fixture_github, policy
 ):
     controls = Controls(store)
     for expected in (
         Stage.DEVELOPMENT,
         Stage.REVIEW,
+        Stage.ANALYSIS,
+        Stage.REVIEW,
         Stage.REVISION,
+        Stage.REVIEW,
+        Stage.ANALYSIS,
         Stage.REVIEW,
         Stage.VALIDATION,
     ):
@@ -270,10 +274,6 @@ async def test_steps_include_publication_revision_and_pending_ci(
     assert not store.db.execute("SELECT 1 FROM leases").fetchone()
     fixture_github.ci = None
     assert controls.issue(task_id, "step", policy=policy.policy_hash)
-    await Workflow(store, policy, fixture_github).run(task_id)
-    assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
-    assert not store.task(task_id)["control"]["spent"]
-    fixture_github.ci = "success"
     await Workflow(store, policy, fixture_github).run(task_id)
     assert store.task(task_id)["stage"] == Stage.MERGEABLE
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
@@ -659,18 +659,22 @@ async def test_step_received_during_failed_checks_stops_at_revision(
 ):
     workflow = reviewing
 
-    async def failed_checks(task, kind):
+    async def failed_checks(task, **kwargs):
         comments.post("/gongcao step")
         await asyncio.create_task(
             Controls(store).collect(task_id, workflow.config, fixture_github), context=Context()
         )
-        return {"passed": False, "target_sha": task["target_sha"]}
+        return {
+            "passed": False,
+            "target_sha": task["target_sha"],
+            "items": [{"category": "internal", "required": True, "status": "failed"}],
+        }
 
     monkeypatch.setattr(workflow.quality, "run", failed_checks)
     await workflow.run(task_id)
     assert store.task(task_id)["stage"] == Stage.REVISION
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
-    assert len(store.runs(task_id)) == 2
+    assert [r["role"] for r in store.runs(task_id)] == ["analyst", "developer", "analyst"]
 
 
 @pytest.mark.parametrize("conflict", [False, True])

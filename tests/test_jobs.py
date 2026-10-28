@@ -59,7 +59,7 @@ def test_jobs_rejects_invalid_section_shapes_and_fields(tmp_path, settings):
 
 def test_scheduler_upper_bound_and_qa_policy_independence(tmp_path):
     path = tmp_path / "jobs.yaml"
-    path.write_text("scheduler:\n  jobs: 4\nroles: ignored\nquality: ignored\nqa:\n  jobs: 5\n")
+    path.write_text("scheduler:\n  jobs: 4\nroles: ignored\nmodel: ignored\nqa:\n  jobs: 5\n")
     assert Config.load_qa_jobs(path) == 5
     path.write_text("scheduler:\n  jobs: 4\n")
     with pytest.raises(ValueError, match=r"scheduler.jobs.*between 1 and 3"):
@@ -155,7 +155,7 @@ def test_offline_qa_defaults_yaml_override_and_batch_evidence(checkout, tmp_path
     env = cli_env(checkout, tmp_path / "gate")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
     path = tmp_path / "jobs.yaml"
-    path.write_text("scheduler:\n  jobs: 3\nqa:\n  jobs: 1\nquality: ignored-production-policy\n")
+    path.write_text("scheduler:\n  jobs: 3\nqa:\n  jobs: 1\nmodel: ignored-production-policy\n")
     for name, options, expected in (
         ("default", [], 2),
         ("yaml", ["--config", str(path)], 1),

@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 8
+VERSION = 10
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -19,7 +19,11 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
     roles = {
         "analyst": scope + "Read only. Inspect the request and plan the complete final contract. "
         "Execute /usr/bin/sleep 20 after your first inspection command, for the cancel probe. "
-        "Return ready and the exact context target_sha. No long tests or credential access.",
+        "Return ready and the exact context target_sha. No long tests or credential access. "
+        "This task changes only a standalone stdlib clamp function: it has no engine, browser "
+        "or external-service integration. Its functional tests are internal; record real E2E "
+        "as not applicable with that risk-based reason. The surrounding QA harness separately "
+        "exercises the real model/GitHub controller chain. Propose all three plan categories.",
         "developer": scope + requirement + " On initial development (confirmed_findings is null) "
         "implement the explicitly authorized missing-lower-bound defect. "
         "For technical check failures (findings with commands or ci), fix only the reported "
@@ -37,55 +41,12 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
         "lower-bound defect, ready only after the full contract and tests are implemented. "
         "Return exact context target_sha. No credentials or remote writes.",
         "validator": "Read only. Independently inspect quality_evidence for passing project "
-        "checks, required real checks, and CI with exact PR/base/head checkout proof. "
+        "all required plan checks, including E2E, with exact repository/base/head/plan binding. "
         "Draft/merge protection status is controlled separately after validation. "
         "Return ready only for actual passing evidence at exact context target_sha; "
         "revise for code defects or blocked for missing evidence. No credentials or writes.",
     }
-    prefix = [
-        "/usr/bin/env",
-        "HOME=/tmp/gongcao-check-home",
-        "UV_CACHE_DIR=/workspace/.venv/uv-cache",
-        "UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv",
-        "UV_LINK_MODE=copy",
-        "uv",
-        "run",
-        "--locked",
-        "--python",
-        "{python}",
-    ]
-    config: dict[str, Any] = {
-        "timeout_seconds": 900,
-        "max_revisions": 3,
-        "roles": roles,
-        "quality": {
-            "checks": [
-                prefix + argv
-                for argv in (
-                    ["ruff", "check", "."],
-                    ["ruff", "format", "--check", "."],
-                    ["mypy"],
-                    ["python", "-c", pytest_snapshot_script()],
-                )
-            ],
-            "ci_workflows": ["ci.yml"],
-            "require_real_checks": True,
-            "real_checks": [
-                [
-                    "uv",
-                    "run",
-                    "--offline",
-                    "--no-project",
-                    "--python",
-                    "{python}",
-                    "python",
-                    "-B",
-                    "-c",
-                    vector_script(module),
-                ]
-            ],
-        },
-    }
+    config: dict[str, Any] = {"timeout_seconds": 900, "max_revisions": 3, "roles": roles}
     if model:
         config["model"] = model
     return requirement, config
@@ -113,7 +74,10 @@ with tempfile.TemporaryDirectory(prefix='gongcao-pytest-') as temporary:
     tree = subprocess.check_output(
         ['git', 'rev-parse', 'HEAD^{tree}'], cwd=source, text=True).strip()
     print('QA_SOURCE_TREE=' + tree, flush=True)
-    env = os.environ | {'PYTHONPATH': os.pathsep.join((str(source/'src'), str(source)))}
+    host_home = Path(temporary) / 'host-home'
+    host_home.mkdir()
+    env = os.environ | {'HOME': str(host_home),
+                        'PYTHONPATH': os.pathsep.join((str(source/'src'), str(source)))}
     print('Testing a full source copy of target {sha}', flush=True)
     subprocess.run([sys.executable, '-m', 'pytest', '-q'], cwd=source, env=env, check=True)
 """.strip()

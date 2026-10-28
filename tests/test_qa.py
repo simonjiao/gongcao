@@ -249,24 +249,26 @@ async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
     }
     facts = await fixture_github.gates(task)
     assert evaluate(task, policy, facts)["revision_count"] == 1
-    for failure in ("stale", "old", "real", "ci", "pending", "ready", "argv", "no_reject"):
+    for failure in ("stale", "old", "e2e", "plan", "pending", "ready", "argv", "no_reject"):
         changed, remote = copy.deepcopy(task), copy.deepcopy(facts)
         if failure == "stale":
             changed["target_sha"] = "0" * 40
         elif failure == "old":
             changed["runs"][2]["evidence_valid"] = 1
-        elif failure == "real":
+        elif failure == "e2e":
             for artifact in changed["evidence"]["artifacts"]:
-                if artifact["kind"] == "real":
+                if artifact["kind"] == "quality-results":
                     artifact["valid"] = 0
-        elif failure == "ci":
-            remote["workflows"][0]["target_proof"]["base_sha"] = "0" * 40
+        elif failure == "plan":
+            for artifact in changed["evidence"]["artifacts"]:
+                if artifact["kind"] == "quality-plan" and artifact["valid"]:
+                    artifact["data"]["base_sha"] = "0" * 40
         elif failure == "pending":
             changed["evidence"]["operations"][0]["state"] = "pending"
         elif failure == "argv":
             for artifact in changed["evidence"]["artifacts"]:
-                if artifact["kind"] == "checks" and artifact["valid"]:
-                    artifact["data"]["commands"][0]["argv"] = ["true"]
+                if artifact["kind"] == "quality-results" and artifact["valid"]:
+                    artifact["data"]["items"][0]["entry"] = ["true"]
         elif failure == "no_reject":
             for role in changed["runs"]:
                 if role["role"] == "reviewer":

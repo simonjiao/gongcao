@@ -7,36 +7,6 @@ scheduler:
   jobs: 2  # 允许 1～3；省略时默认 1。
 qa:
   jobs: 2  # 正整数；省略时默认 2。
-# 以下是 Gongcao 自身的质量检查示例；处理其他仓库时须替换为目标项目的检查命令。
-quality:
-  # 本项目测试会启动嵌套沙箱，因此将 HOME、项目虚拟环境放在 /workspace 之外；
-  # uv 缓存放在工作区的 .venv 目录，供同一轮隔离检查复用。
-  # checks 在隔离工作区按顺序执行，任一命令失败即停止后续检查。
-  # /usr/bin/env 用于设置环境变量；{python} 由控制器替换为 Python 解释器路径。
-  # 以下冗长的环境参数用于本项目的嵌套沙箱，普通项目无需原样照搬。
-  checks:
-    # 检查代码规范及常见静态问题
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, check, .]
-    # 检查代码格式，不自动修改文件
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", ruff, format, --check, .]
-    # 检查 Python 静态类型
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", mypy]
-    # 执行自动化测试，减少输出
-    - [/usr/bin/env, HOME=/tmp/gongcao-check-home,
-       UV_CACHE_DIR=/workspace/.venv/uv-cache, UV_PROJECT_ENVIRONMENT=/tmp/gongcao-project-venv,
-       UV_LINK_MODE=copy, uv, run, --locked, --python, "{python}", pytest, -q]
-  # 必须通过的目标仓库 GitHub CI 工作流文件名，与本地 checks 独立。
-  # 当前门禁只认 pull_request 事件；仅手动 workflow_dispatch 不能满足该门禁。
-  ci_workflows: [ci.yml]
-  # 是否强制执行额外实测检查；若启用，应提供下面的实测命令。
-  require_real_checks: false
-  real_checks: []
 roles:
   # 以下是发送给 Agent 的任务提示词（实际配置值，不是注释），故保持原文。
   analyst: >-
