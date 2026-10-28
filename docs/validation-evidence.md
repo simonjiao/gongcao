@@ -60,6 +60,8 @@ AirDB 在固定 `345f3b2` 的实际 Issue/PR/AGENTS/构建上下文验证 Maven/
 Reviewer `553c61f8d2494c5da636e80f6d405e47` 和 Validator `1fc275658f7f456ab5ecaab8f2487abe` 均返回 revise，控制器进入修订，未放行。
 这是两次独立只读 SDK 会话，GitHub 运输为本地替身，无远端写入；未运行浏览器/引擎，也不重复声明完整远程闭环。
 记录在 `.qa-runs/issue79-acceptance-boundary-r2/report.json`；离线回归另核对错误计划上下文传递及两角色 blocked 时不会进入可合并。
+最终实现 `aeb271f453b81bfcb57c19f37a5aa26dae502ab9`：Python 3.12/3.13 各 289 项全量通过，Ruff、format、mypy、离线 QA 全通过；复审无剩余阻断项。
+矩阵记录 `.qa-runs/issue79-aeb271f-matrix/report.json`；[本轮追加证据及 SHA256 回读确认](https://github.com/simonjiao/gongcao/tree/c6ff81d4a2b33ebe7edc5b4b886e0d9150be0b12/qa/acceptance/issue-79/aeb271f453b81bfcb57c19f37a5aa26dae502ab9/review-20261028-boundaries)。
 
 用户授权的真实归档验收已通过，专用 [QA Issue #82](https://github.com/simonjiao/gongcao/issues/82) 已关闭，Agent 运行数为 0。
 [成功执行证据](https://github.com/simonjiao/gongcao/tree/63b71666c677786d8f3d1ecc88291495a7a628e4/qa/acceptance/issue-82/368f331fa030db13d26856e09ba7d5964bb3e914/check-328edf353a3047378529e42222d077ba)。
