@@ -389,12 +389,16 @@ class Controls:
         with self.transaction():
             if not self.owns_checkpoint(task_id):
                 return
+            task = self.store.task(task_id)
             unverified = [
                 row[0]
                 for row in self.db.execute(
                     "SELECT id FROM instructions WHERE task_id=? "
-                    "AND status='pending' AND reason!=''",
-                    (task_id,),
+                    "AND reason!='' AND (status='pending' OR (status='accepted' AND id=?))",
+                    (
+                        task_id,
+                        None if task["control"].get("spent") else task["control"].get("command_id"),
+                    ),
                 )
             ]
             operators = {name.casefold() for name in config.copilot_operators}
@@ -410,12 +414,18 @@ class Controls:
                         int(key.split(":")[1]) for key in unverified
                     ):
                         pending.append((row["id"], data))
+                    else:
+                        self.mark(
+                            task_id,
+                            row["id"],
+                            "rejected",
+                            "Comment predates unverified instruction",
+                        )
                 else:
                     self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
             if not pending:
                 return
             pending.sort(key=lambda item: int(item[0].split(":")[1]), reverse=True)
-            task = self.store.task(task_id)
             fingerprints = {data.get("fingerprint", key) for key, data in pending}
             row = self.db.execute(
                 "SELECT id,data FROM instructions WHERE task_id=? AND id=? AND status='accepted'",

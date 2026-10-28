@@ -133,15 +133,19 @@ async def test_failed_foreground_poll_cannot_consume_a_concurrent_unverified_rec
 
 
 @pytest.mark.parametrize(
-    "recovery", ["visible", "local", "new", "stale", "unauthorized", "conflict", "published"]
+    "recovery",
+    ["visible", "local", "new", "accepted", "stale", "unauthorized", "conflict", "published"],
 )
 async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permission(
-    store, task_id, comments, copilot, monkeypatch, recovery
+    store, task_id, comments, copilot, fixture_github, monkeypatch, recovery
 ):
     controls = Controls(store)
     controls.issue(task_id, "pause")
+    comments.sequence = int(recovery == "accepted")
     old = comments.post("/gongcao auto")
     await controls.collect(task_id, copilot, comments)
+    if recovery == "accepted":
+        controls.apply_pending(task_id, copilot)
     comments.comments.clear()
     await controls.poll(task_id, copilot, comments)
     with closing(Store(store.root)) as restarted:
@@ -155,7 +159,20 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
         elif recovery == "local":
             controls.issue(task_id, "until", "review", policy=copilot.policy_hash)
         else:
-            comments.post(
+            if recovery == "accepted":
+                before = restarted.evidence(task_id)["instructions"][-1]
+                older = comments.post("/gongcao auto")
+                older["id"] = old["id"] - 1  # Previously invisible B predates accepted A.
+                await controls.poll(task_id, copilot, comments)
+                task = restarted.task(task_id)
+                assert task["control"]["command_id"] == f"github:{old['id']}"
+                assert task["control"]["pause_requested"] and not controls.checkpoint(task_id)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before
+                assert rows[f"github:{older['id']}"]["status"] == "rejected"
+                assert await Workflow(restarted, copilot, fixture_github).execute(task_id) == []
+                assert not fixture_github.writes and not restarted.runs(task_id)
+            new = comments.post(
                 "/gongcao until development" if recovery == "published" else "/gongcao auto",
                 actor="stranger" if recovery == "unauthorized" else "owner",
             )
@@ -168,7 +185,7 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
                 store.halt(task_id, State.QUEUED, "publication acknowledgment")
                 store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "published")
                 controls.apply_pending(task_id, copilot, defer_checkpoint=True)
-            if recovery == "new":
+            if recovery in {"new", "accepted"}:
                 before = restarted.task(task_id), restarted.evidence(task_id)
                 mark = controls.mark
 
@@ -188,11 +205,15 @@ async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permissi
         assert restarted.task(task_id)["state"] == (
             State.WAITING_INSTRUCTION if invalid else State.QUEUED
         )
-        assert rows["github:1"]["status"] == (
+        assert rows[f"github:{old['id']}"]["status"] == (
             "pending" if invalid else "accepted" if recovery == "visible" else "superseded"
         )
         if recovery not in {"visible", "local"}:
-            assert rows["github:2"]["status"] == ("rejected" if invalid else "accepted")
+            assert rows[f"github:{new['id']}"]["status"] == ("rejected" if invalid else "accepted")
+        if recovery == "accepted":
+            before = restarted.evidence(task_id)
+            await controls.poll(task_id, copilot, comments)
+            assert restarted.evidence(task_id) == before  # Retired A/B cannot block or replay.
 
 
 @pytest.mark.parametrize(

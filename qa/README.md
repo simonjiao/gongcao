@@ -130,6 +130,9 @@ The optional real run is `uv run python -m qa run copilot --real --repo OWNER/RE
 execute it only with explicit authorization for real QA.
 The deleted pending comment must be superseded by the next verified comment; the
 scene does not issue a local pause to bypass an unverified receipt (scenario v8).
+The offline control recovery regression also covers an accepted comment becoming
+unverifiable: a late older ID cannot resume execution or writes, while a larger ID
+replaces it atomically, including rollback and a subsequent poll of retired records.
 
 `verify-batch --require-isolation` checks slot events, independent resource IDs,
 overlapping real SDK session intervals, a queued third Run, and cancellation
