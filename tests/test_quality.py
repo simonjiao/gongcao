@@ -241,9 +241,9 @@ def test_controlled_entry_matches_actual_invocation(tmp_path):
         controlled_entry(tmp_path, ["cp", "qa/probe.py", "/tmp/outside"])
 
 
-@pytest.mark.parametrize("ignored", [False, True])
+@pytest.mark.parametrize("mode", ["tracked", "ignored", "commit"])
 async def test_check_cannot_change_fixed_sha_or_feed_code_to_host_qa(
-    store, task_id, repo, tmp_path, ignored
+    store, task_id, repo, tmp_path, mode
 ):
     sentinel = tmp_path / "host-private-sentinel"
     sentinel.write_text("HOST_ONLY_DUMMY_DATA")
@@ -251,6 +251,12 @@ async def test_check_cannot_change_fixed_sha_or_feed_code_to_host_qa(
     (repo / "qa/probe.py").write_text(
         "try:\n import generated\nexcept ImportError:\n print('approved')\n"
     )
+    if mode == "commit":
+        (repo / "qa/probe.py").write_text(
+            "import subprocess\nopen('sample.txt','w').write('changed')\n"
+            "subprocess.run(['git','-c','core.hooksPath=/dev/null',"
+            "'commit','-am','QA change'],check=True)\n"
+        )
     (repo / ".gitignore").write_text("qa/generated.py\n**/__pycache__/\n")
     await command("git", "add", ".", cwd=str(repo))
     await command("git", "commit", "-qm", "QA boundary probe", cwd=str(repo))
@@ -258,14 +264,16 @@ async def test_check_cannot_change_fixed_sha_or_feed_code_to_host_qa(
     store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": sha})
     quality = Quality(store, Config())
     checks = items(["{python}", "qa/probe.py"], "controlled")
-    target = "qa/generated.py" if ignored else "qa/probe.py"
+    target = "qa/generated.py" if mode == "ignored" else "qa/probe.py"
     payload = f"print(open({str(sentinel)!r}).read())\n"
     checks[0]["entry"] = ["{python}", "-c", f"open({target!r},'w').write({payload!r})"]
+    if mode == "commit":
+        checks[0]["entry"] = ["true"]
     plan = quality.confirm(store.task(task_id), checks)
     result = await quality.run(
         store.task(task_id), include_e2e=True, real_check=2, approved_plan=plan["plan_hash"]
     )
-    assert verdict(result) == ("passed" if ignored else "failed")
+    assert verdict(result) == ("passed" if mode == "ignored" else "failed")
     assert "HOST_ONLY_DUMMY_DATA" not in json.dumps(result)
-    if ignored:
+    if mode == "ignored":
         assert result["items"][-1]["stdout"]["tail"].strip() == "approved"

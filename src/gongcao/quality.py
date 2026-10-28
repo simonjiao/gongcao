@@ -259,7 +259,8 @@ class Quality:
                 "--untracked-files=normal",
                 cwd=str(checked_workspace),
             )
-            if dirty:
+            head = (await command("git", "rev-parse", "HEAD", cwd=str(checked_workspace))).strip()
+            if dirty or head != task["target_sha"]:
                 tainted = True
                 code, stderr = (
                     1,
