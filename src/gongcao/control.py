@@ -156,7 +156,6 @@ class Controls:
                     "spent": False,
                     "pause_requested": len(labels) > 1,
                     "since": time.time(),
-                    "request_since": time.time(),
                     "baseline": baseline(task),
                     "policy": policy,
                     "feedback": [],
@@ -265,7 +264,6 @@ class Controls:
                 "pause_reason": "Pause requested" if mode == "pause" else "",
                 "policy": policy,
                 "since": max(created, control.get("since", 0)),
-                "request_since": max(created, control.get("request_since", 0)),
                 "feedback": control.get("feedback", [])
                 + ([data | {"source": command_id}] if feedback else []),
             }
@@ -296,7 +294,6 @@ class Controls:
                     "pause_requested": explicit,
                     "spent": explicit,
                     "since": time.time(),
-                    "request_since": time.time(),
                     "baseline": baseline(task),
                     "pause_reason": reason,
                 },
@@ -391,11 +388,14 @@ class Controls:
         with self.transaction():
             if not self.owns_checkpoint(task_id):
                 return
-            if self.db.execute(
-                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason!=''",
-                (task_id,),
-            ).fetchone():
-                return
+            unverified = [
+                row[0]
+                for row in self.db.execute(
+                    "SELECT id FROM instructions WHERE task_id=? "
+                    "AND status='pending' AND reason!=''",
+                    (task_id,),
+                )
+            ]
             operators = {name.casefold() for name in config.copilot_operators}
             pending = []
             for row in self.db.execute(
@@ -405,7 +405,10 @@ class Controls:
             ):
                 data = json.loads(row["data"])
                 if data["actor"].casefold() in operators:
-                    pending.append((row["id"], data))
+                    if not unverified or int(row["id"].split(":")[1]) > max(
+                        int(key.split(":")[1]) for key in unverified
+                    ):
+                        pending.append((row["id"], data))
                 else:
                     self.mark(task_id, row["id"], "rejected", "Operator is not authorized")
             if not pending:
@@ -464,6 +467,9 @@ class Controls:
                     received=data,
                     defer_checkpoint=defer_checkpoint and not reached,
                 )
+                if accepted:
+                    for old in unverified:
+                        self.mark(task_id, old, "superseded", f"Replaced by verified {key}")
 
     async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
         # Serialize transport snapshots across foreground/background collectors and stores.
@@ -543,6 +549,8 @@ class Controls:
                 ).fetchone()
                 edited = comment.get("updated_at") != comment["created_at"]
                 if known:
+                    if known["status"] not in {"pending", "accepted"}:
+                        continue  # Preserve the audit outcome of retired instructions.
                     original = json.loads(known["data"])
                     if (
                         (edited and original.get("updated_at") != comment.get("updated_at"))

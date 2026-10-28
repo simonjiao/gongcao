@@ -150,7 +150,6 @@ async def exercise(run: Run, github: GitHub) -> None:
         )
         run.archive("copilot-" + probe, task)
         if probe == "deleted":
-            require(await core(run, "control", task_id, "--pause") == 0, "Pause failed")
             commands[-1]["expected"] = "superseded"
 
     for stage, instruction in (
