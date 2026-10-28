@@ -1,0 +1,236 @@
+{
+  "sha": "e465e2507c39f7e79f946c3ffe8ad14ccb0f15fa",
+  "mode": "all collected tests, partitioned into disjoint file groups",
+  "real": false,
+  "versions": [
+    {
+      "python": "3.12",
+      "groups": [
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "files": [
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 100.68,
+          "log_sha256": "cc4eaa95e355cf1ea4569b2d967e075b30007d249e029003578ccdb7d638a72a"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "files": [
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 139.87,
+          "log_sha256": "4e2a9708a394a85be5b06ea3a40cb99120ed2db57e1ce22512722a4579068762"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.12",
+            "pytest",
+            "-q",
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py"
+          ],
+          "files": [
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py"
+          ],
+          "expected": 93,
+          "passed": 93,
+          "exit_code": 0,
+          "seconds": 125.73,
+          "log_sha256": "bd67425e8359d98f19219ab0db536c47fe298e1cef9cda3b50fe05833b071a3f"
+        }
+      ],
+      "passed": 281,
+      "seconds": 141.0,
+      "success": true,
+      "quality": {
+        "ruff": "passed",
+        "format": "67 files passed",
+        "mypy": "33 files passed",
+        "offline_qa": "passed; real Bubblewrap access probes"
+      }
+    },
+    {
+      "python": "3.13",
+      "groups": [
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "files": [
+            "tests/test_control.py",
+            "tests/test_state.py",
+            "tests/test_inputs.py",
+            "tests/test_processes.py",
+            "tests/test_control_cli.py",
+            "tests/test_workspace.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 102.06,
+          "log_sha256": "cbe9464db9fd172b610159785a0ae4c59dc5f48af9dd7adca9f91d18242435b1"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "files": [
+            "tests/test_pr2.py",
+            "tests/test_qa.py",
+            "tests/test_runner.py",
+            "tests/test_sandbox.py"
+          ],
+          "expected": 94,
+          "passed": 94,
+          "exit_code": 0,
+          "seconds": 143.41,
+          "log_sha256": "c8622bbe63f39fe1584fa4d25d7bee2122d7e301a27e76aae0b4d94228f012e3"
+        },
+        {
+          "command": [
+            "uv",
+            "run",
+            "--no-sync",
+            "--python",
+            "3.13",
+            "pytest",
+            "-q",
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py"
+          ],
+          "files": [
+            "tests/test_stability.py",
+            "tests/test_jobs.py",
+            "tests/test_qa_review.py",
+            "tests/test_discovery.py",
+            "tests/test_events.py",
+            "tests/test_discovery_cli.py"
+          ],
+          "expected": 93,
+          "passed": 93,
+          "exit_code": 0,
+          "seconds": 132.09,
+          "log_sha256": "57a7558b5e5e484be9d2aee336f35eff9471372b42ffe281a818e0a682aae890"
+        }
+      ],
+      "passed": 281,
+      "seconds": 144.68,
+      "success": true,
+      "quality": {
+        "ruff": "passed",
+        "format": "67 files passed",
+        "mypy": "33 files passed",
+        "offline_qa": "passed; real Bubblewrap access probes"
+      }
+    }
+  ],
+  "reviews": {
+    "standards": 0,
+    "spec": 0,
+    "kind": "local dual-axis review, not GitHub formal approval"
+  },
+  "github_ci": {
+    "run_id": 40623409147,
+    "url": "https://github.com/simonjiao/gongcao/actions/runs/40623409147",
+    "head_sha": "e465e2507c39f7e79f946c3ffe8ad14ccb0f15fa",
+    "jobs": [
+      {
+        "id": 122602551949,
+        "name": "test (3.13)",
+        "conclusion": "failure",
+        "runner_id": 0,
+        "runner_name": "",
+        "steps": []
+      },
+      {
+        "id": 122602552487,
+        "name": "test (3.12)",
+        "conclusion": "cancelled",
+        "runner_id": 0,
+        "runner_name": "",
+        "steps": []
+      }
+    ],
+    "interpretation": "No runner assigned and no test steps executed. Platform cause unavailable; CI is not considered passed."
+  }
+}

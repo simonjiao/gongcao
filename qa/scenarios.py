@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 6
+VERSION = 8
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 

@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 from contextvars import Context
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -25,11 +26,16 @@ from gongcao.workspace import context
 class Comments(GitHub):
     def __init__(self):
         self.comments = []
+        self.direct_reads = []
+        self.sequence = 0
+        self.listing_error = None
+        self.listing_missing = False
 
     def post(self, body, *, actor="owner", at=None):
         stamp = (datetime.now(UTC) if at is None else datetime.fromtimestamp(at, UTC)).isoformat()
+        self.sequence += 1
         comment = {
-            "id": len(self.comments) + 1,
+            "id": self.sequence,
             "body": body,
             "user": {"login": actor},
             "created_at": stamp,
@@ -40,7 +46,16 @@ class Comments(GitHub):
 
     async def instructions(self, task):
         assert observer.get() is None
-        return self.comments
+        if self.listing_error:
+            raise self.listing_error
+        return [] if self.listing_missing else self.comments
+
+    async def read(self, path):
+        self.direct_reads.append(path)
+        for comment in self.comments:
+            if comment["id"] == int(path.rsplit("/", 1)[1]):
+                return comment
+        raise RuntimeError("HTTP 404: Not Found (deletion or visibility unknown)")
 
 
 @pytest.fixture
@@ -61,6 +76,158 @@ async def reviewing(store, task_id, fixture_github, copilot):
     await Workflow(store, copilot, fixture_github).run(task_id)
     controls.issue(task_id, "auto", policy=copilot.policy_hash)
     return Workflow(store, copilot, fixture_github)
+
+
+@pytest.mark.parametrize("age", [0, 100])
+async def test_unseen_comment_ids_use_current_facts_even_in_checkpoint_second(
+    store, task_id, comments, copilot, age
+):
+    controls = Controls(store)
+    controls.issue(task_id, "pause")
+    comments.post("/gongcao step", at=int(store.task(task_id)["control"]["since"]) - age)
+    await controls.poll(task_id, copilot, comments)
+    assert store.task(task_id)["state"] == State.QUEUED
+
+
+async def test_completed_comment_permissions_cannot_reactivate_work(
+    store, task_id, comments, copilot
+):
+    controls = Controls(store)
+    original = comments.post("/gongcao auto")
+    await controls.poll(task_id, copilot, comments)
+    store.transition(store.task(task_id), Stage.MERGEABLE, State.COMPLETED, "done")
+    before = store.task(task_id), store.evidence(task_id)
+    original["body"] = "withdrawn"
+    comments.post("/gongcao step")
+    await controls.poll(task_id, copilot, comments)
+    assert before == (store.task(task_id), store.evidence(task_id))
+    assert not controls.issue(task_id, "auto")
+
+
+async def test_failed_foreground_poll_cannot_consume_a_concurrent_unverified_receipt(
+    store, task_id, comments, copilot
+):
+    controls = Controls(store)
+    controls.issue(task_id, "pause")
+    comments.post("/gongcao auto")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SlowFailed(Comments):
+        async def instructions(self, task):
+            entered.set()
+            await release.wait()
+            raise PermissionError("HTTP 403 on page two")
+
+    with closing(Store(store.root)) as restarted:
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(controls.poll(task_id, copilot, SlowFailed()))
+            await entered.wait()
+            background = tasks.create_task(Controls(restarted).collect(task_id, copilot, comments))
+            await asyncio.sleep(0)  # Distinct Store handles must respect the real OS lock.
+            assert not background.done()
+            release.set()
+        assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        assert store.evidence(task_id)["instructions"][-1]["status"] == "pending"
+        await controls.poll(task_id, copilot, comments)
+        assert store.task(task_id)["state"] == State.QUEUED
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    ["visible", "local", "new", "accepted", "stale", "unauthorized", "conflict", "published"],
+)
+async def test_unverified_pending_recovery_is_atomic_and_requires_valid_permission(
+    store, task_id, comments, copilot, fixture_github, monkeypatch, recovery
+):
+    controls = Controls(store)
+    controls.issue(task_id, "pause")
+    comments.sequence = int(recovery == "accepted")
+    old = comments.post("/gongcao auto")
+    await controls.collect(task_id, copilot, comments)
+    if recovery == "accepted":
+        controls.apply_pending(task_id, copilot)
+    comments.comments.clear()
+    await controls.poll(task_id, copilot, comments)
+    with closing(Store(store.root)) as restarted:
+        controls = Controls(restarted)
+        controls.apply_pending(task_id, copilot)
+        assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        assert "verification pending" in restarted.evidence(task_id)["instructions"][-1]["reason"]
+        if recovery == "visible":
+            comments.comments.append(old)
+            comments.listing_missing = True  # Complete list omits A; its direct read restores it.
+        elif recovery == "local":
+            controls.issue(task_id, "until", "review", policy=copilot.policy_hash)
+        else:
+            if recovery == "accepted":
+                before = restarted.evidence(task_id)["instructions"][-1]
+                comments.post("/gongcao step")
+                comments.post("/gongcao auto")
+                await controls.poll(task_id, copilot, comments)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before  # Conflict cannot retire A.
+                restarted.halt(task_id, State.QUEUED, "publication acknowledgment")
+                restarted.transition(
+                    restarted.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "published"
+                )
+                comments.post("/gongcao until development")
+                await controls.collect(task_id, copilot, comments)
+                controls.apply_pending(task_id, copilot, defer_checkpoint=True)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before  # Reached target cannot retire A.
+                older = comments.post("/gongcao auto")
+                older["id"] = old["id"] - 1  # Previously invisible B predates accepted A.
+                await controls.poll(task_id, copilot, comments)
+                task = restarted.task(task_id)
+                assert task["control"]["command_id"] == f"github:{old['id']}"
+                assert task["control"]["pause_requested"] and not controls.checkpoint(task_id)
+                rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+                assert rows[f"github:{old['id']}"] == before
+                assert rows[f"github:{older['id']}"]["status"] == "rejected"
+                assert await Workflow(restarted, copilot, fixture_github).execute(task_id) == []
+                assert not fixture_github.writes and not restarted.runs(task_id)
+            new = comments.post(
+                "/gongcao until development" if recovery == "published" else "/gongcao auto",
+                actor="stranger" if recovery == "unauthorized" else "owner",
+            )
+            if recovery == "conflict":
+                comments.post("/gongcao step")
+            await controls.collect(task_id, copilot, comments)
+            if recovery in {"stale", "conflict"}:
+                store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": "0" * 40})
+            if recovery == "published":
+                store.halt(task_id, State.QUEUED, "publication acknowledgment")
+                store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "published")
+                controls.apply_pending(task_id, copilot, defer_checkpoint=True)
+            if recovery in {"new", "accepted"}:
+                before = restarted.task(task_id), restarted.evidence(task_id)
+                mark = controls.mark
+
+                def fail_retirement(*args):
+                    if args[2] == "superseded":
+                        raise OSError("crash")
+                    mark(*args)
+
+                with monkeypatch.context() as crash:
+                    crash.setattr(controls, "mark", fail_retirement)
+                    with pytest.raises(OSError, match="crash"):
+                        controls.apply_pending(task_id, copilot)
+                assert before == (restarted.task(task_id), restarted.evidence(task_id))
+        await controls.poll(task_id, copilot, comments)
+        rows = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
+        invalid = recovery in {"stale", "unauthorized", "conflict", "published"}
+        assert restarted.task(task_id)["state"] == (
+            State.WAITING_INSTRUCTION if invalid else State.QUEUED
+        )
+        assert rows[f"github:{old['id']}"]["status"] == (
+            "pending" if invalid else "accepted" if recovery == "visible" else "superseded"
+        )
+        if recovery not in {"visible", "local"}:
+            assert rows[f"github:{new['id']}"]["status"] == ("rejected" if invalid else "accepted")
+        if recovery == "accepted":
+            before = restarted.evidence(task_id)
+            await controls.poll(task_id, copilot, comments)
+            assert restarted.evidence(task_id) == before  # Retired A/B cannot block or replay.
 
 
 @pytest.mark.parametrize(
@@ -150,8 +317,11 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
 
     comments.post("/gongcao auto", actor="stranger", at=101)
     comments.post("ordinary comment", at=101)
+    edited = comments.post("/gongcao step", at=101)
+    edited["updated_at"] = "2099-01-01T00:00:00Z"
     await controls.poll(task_id, config, comments)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert "Edited comments" in store.evidence(task_id)["instructions"][-1]["reason"]
     comments.post("/gongcao step\nAlso check the upper bound.", at=101)
     clock[0] = 102
     await controls.poll(task_id, config, comments)
@@ -164,11 +334,17 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
         assert restarted.evidence(task_id)["instructions"][-1]["status"] == "consumed"
     finally:
         restarted.close()
+    history = store.evidence(task_id)["instructions"]
+    for comment in comments.comments:
+        comment["body"] = "Edited after retirement"
+    await controls.poll(task_id, config, comments)
+    assert store.evidence(task_id)["instructions"] == history
     data, _ = await context(repo, store.task(task_id), Role.DEVELOPER, config, None)
     assert data["operator_feedback"][0]["feedback"] == "Also check the upper bound."
     clock[0] = 104
-    store.sync(task_id, snapshot | {"head_sha": "0" * 40})
     comments.post("/gongcao step", at=103)
+    await controls.collect(task_id, config, comments)
+    store.sync(task_id, snapshot | {"head_sha": "0" * 40})
     await controls.poll(task_id, config, comments)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
     assert store.evidence(task_id)["instructions"][-1]["status"] == "rejected"
@@ -299,8 +475,9 @@ async def test_journaled_operation_settles_before_pause(store, task_id, fixture_
     assert not store.db.execute("SELECT 1 FROM leases").fetchone()
 
 
-async def test_remote_pause_is_read_after_agent_before_publication(
-    store, task_id, fixture_github, copilot, comments, monkeypatch
+@pytest.mark.parametrize("change", ["pause", "edited", "deleted", "unavailable"])
+async def test_remote_revocation_is_read_after_agent_before_publication(
+    store, task_id, fixture_github, copilot, comments, monkeypatch, change
 ):
     config = copilot
     Controls(store).issue(task_id, "until", "development", policy=config.policy_hash)
@@ -309,11 +486,20 @@ async def test_remote_pause_is_read_after_agent_before_publication(
 
     async def receive(self, *args):
         result = await original(self, *args)
-        comments.post("/gongcao pause")
+        if change == "pause":
+            comments.post("/gongcao pause")
+        elif change == "edited":
+            grant["body"] = "withdrawn"
+        elif change == "deleted":
+            comments.comments.clear()
+        else:
+            comments.listing_error = PermissionError("HTTP 403 on page two")
         return result
 
     monkeypatch.setattr(Runner, "receive", receive)
-    Controls(store).issue(task_id, "auto", policy=config.policy_hash)
+    grant = comments.post("/gongcao auto")
+    await Controls(store).poll(task_id, config, comments)
+    monkeypatch.setattr(fixture_github, "read", comments.read)
     await Workflow(store, config, fixture_github).run(task_id)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
     assert store.task(task_id)["stage"] == Stage.DEVELOPMENT
@@ -404,29 +590,46 @@ async def test_background_commands_are_recorded_without_agent_lease_and_survive_
         restarted.close()
 
 
-@pytest.mark.parametrize("split_poll", [False, True])
+@pytest.mark.parametrize("split_poll,change", [(False, "body"), (True, "edited"), (True, "actor")])
 async def test_edited_and_conflicting_commands_pause_without_replay(
-    store, task_id, comments, split_poll
+    store, task_id, comments, split_poll, change
 ):
     config = Config(copilot_operators=["owner"])
     controls = Controls(store)
-    original = comments.post("/gongcao auto")
-    await controls.poll(task_id, config, comments)
-    original["body"] = "Withdrawn"
-    await controls.poll(task_id, config, comments)
+    controls.issue(task_id, "pause")
+    original = comments.post("/gongcao step")
+    await controls.collect(task_id, config, comments)
+    if change != "actor":
+        controls.apply_pending(task_id, config)
+        run = store.begin_run(task_id, Role.ANALYST)
+    original.update(
+        {
+            "body": {"body": "Withdrawn"},
+            "edited": {"updated_at": "2099-01-01T00:00:00Z"},
+            "actor": {"user": {"login": "stranger"}},
+        }[change]
+    )
+    await controls.collect(task_id, config, comments)
+    if change != "actor":
+        store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ready")
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
-    assert store.evidence(task_id)["instructions"][0]["status"] == "stale"
+    assert store.evidence(task_id)["instructions"][-1]["status"] == "stale"
     stamp = datetime.now(UTC).timestamp()
     comments.post("/gongcao auto", at=stamp)
     if split_poll:
         await controls.poll(task_id, config, comments)
-    comments.post("/gongcao step", at=stamp)
+    comments.post("/gongcao step", at=stamp + 1)
     await controls.poll(task_id, config, comments)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
     assert "Conflicting" in store.task(task_id)["reason"]
     rows = {row["id"]: row for row in store.evidence(task_id)["instructions"]}
     assert rows["github:3"]["status"] == "rejected"
     assert rows["github:2"]["status"] == ("superseded" if split_poll else "rejected")
+    history = store.evidence(task_id)["instructions"]
+    for comment in comments.comments:
+        comment["body"] = "Edited after retirement"
+    await controls.poll(task_id, config, comments)
+    assert store.evidence(task_id)["instructions"] == history
 
 
 async def test_until_current_review_pauses_after_review_write_without_advancing(

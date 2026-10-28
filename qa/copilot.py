@@ -9,7 +9,10 @@ from pathlib import Path
 
 import yaml
 
+from gongcao.config import Config
+from gongcao.control import Controls
 from gongcao.github import GitHub, command
+from gongcao.store import Store
 
 from .evidence import require
 from .ledger import Run, digest
@@ -63,11 +66,6 @@ async def exercise(run: Run, github: GitHub) -> None:
     require(await core(run, "control", task_id, "--pause") == 0, "Initial pause failed")
 
     async def post(text: str, expected: str = "consumed") -> str:
-        # GitHub timestamps have second resolution; wait beyond the local checkpoint.
-        since = inspect(run)["control"]["since"]
-        while time.time() <= since + 1:
-            run.check_cancelled()
-            await asyncio.sleep(0.2)
         comment = await github.mutate(endpoint, {"body": text})
         require(comment["user"]["login"] == run.value["github_login"], "Unexpected API actor")
         commands.append(
@@ -107,8 +105,9 @@ async def exercise(run: Run, github: GitHub) -> None:
     run.value["config_digest"] = digest(config)
     run.archive("configuration", config)
 
-    for probe in ("edited", "expired"):
-        rejected = await post("/gongcao auto", "rejected")
+    for probe in ("edited", "deleted"):
+        expected = "rejected" if probe == "edited" else "pending"
+        rejected = await post("/gongcao auto", expected)
         if probe == "edited":
             created = datetime.fromisoformat(commands[-1]["created_at"].replace("Z", "+00:00"))
             await asyncio.sleep(max(0, created.timestamp() + 1.1 - time.time()))
@@ -123,7 +122,18 @@ async def exercise(run: Run, github: GitHub) -> None:
                 input_data=json.dumps({"body": "/gongcao step"}),
             )
         else:
-            require(await core(run, "control", task_id, "--pause") == 0, "Pause failed")
+            store = Store(run.root / "state")
+            try:
+                await Controls(store).collect(int(task_id), Config.load(path), github)
+            finally:
+                store.close()
+            await command(
+                "gh",
+                "api",
+                "--method",
+                "DELETE",
+                f"repos/{run.value['repository']}/issues/comments/{rejected.split(':')[1]}",
+            )
         before = signature(inspect(run))
         await once()
         task = inspect(run)
@@ -133,12 +143,14 @@ async def exercise(run: Run, github: GitHub) -> None:
         )
         require(
             any(
-                i["id"] == rejected and i["status"] == "rejected"
+                i["id"] == rejected and i["status"] == expected
                 for i in task["evidence"]["instructions"]
             ),
             f"Missing {probe} rejection",
         )
         run.archive("copilot-" + probe, task)
+        if probe == "deleted":
+            commands[-1]["expected"] = "superseded"
 
     for stage, instruction in (
         ("pending_development", "/gongcao step"),
