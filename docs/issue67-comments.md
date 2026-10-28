@@ -70,8 +70,26 @@ GitHub 状态码依据：[评论读取 API](https://docs.github.com/en/rest/issu
 首次审查发现的配置失效、并发登记和首次编辑状态三处问题已修复并补充回归。
 Issue 保持开放，未经最终验收不关闭。
 
-真实 GitHub 轻量冒烟待明确授权：只在 `simonjiao/gongcao` 建立一个有唯一标记的临时
-Issue，登记在独立临时状态目录，通过真实 API 发布两条自有指令，分别核验登记后的修订
-和删除；只调用生产 `Controls` 收集/应用/检查点，不启动 Agent，不创建 PR。成功后核实
-并关闭该自有 Issue，保留评论 ID、API 事实与固定实现 SHA 的脱敏记录。
-无需重复六角色 QA，亦不合并或发布产品。
+## 真实 GitHub 轻量冒烟
+
+2026-10-28 用户明确授权后，执行 `uv run python
+.qa-runs/issue67-comment-smoke.ntb2b9/run.py --real`，结果通过。运行时 HEAD 为
+`1b2da503b93bb77b6ce57f2093018a2e327fb517`，与上述固定实现的生产代码、QA 和测试相同。
+脱敏证据：[issue67-comments-1b2da50.json](evidence/issue67-comments-1b2da50.json)。
+
+只创建临时 [Issue #77](https://github.com/simonjiao/gongcao/issues/77)，在独立状态目录
+登记，并通过本地 `gh` 调用真实 GitHub API 发布两条自有指令；许可核验使用生产
+`Controls`，未启动 Agent 或创建开发分支/PR。
+
+- 评论 `6458666317` 首次原文接收为 `accepted`；随后从 `/gongcao auto` 修改为
+  `/gongcao step`，GitHub `updated_at` 从 `02:03:15Z` 变为 `02:03:18Z`。
+  核验后为 `stale`，任务停在 `waiting_instruction`；重复轮询不重新受理。
+- 评论 `6458667569` 从待消费记录成为有效许可后，删除 API 返回 HTTP 204。
+  随后的完整分页不含该 ID，生产代码按 ID 直读返回 HTTP 404，保留
+  `Instruction verification pending` 并暂停许可，任务为 `waiting_instruction`。
+  本次删除事实来自自有 DELETE 的 204；生产核验仍按不明 404 处理，不误判删除。
+- 全程保持分析阶段，Agent 运行和业务受控远端操作均为 0；再次检查点不能恢复旧许可。
+  临时 Issue 已核实关闭，修订评论保留作证据，删除评论在最终完整列表中缺失。
+
+这项冒烟仅验收真实评论事实与控制许可，不替代六角色模型验收。不合并或发布产品，
+#67 仍保持开放，等待最终验收。
