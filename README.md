@@ -82,7 +82,7 @@ run 在前台推进已登记任务，直到外部依赖未满足、人工介入�
 
 `gongcao quality TASK --archive --real` 把当前执行结果追加到独立证据分支，并在 Issue/PR
 记录固定 commit 链接；失败结果同样保留，原始日志/SQLite/会话留在本地。
-详见 [#79 验证与归档](docs/issue79-quality.md)。
+详见 [#79 验证与归档](docs/validation-evidence.md)。
 
 每个角色使用独立上下文/线程；审查只读。修订最多 max_revisions 次，超限转人工。
 缺环境时可在补齐证据后再次 run，不重复发布已确认的远端对象。

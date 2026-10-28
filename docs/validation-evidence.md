@@ -1,4 +1,4 @@
-# #79 动态验证与证据归档
+# 动态验证与证据归档
 
 按目标 SHA 的 AGENTS.md、构建文件、Issue 要求、PR diff 生成三类验证项；
 分析候选只提供建议，控制器执行结果才是证据。支持 Python、Maven、npm 和 Make 入口。
@@ -36,3 +36,13 @@ README.md、manifest.json、SHA256SUMS。独立孤立提交起步，后续追加
 
 分工按最新 Issue 正文执行：#78 负责 doctor/示例配置；本次仅删除失效 quality 示例段。
 #80 随后整理剩余 test_pr2/跨文件夹具/长期文档；#55 再做 E2E 去重和扩展，本次不搬迁剩余测试。
+
+固定实现 `368f331fa030db13d26856e09ba7d5964bb3e914`：Python 3.12/3.13 各 278 项全量通过，
+Ruff、format、mypy、离线 QA 通过，Standards/Spec 均无剩余问题。使用全部收集文件的互斥分组，
+墙钟分别 147.0/160.24 秒；不依赖 CI，未使用 Docker。
+本地完整记录保存在 `.qa-runs/quality-368f331-local.json`；证据 JSON 不合入业务分支。
+
+用户授权的真实归档验收已通过，专用 [QA Issue #82](https://github.com/simonjiao/gongcao/issues/82) 已关闭，Agent 运行数为 0。
+[成功执行证据](https://github.com/simonjiao/gongcao/tree/63b71666c677786d8f3d1ecc88291495a7a628e4/qa/acceptance/issue-82/368f331fa030db13d26856e09ba7d5964bb3e914/check-328edf353a3047378529e42222d077ba)。
+[失败执行证据（追加保留前次记录）](https://github.com/simonjiao/gongcao/tree/8631aa21870f2bb9caf7e5f84a6df46e86cb0532/qa/acceptance/issue-82/368f331fa030db13d26856e09ba7d5964bb3e914/check-8d9e4f6a93fb4e258bb4f72ee9fd193c)。
+验证了脱敏、SHA256 回读及成功 push 后丢失响应的确认；证据分支保留。此验收不声明真实引擎/浏览器 E2E 已通过。

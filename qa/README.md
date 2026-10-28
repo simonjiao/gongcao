@@ -201,4 +201,4 @@ Issue #79 uses version-bound build/internal/e2e plans instead of configured comm
 Offline `tests/test_quality.py` exercises actual sandboxes, current-SHA execution, plan invalidation,
 controlled QA entry authorization, and append/readback against a local bare Git repository.
 GitHub archive acceptance is separate and requires explicit `--real` authorization; these transport
-fixtures do not claim real engine/browser acceptance. See `docs/issue79-quality.md`.
+fixtures do not claim real engine/browser acceptance. See `docs/validation-evidence.md`.
