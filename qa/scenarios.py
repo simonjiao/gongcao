@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 9
+VERSION = 10
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -19,7 +19,11 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
     roles = {
         "analyst": scope + "Read only. Inspect the request and plan the complete final contract. "
         "Execute /usr/bin/sleep 20 after your first inspection command, for the cancel probe. "
-        "Return ready and the exact context target_sha. No long tests or credential access.",
+        "Return ready and the exact context target_sha. No long tests or credential access. "
+        "This task changes only a standalone stdlib clamp function: it has no engine, browser "
+        "or external-service integration. Its functional tests are internal; record real E2E "
+        "as not applicable with that risk-based reason. The surrounding QA harness separately "
+        "exercises the real model/GitHub controller chain. Propose all three plan categories.",
         "developer": scope + requirement + " On initial development (confirmed_findings is null) "
         "implement the explicitly authorized missing-lower-bound defect. "
         "For technical check failures (findings with commands or ci), fix only the reported "

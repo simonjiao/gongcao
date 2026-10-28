@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Check(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", json_schema_serialization_defaults_required=True)
 
     category: Literal["build", "internal", "e2e"]
     entry: list[str]
@@ -17,6 +17,8 @@ class Check(BaseModel):
     required: bool
     reason: str = Field(min_length=1)
     environment: Literal["sandbox", "controlled"] = "sandbox"
+    network: bool = False
+    variables: list[str] = Field(default_factory=list)
 
 
 def digest(value: Any) -> str:
@@ -101,11 +103,8 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
                     else ["uv", "run", "--locked", "pytest", "-q"],
                     "tests",
                 )
-            cli = [p for p in files if p.startswith("tests/") and p.endswith("_cli.py")]
-            if cli:
-                add("e2e", ["uv", "run", "--locked", "pytest", "-q", *cli], "tests/*_cli.py")
         elif path == "Makefile":
-            for target, category in (("check", "build"), ("test", "internal"), ("test-e2e", "e2e")):
+            for target, category in (("check", "build"), ("test", "internal")):
                 if f"{target}:" in body:
                     add(category, ["make", target], ".")
     for category in ("build", "internal", "e2e"):

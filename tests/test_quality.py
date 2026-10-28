@@ -20,7 +20,7 @@ from gongcao.workspace import context
 
 
 async def authorized_fixture() -> None:
-    # Explicit host execution is restricted to temporary, test-owned QA scripts.
+    # Explicit execution is restricted to temporary, test-owned QA scripts.
     pass
 
 
@@ -28,10 +28,16 @@ def items(entry, environment="sandbox"):
     return [
         {
             "category": category,
-            "entry": entry if category == "e2e" else ["true"],
+            "entry": entry
+            if category == ("e2e" if environment == "controlled" else "internal")
+            else ["true"]
+            if category != "e2e"
+            else [],
             "scope": ["."],
-            "required": True,
-            "reason": "Acceptance contract",
+            "required": category != "e2e" or environment == "controlled",
+            "reason": "Execution probe; no real E2E claimed"
+            if environment == "sandbox"
+            else "Acceptance contract",
             "environment": environment if category == "e2e" else "sandbox",
         }
         for category in ("build", "internal", "e2e")
@@ -72,6 +78,8 @@ async def test_plan_context_and_analysis_suggestions_are_not_results(store, task
     plan = await quality.plan(task)
     assert plan["base_sha"] == plan["target_sha"] == task["target_sha"]
     assert store.artifact(task_id, "quality-results", plan["plan_hash"]) is None
+    assert any(not i["entry"] and "assessment" in i["reason"] for i in plan["items"])
+    quality.confirm(task, propose(data))
     result = await quality.run(task)
     assert verdict(result, include_e2e=False) == "passed" and verdict(result) == "blocked"
 
@@ -83,9 +91,21 @@ async def test_same_sha_plan_change_invalidates_review_and_results(
     task = store.task(task_id)
     quality = Quality(store, policy)
     previous = await quality.plan(task)
+    store.db.execute(
+        "INSERT INTO claims(url,data,task_id,dirty) VALUES(?,?,?,0)",
+        (task["url"], json.dumps({"marker": "status-probe"}), task_id),
+    )
+    store.db.commit()
     changed = copy.deepcopy(previous["items"])
     changed[0]["reason"] = "Additional requirement confirmed at the same SHA"
     plan = quality.confirm(task, changed)
+    assert store.task(task_id)["stage"] == Stage.REVIEW
+    assert store.task(task_id)["state"] == State.QUEUED
+    from gongcao.discovery import Discovery
+
+    claim = Discovery(store, policy, fixture_github).records()[0]
+    assert claim["dirty"] == 1
+    assert "Await human merge" not in Discovery(store, policy, fixture_github).render(claim)
     assert (
         plan["target_sha"] == previous["target_sha"] and plan["plan_hash"] != previous["plan_hash"]
     )
@@ -95,9 +115,55 @@ async def test_same_sha_plan_change_invalidates_review_and_results(
         if r["role"] in {"reviewer", "validator"} and r["evidence_valid"]
     ]
     assert store.artifact(task_id, "quality-results", previous["plan_hash"]) is None
+    store.db.execute("DELETE FROM claims WHERE task_id=?", (task_id,))
+    store.db.commit()
     await Workflow(store, policy, fixture_github).run(task_id)
     assert store.task(task_id)["state"] == State.COMPLETED
     assert len(fixture_github.reviews) == 3
+    store.transition(store.task(task_id), Stage.MERGED, State.COMPLETED, "Merged externally")
+    with pytest.raises(ValueError, match="Merged tasks are terminal"):
+        quality.confirm(store.task(task_id), previous["items"])
+
+
+def test_offline_cli_regressions_do_not_supply_real_e2e():
+    plan = propose(
+        {
+            "repository_files": ["pyproject.toml", "tests/test_control_cli.py"],
+            "build_files": {"pyproject.toml": "pytest ruff mypy"},
+        }
+    )
+    e2e = [i for i in plan if i["category"] == "e2e"]
+    assert len(e2e) == 1 and not e2e[0]["entry"] and e2e[0]["required"]
+
+
+async def test_analyst_cannot_relabel_offline_tests_as_real_e2e(store, task_id):
+    checks = items(["true"])
+    checks[-1].update(required=True, entry=["pytest", "tests/test_control_cli.py"])
+    with pytest.raises(ValueError, match="real E2E.*controlled"):
+        Quality(store, Config()).confirm(store.task(task_id), checks)
+
+
+async def test_new_head_cannot_drop_unconfirmed_issue_acceptance(store, task_id, repo):
+    quality = Quality(store, Config())
+    task = store.task(task_id)
+    store.sync(task_id, task["snapshot"] | {"body": "Require actual browser and engine acceptance"})
+    task = store.task(task_id)
+    checks = items([], "controlled")
+    checks[-1]["reason"] = "Actual browser and engine entry is unavailable"
+    quality.confirm(task, checks)
+    (repo / "sample.txt").write_text("complete\n")
+    await command("git", "add", "sample.txt", cwd=str(repo))
+    await command("git", "commit", "-qm", "new PR head", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    store.sync(task_id, task["snapshot"] | {"head_sha": sha})
+    task = store.task(task_id)
+    plan = await quality.plan(task)
+    assert any(not i["entry"] and "assessment" in i["reason"] for i in plan["items"])
+    result = await quality.run(task, include_e2e=True)
+    assert verdict(result) == "blocked"
+    data, _ = await context(repo, store.task(task_id), Role.ANALYST, Config(), None)
+    assert "actual browser" in data["github"]["body"] and data["target_sha"] == sha
+    assert data["repository_instructions"] == (repo / "AGENTS.md").read_text()
 
 
 @pytest.mark.parametrize(
@@ -109,7 +175,7 @@ async def test_failure_and_missing_environment_are_distinct(store, task_id, entr
     quality.confirm(store.task(task_id), items(entry))
     result = await quality.run(store.task(task_id), include_e2e=True)
     assert verdict(result) == status
-    assert result["items"][-1]["status"] == status
+    assert result["items"][1]["status"] == status
 
 
 async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store, task_id, repo):
@@ -155,6 +221,63 @@ async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store,
         )
     assert verdict(result) == "passed"
     assert all("real controlled entry" in row["stdout"]["tail"] for row in result["items"][2:])
+
+
+async def test_real_qa_denies_host_secrets_and_requires_explicit_network(
+    store, task_id, repo, tmp_path, monkeypatch
+):
+    import asyncio
+
+    sentinel = tmp_path / "host-secret"
+    sentinel.write_text("PRIVATE_HOST_DATA")
+    monkeypatch.setenv("GH_TOKEN", "PRIVATE_HOST_TOKEN")
+    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv("QA_PROBE_PORT", str(port))
+    (repo / "qa").mkdir()
+    (repo / "qa/probe.py").write_text(
+        "import os, pathlib, socket\n"
+        "assert 'GH_TOKEN' not in os.environ and 'SSH_AUTH_SOCK' not in os.environ\n"
+        f"assert not pathlib.Path({str(sentinel)!r}).exists()\n"
+        "s=socket.socket(); s.settimeout(1)\n"
+        f"connected=s.connect_ex(('127.0.0.1', {port}))==0; s.close()\n"
+        "assert connected == ('QA_PROBE_PORT' in os.environ)\n"
+        "print('actual network and host-filesystem boundary verified')\n"
+    )
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "Untrusted QA secret probe", cwd=str(repo))
+    sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    store.sync(task_id, store.task(task_id)["snapshot"] | {"head_sha": sha})
+    quality = Quality(store, Config())
+    checks = items(["{python}", "qa/probe.py"], "controlled")
+    try:
+        for granted in (False, True):
+            checks[-1].update(network=granted, variables=["QA_PROBE_PORT"] if granted else [])
+            plan = quality.confirm(store.task(task_id), checks)
+            result = await quality.run(
+                store.task(task_id),
+                include_e2e=True,
+                real_check=2,
+                approved_plan=plan["plan_hash"],
+                before_real=authorized_fixture,
+            )
+            assert verdict(result) == "passed"
+            assert "PRIVATE_HOST" not in json.dumps(result)
+        monkeypatch.setenv("QA_PROBE_PORT", "changed")
+        with pytest.raises(ValueError, match="current plan hash"):
+            await quality.run(
+                store.task(task_id),
+                include_e2e=True,
+                real_check=2,
+                approved_plan=plan["plan_hash"],
+                before_real=authorized_fixture,
+            )
+        checks[-1]["variables"] = ["GH_TOKEN"]
+        with pytest.raises(ValueError, match="engine/browser"):
+            quality.confirm(store.task(task_id), checks)
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_plan_cannot_change_under_another_lease(store, task_id):
@@ -204,13 +327,19 @@ async def test_archive_append_redaction_readback_and_unknown_write(
 
     monkeypatch.setattr(fixture_github, "pages", pages)
     monkeypatch.setattr(fixture_github, "mutate", mutate)
-    result["items"][0]["stdout"]["tail"] = "github_pat_" + "PRIVATE" * 12
     remote = Controlled(store, policy, fixture_github)
+    altered = copy.deepcopy(result)
+    altered["items"][0]["stdout"]["tail"] = "FORGED_BUSINESS_DATA"
+    with pytest.raises(ValueError, match="original.*stored"):
+        await publish(remote, task, altered)
+    checks = items(["sh", "-c", "printf 'PRIVATE_BUSINESS_DATA\\n'"])
+    quality.confirm(store.task(task_id), checks)
+    task = store.task(task_id)
+    result = await quality.run(task, include_e2e=True)
     first = await publish(remote, task, result)
-    result = copy.deepcopy(result)
-    result["run_id"] += "-failed"
-    result["items"][-1]["status"] = "failed"
-    result["items"][-1]["exit_code"] = 1
+    quality.confirm(store.task(task_id), items(["sh", "-c", "exit 1"]))
+    task = store.task(task_id)
+    result = await quality.run(task, include_e2e=True)
     uncertain = True
     second = await publish(remote, task, result)
     assert first["sha"] != second["sha"] and first["sha"] in first["url"]
@@ -221,6 +350,9 @@ async def test_archive_append_redaction_readback_and_unknown_write(
         "git", "show", f"{first['sha']}:{first['path']}/manifest.json", cwd=task["repo_path"]
     )
     assert "PRIVATE" not in content and "directory" not in content
+    assert not {"entry", "argv", "stdout", "stderr", "reason", "scope"}.intersection(
+        json.loads(content)["items"][-1]
+    )
     assert len(comments) == 2 and all(len(rows) == 2 for rows in comments.values())
     assert (await publish(remote, task, result)) == second
     assert all(len(rows) == 2 for rows in comments.values())

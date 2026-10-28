@@ -153,6 +153,34 @@ async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, s
         assert "refusing replay" in restarted.records()[0]["reason"]
 
 
+async def test_refresh_only_current_status_without_scanning_and_respects_owner_lock(
+    intake, store, monkeypatch
+):
+    import fcntl
+
+    from gongcao.discovery import lock_path
+
+    await intake.scan()
+    task = store.tasks()[0]
+    assert len(store.tasks()) == 1
+
+    async def forbidden():
+        pytest.fail("A status refresh must not scan for other issues")
+
+    monkeypatch.setattr(intake, "scan", forbidden)
+    Controls(store).issue(task["id"], "pause")
+    writes = len(intake.github.writes)
+    with lock_path(task["snapshot"]["repository"]).open("a") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        await intake.refresh(task["id"])
+        assert intake.records()[0]["dirty"]
+        assert len(intake.github.writes) == writes
+    await intake.refresh(task["id"])
+    assert len(store.tasks()) == 1 and len(intake.github.writes) == writes + 1
+    assert not intake.records()[0]["dirty"]
+    assert "waiting_instruction" in intake.github.comments[0]["body"]
+
+
 async def test_progress_failure_is_durable_without_stopping_work_and_preserves_owner(intake, store):
     await intake.scan()
     task = store.tasks()[0]

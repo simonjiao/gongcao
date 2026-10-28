@@ -150,6 +150,14 @@ class Workflow:
             )
             return
         if stage == Stage.REVIEW:
+            if self.cached_run(task, Role.ANALYST) is None:
+                self.store.transition(
+                    self.safe(task),
+                    Stage.ANALYSIS,
+                    State.QUEUED,
+                    "Reassess current Issue and repository requirements at PR head",
+                )
+                return
             checks = await self.quality.run(task)
             if verdict(checks, include_e2e=False) == "blocked":
                 self.store.halt(
@@ -181,6 +189,9 @@ class Workflow:
         if stage in {Stage.VALIDATION, Stage.MERGEABLE}:
             review = self.cached_run(task, Role.REVIEWER)
             plan = await self.quality.plan(task)
+            current = self.store.task(task["id"])
+            if current["stage"] != stage:
+                return
             checks = self.store.artifact(task["id"], "quality-results", plan["plan_hash"])
             review = self.cached_run(task, Role.REVIEWER)
             if (
@@ -272,7 +283,7 @@ class Workflow:
             before = {run["id"] for run in self.store.runs(task_id)}
             try:
                 controls = Controls(self.store)
-                for _ in range(2 * self.config.max_revisions + 8):
+                for _ in range(4 * self.config.max_revisions + 10):
                     task = await self.sync(task_id)
                     await controls.poll(task_id, self.config, self.github)
                     if not controls.revalidate(task_id, self.config):

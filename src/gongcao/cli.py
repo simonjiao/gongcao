@@ -123,6 +123,12 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                     raise ValueError("Plan confirmation must match the current task version")
                 quality.confirm(task, proposed["items"])
             plan = await quality.plan(task)
+            task = store.task(args.task)
+            from .discovery import Discovery
+
+            # The task update marks its owned status comment dirty in the same transaction.
+            # Use the existing publisher's repository lock and intent/readback protocol.
+            await Discovery(store, config, github).refresh(args.task)
             if args.real_check is not None and not args.real:
                 raise ValueError("Real QA requires --real and --plan-hash")
 

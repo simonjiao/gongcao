@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import os
 import platform
+import re
 import sys
 import time
 import uuid
@@ -38,12 +40,18 @@ class Quality:
         checks = [Check.model_validate(item).model_dump() for item in items]
         if {item["category"] for item in checks} != {"build", "internal", "e2e"}:
             raise ValueError("Plan must explicitly cover build, internal and e2e")
+        if any(
+            i["category"] == "e2e" and i["required"] and i["environment"] != "controlled"
+            for i in checks
+        ):
+            raise ValueError("Required real E2E must use an explicitly authorized controlled entry")
         data = binding(task) | {
             "items": checks,
             "policy": self.config.policy_hash,
             "source": source,
             "analysis_hash": analysis_hash,
             "runtime": self.runtime,
+            "environment_hash": self.environment_hash(checks),
         }
         data["plan_hash"] = digest(data)
         previous = self.store.artifact(task["id"], "quality-plan", self.config.policy_hash)
@@ -63,6 +71,17 @@ class Quality:
                 "AND role IN ('reviewer','validator')",
                 (task["id"],),
             )
+            if task["stage"] in {Stage.VALIDATION, Stage.MERGEABLE}:
+                self.store.db.execute(
+                    "UPDATE tasks SET stage=?,state=?,reason=?,updated=? WHERE id=?",
+                    (
+                        Stage.REVIEW,
+                        State.QUEUED,
+                        "Validation plan changed; review required",
+                        time.time(),
+                        task["id"],
+                    ),
+                )
             self.store.db.execute(
                 "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
                 (
@@ -74,6 +93,16 @@ class Quality:
                 ),
             )
         return data
+
+    @staticmethod
+    def environment_hash(items: list[dict[str, Any]]) -> str:
+        names = {name for item in items for name in item.get("variables", [])}
+        if any(
+            not re.fullmatch(r"(?:QA|PLAYWRIGHT|WORKSPACE|DORIS|FLINK|KAFKA)_[A-Z0-9_]+", n)
+            for n in names
+        ):
+            raise ValueError("QA may only receive explicitly named engine/browser variables")
+        return digest({name: os.environ.get(name) for name in sorted(names)})
 
     async def plan(self, task: dict[str, Any]) -> dict[str, Any]:
         analyses = [
@@ -92,24 +121,38 @@ class Quality:
             current
             and current["source"] == "operator"
             and all(current.get(k) == v for k, v in binding(task).items())
-            and current["runtime"] != self.runtime
+            and (
+                current["runtime"] != self.runtime
+                or current["environment_hash"] != self.environment_hash(current["items"])
+            )
         ):
             return self.confirm(task, current["items"])
         if (
             current
             and current["runtime"] == self.runtime
+            and current["environment_hash"] == self.environment_hash(current["items"])
             and all(current.get(k) == v for k, v in binding(task).items())
             and (current["source"] == "operator" or current["analysis_hash"] == digest(proposal))
         ):
             return current
         data, _ = await context(Path(task["repo_path"]), task, Role.REVIEWER, self.config, None)
         items = propose(data)
-        for candidate in analyses[-1].get("validation_plan", []) if analyses else []:
+        covered = {i["category"] for i in proposal}
+        items = [i for i in items if i["entry"] or i["category"] not in covered]
+        for candidate in proposal:
             item = Check.model_validate(candidate).model_dump()
-            if item["required"] and item["entry"]:
-                items = [i for i in items if i["entry"] or i["category"] != item["category"]]
-                if item not in items:
-                    items.append(item)
+            if item not in items:
+                items.append(item)
+        if {i["category"] for i in proposal} != {"build", "internal", "e2e"}:
+            items.append(
+                Check(
+                    category="internal",
+                    entry=[],
+                    scope=["Issue", "AGENTS.md"],
+                    required=True,
+                    reason="Current-SHA Issue and repository acceptance assessment required",
+                ).model_dump()
+            )
         return self.confirm(task, items, source="repository", analysis_hash=digest(proposal))
 
     async def run(
@@ -121,7 +164,9 @@ class Quality:
         approved_plan: str | None = None,
         before_real: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
+        self.store.guard(task)
         plan = await self.plan(task)
+        task = self.store.task(task["id"])
         if real_check is not None and approved_plan != plan["plan_hash"]:
             raise ValueError("Explicit real QA authorization must name the current plan hash")
         cached = self.store.artifact(task["id"], "quality-results", plan["plan_hash"])
@@ -183,7 +228,17 @@ class Quality:
                 if before_real is None:
                     raise ValueError("Real QA requires a controller authorization checkpoint")
                 await before_real()
-                process = await launch(*expanded, cwd=str(real_workspace))
+                real_sandbox = Sandbox(real_workspace, directory / f"real-{index}", Role.DEVELOPER)
+                real_sandbox.prepare(self.config, authentication=False)
+                await real_sandbox.verify(repo)
+                isolated = real_sandbox.argv(*expanded)
+                grant = [] if item["network"] else ["--unshare-net"]
+                for name in item["variables"]:
+                    if name in os.environ:
+                        grant += ["--setenv", name, os.environ[name]]
+                split = isolated.index("--")
+                isolated[split:split] = grant
+                process = await launch(*isolated)
             else:
                 process = await launch(
                     *sandbox.argv(

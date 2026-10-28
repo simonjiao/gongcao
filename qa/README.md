@@ -45,7 +45,7 @@ probes continue to inspect the target worktree.
 
 Real scenarios create issues, unmerged PRs, review COMMENTs and dedicated branches
 in the selected **Gongcao-compatible** test repository. Its default branch must
-contain the project's `pyproject.toml`, `uv.lock`, tests and `ci.yml`. Review the
+contain the project's `pyproject.toml`, `uv.lock` and tests. Review the
 target before running. The fixture's quality policy is for this project, not a
 generic policy for arbitrary repositories.
 
@@ -83,10 +83,11 @@ their existing generated policies; production `quality` is never used as a scene
 This does not provide cross-process/global scheduling.
 
 - `smoke`: offline capability checks with an archived verdict; no model or remote writes.
-- `loop`: native missing-gate block and unchanged blocked repeat, then real analysis,
+- `loop`: real analysis and current-PR-head acceptance reassessment,
   deliberate initial lower-bound defect, draft PR, independent reviewer rejection,
   revision, old-SHA invalidation, all four project checks, real boundary checks,
-  exact-SHA CI, validator and human-merge readiness. Repeating the completed native
+  validator and human-merge readiness, followed by production evidence archive/readback.
+  No CI is required. Repeating the completed native
   task must create no sessions, operations or review comments.
   Technical-only corrections preserve the staged algorithm until the independent
   reviewer rejects it; a format-only revision cannot satisfy the review exercise.
@@ -115,7 +116,7 @@ This does not provide cross-process/global scheduling.
 - `discovery`: requires explicit real-QA authorization. Native continuous serve discovers
   an auto issue and a step issue through two run-owned labels, excludes an unlabelled issue,
   confirms unique controller status comments, and consumes a trusted pause on the step issue.
-  The auto issue uses the existing six-role loop and exact-SHA CI acceptance. A repeated scan
+  The auto issue uses the existing role loop and exact-SHA acceptance. A repeated scan
   must preserve sessions/PRs; cleanup additionally validates and closes the companion issues
   and removes only the run-owned labels. Run with
   `uv run python -m qa run discovery --real --repo OWNER/REPO --cleanup`.
@@ -141,7 +142,7 @@ The batch returns nonzero if any Run or its requested cleanup failed.
 
 ## Independent evidence and interruptions
 
-`verify` checks archive digests and re-evaluates controller, policy/SHA and CI
+`verify` checks archive digests and re-evaluates controller, plan and policy/SHA
 evidence. Before cleanup, `verify RUN_ID --real` additionally checks current GitHub
 facts and reruns credential-free boundary probes. Initial and final fixture code
 is inspected in a separate read-only OS sandbox. Missing, stale, unconfirmed or

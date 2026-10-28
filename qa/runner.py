@@ -364,6 +364,27 @@ async def execute(
                             **result,
                             "repeat_unchanged": True,
                         }
+                        require(
+                            await core(
+                                run,
+                                "quality",
+                                str(run.value["task_id"]),
+                                "--config",
+                                str(run.root / "config.yaml"),
+                                "--archive",
+                                "--real",
+                            )
+                            == 0,
+                            "Current execution evidence was not archived to GitHub",
+                        )
+                        run.archive(
+                            "quality-archives",
+                            [
+                                a
+                                for a in inspect(run)["evidence"]["artifacts"]
+                                if a["kind"] == "archive"
+                            ],
+                        )
                         break
                     require(
                         task["state"] in {"queued", "waiting_dependency"},

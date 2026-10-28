@@ -65,7 +65,7 @@ class Role(StrEnum):
 
 
 class AgentResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", json_schema_serialization_defaults_required=True)
 
     conclusion: str = Field(pattern="^(ready|revise|blocked|failed)$")
     summary: str = Field(min_length=1, max_length=8000)

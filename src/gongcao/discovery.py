@@ -413,3 +413,22 @@ class Discovery:
                 raise ValueError("Status PATCH was not confirmed")
             self.save(row["url"], confirmed=body, intent="", reason="")
         self.save(row["url"], dirty=int(self.render(row) != body))
+
+    async def refresh(self, task_id: int) -> None:
+        """Publish only this task's dirty status; an active serve owns its own refresh."""
+        rows = [
+            r for r in self.records() if r["task_id"] == task_id and (r["dirty"] or r["intent"])
+        ]
+        for row in rows:
+            repo = Target.parse(row["url"]).repository
+            with os.fdopen(
+                os.open(lock_path(repo), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "a"
+            ) as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    await self.publish(row)
+                except Exception as exc:
+                    self.warning(row["url"], exc)

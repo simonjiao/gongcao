@@ -255,7 +255,11 @@ async def test_steps_include_publication_revision_without_ci(
     for expected in (
         Stage.DEVELOPMENT,
         Stage.REVIEW,
+        Stage.ANALYSIS,
+        Stage.REVIEW,
         Stage.REVISION,
+        Stage.REVIEW,
+        Stage.ANALYSIS,
         Stage.REVIEW,
         Stage.VALIDATION,
     ):
@@ -670,7 +674,7 @@ async def test_step_received_during_failed_checks_stops_at_revision(
     await workflow.run(task_id)
     assert store.task(task_id)["stage"] == Stage.REVISION
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
-    assert len(store.runs(task_id)) == 2
+    assert [r["role"] for r in store.runs(task_id)] == ["analyst", "developer", "analyst"]
 
 
 @pytest.mark.parametrize("conflict", [False, True])

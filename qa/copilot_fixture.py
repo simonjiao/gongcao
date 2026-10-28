@@ -16,12 +16,18 @@ from .ledger import write_json
 
 WORKER = """
 import json,pathlib,sys,uuid
+from gongcao.plan import propose
 data=json.loads(sys.stdin.readline())['context']
 if data['role']=='developer': pathlib.Path('/workspace/sample.txt').write_text('complete\\n')
+plan=propose(data) if data['role']=='analyst' else []
+for item in plan:
+    if item['category']=='e2e':
+        item.update(required=False,reason='Offline protocol fixture; real E2E is not claimed')
 print(json.dumps({'kind':'thread','data':{'thread_id':str(uuid.uuid4())}}))
 print(json.dumps({'kind':'result','data':{
     'conclusion':'ready','summary':'Offline protocol result',
-    'basis':['Fixture only'],'target_sha':data['target_sha'],'next_steps':['Check gates']}}))
+    'basis':['Fixture only'],'target_sha':data['target_sha'],'next_steps':['Check gates'],
+    'validation_plan':plan}}))
 """
 
 

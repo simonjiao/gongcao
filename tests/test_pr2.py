@@ -17,17 +17,23 @@ from gongcao.workflow import Workflow
 
 WORKER = """
 import json, pathlib, sys, uuid
+from gongcao.plan import propose
 data = json.loads(sys.stdin.readline())['context']
 role = data['role']
 sample = pathlib.Path('/workspace/sample.txt')
 if role == 'developer':
     sample.write_text('complete\\n' if data['confirmed_findings'] else 'incomplete\\n')
 conclusion = 'revise' if role == 'reviewer' and sample.read_text() == 'incomplete\\n' else 'ready'
+plan = propose(data) if role=='analyst' else []
+for item in plan:
+    if item['category']=='e2e':
+        item.update(required=False,reason='Offline protocol fixture; real E2E is not claimed')
 print(json.dumps({'kind':'thread','data':{'thread_id':str(uuid.uuid4())}}))
 print(json.dumps({'kind':'result','data':{
     'conclusion':conclusion,'summary':'Inspected the exact worktree',
     'basis':['sample.txt must be complete'],'target_sha':data['target_sha'],
-    'next_steps':['Fix incomplete output' if conclusion=='revise' else 'Check controller gates']}}))
+    'next_steps':['Fix incomplete output' if conclusion=='revise' else 'Check controller gates'],
+    'validation_plan':plan}}))
 """
 
 
@@ -171,14 +177,16 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
     assert [r["role"] for r in runs] == [
         "analyst",
         "developer",
+        "analyst",
         "reviewer",
         "developer",
+        "analyst",
         "reviewer",
         "validator",
     ]
-    assert len({r["thread_id"] for r in runs}) == 6
-    assert len({r["worktree"] for r in runs}) == 6
-    assert not [r for r in runs[:-2] if r["evidence_valid"]]
+    assert len({r["thread_id"] for r in runs}) == 8
+    assert len({r["worktree"] for r in runs}) == 8
+    assert not [r for r in runs if r["target_sha"] != task["target_sha"] and r["evidence_valid"]]
     assert all(
         payload["event"] == "COMMENT"
         for path, payload in fixture_github.writes
@@ -189,10 +197,10 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
         store.db.execute('SELECT count(*) FROM operations WHERE state="succeeded"').fetchone()[0]
         == 6
     )
-    context = json.loads((store.root / "runs" / runs[2]["id"] / "context.json").read_text())
+    context = json.loads((store.root / "runs" / runs[3]["id"] / "context.json").read_text())
     assert context["confirmed_analysis"] is None
     assert context["quality_evidence"]["passed"]
-    assert context["diff"]["head_sha"] == runs[2]["target_sha"]
+    assert context["diff"]["head_sha"] == runs[3]["target_sha"]
     assert (await Quality(store, policy).run(task, include_e2e=True))["passed"]
     # Repeating the command neither calls a new agent nor duplicates any remote mutation.
     writes = len(fixture_github.writes)
