@@ -63,9 +63,45 @@ async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
         )
 
     monkeypatch.setattr("gongcao.github.command", read)
-    snapshot = await GitHub().snapshot(Target.parse("https://github.com/a/b/issues/1"))
+    api = GitHub()
+    snapshot = await api.snapshot(Target.parse("https://github.com/a/b/issues/1"))
     assert calls == [("gh", "api", "repos/a/b/issues/1")]
     assert snapshot["body"] == "[REDACTED]"
+    calls.clear()
+    token = background.set(True)
+    try:
+        await asyncio.gather(api.read("user"), api.read("user"))
+        assert len(calls) == 1 and api.traffic.counts["saved"] == 1
+        usage = Traffic(budget=1, remaining=999, limit=5000, reset=2000000000.0)
+        with pytest.raises(Deferred):
+            usage.start(False)
+        usage.remaining = 4000
+        usage.start(False)
+        with pytest.raises(Deferred):
+            usage.start(False)
+    finally:
+        background.reset(token)
+    await asyncio.gather(api.read("user"), api.read("user"))
+    assert len(calls) == 3  # Separate foreground checkpoints never share an older response.
+    release = asyncio.Event()
+
+    async def snapshot(target):
+        if background.get():
+            await release.wait()
+        return {"body": "old" if background.get() else "new"}
+
+    monkeypatch.setattr(api, "snapshot", snapshot)
+    task = {"url": "https://github.com/a/b/issues/1"}
+    token = background.set(True)
+    old = asyncio.create_task(api.task_snapshot(task))
+    await asyncio.sleep(0)
+    background.reset(token)
+    assert (await api.task_snapshot(task))["body"] == "new"
+    release.set()
+    await old
+    token = background.set(True)
+    assert (await api.task_snapshot(task))["body"] == "new"
+    background.reset(token)
 
 
 async def test_transient_github_read_retries_but_a_write_never_replays(monkeypatch):
@@ -113,6 +149,11 @@ async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
         (403, "X-RateLimit-Remaining: 0\n", True),
         (403, "Retry-After: 45\n", True),
         (429, "Retry-After: 45\n", True),
+        (
+            403,
+            "X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 9000\nX-RateLimit-Resource: graphql\n",
+            True,
+        ),
     ],
 )
 async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, headers, limited):
@@ -128,42 +169,18 @@ async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, header
     monkeypatch.setattr("gongcao.github.launch", launch)
     monkeypatch.setattr("gongcao.github.completed", lambda process: None)
     api = GitHub()
+    api.traffic.reset = 2000.0  # A core reset must not replace a GraphQL reset.
     with pytest.raises(Deferred if limited else PermissionError):
         await api.read("user")
     assert api.traffic.counts["checks"] == 1
     if limited:
+        if "9000" in headers:
+            assert api.traffic.cooldown == 9000
         with pytest.raises(Deferred):
             await api.mutate("path", {})
         assert api.traffic.counts["writes"] == 0
         now[0] = api.traffic.cooldown + 1
         api.traffic.start(False)  # Recovery admits a fresh request, without busy waiting.
-
-
-async def test_background_reserve_budget_and_inflight_reads(monkeypatch):
-    api = GitHub()
-    calls = []
-
-    async def read(*args):
-        calls.append(args)
-        await asyncio.sleep(0)
-        return "{}"
-
-    monkeypatch.setattr("gongcao.github.command", read)
-    token = background.set(True)
-    try:
-        await asyncio.gather(api.read("user"), api.read("user"))
-        assert len(calls) == 1 and api.traffic.counts["saved"] == 1
-        usage = Traffic(budget=1, remaining=999, limit=5000, reset=2000000000.0)
-        with pytest.raises(Deferred):
-            usage.start(False)
-        usage.remaining = 4000
-        usage.start(False)
-        with pytest.raises(Deferred):
-            usage.start(False)
-    finally:
-        background.reset(token)
-    await asyncio.gather(api.read("user"), api.read("user"))
-    assert len(calls) == 3  # Separate foreground checkpoints never share an older response.
 
 
 async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):

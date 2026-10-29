@@ -83,15 +83,24 @@ class Scheduler:
         )
         if wake:
             immediate = True  # A newly collected permission gets a fresh safety check now.
-        if not immediate and task["state"] != State.QUEUED:
+        if not immediate and task["state"] in {State.HUMAN, State.RECONCILE}:
+            await Controls(self.store).collect(task_id, self.config, self.github, force=False)
+            return  # Only a newly verified recovery permission can advance blocked work.
+        if not immediate and task["state"] not in {State.QUEUED, State.WAITING_INSTRUCTION}:
             if time.monotonic() < self.next_check.get(task_id, 0):
                 return
             self.next_check[task_id] = time.monotonic() + 60
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             if self.config.copilot_operators:
                 controls = Controls(self.store)
-                if not immediate and not controls.due(task_id, self.config, self.github):
-                    return
+                if not immediate:
+                    await controls.collect(task_id, self.config, self.github, force=False)
+                    if not self.store.db.execute(
+                        "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason=''",
+                        (task_id,),
+                    ).fetchone():
+                        return
+                    immediate = True
                 task = self.store.task(task_id)
                 if self.store.db.execute(
                     "SELECT 1 FROM leases WHERE task_id=?", (task_id,)

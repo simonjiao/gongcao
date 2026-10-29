@@ -426,7 +426,7 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
     async def raw(*args):
         calls.append(args)
         return (
-            'HTTP/2.0 200 OK\nLink: <next>; rel="next"\n\n{"items":[{"id":1}]}'
+            'HTTP/2.0 200 OK\nLink: <next?after=AbC>; rel="next"\n\n{"items":[{"id":1}]}'
             if args[-1] == "path"
             else '{"items":[{"id":2}]}'
         )
@@ -435,6 +435,7 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
     assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
     assert "--slurp" not in calls[0]
     assert len(calls) == 2
+    assert calls[-1][-1] == "next?after=AbC"
 
 
 async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id, planned_quality):

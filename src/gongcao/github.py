@@ -26,7 +26,12 @@ def response(raw: str) -> tuple[dict[str, str], str]:
     if not raw.startswith("HTTP/"):
         return {}, raw
     head, body = raw.replace("\r\n", "\n").split("\n\n", 1)
-    return dict(line.lower().split(": ", 1) for line in head.splitlines()[1:] if ": " in line), body
+    return {
+        key.lower(): value
+        for line in head.splitlines()[1:]
+        if ": " in line
+        for key, value in [line.split(": ", 1)]
+    }, body
 
 
 @dataclass
@@ -39,20 +44,21 @@ class Traffic:
     cooldown: float = 0
     spacing: float = 0
     failures: int = 0
+    generation: int = 0
     recent: deque[float] = field(default_factory=deque)
     counts: Counter[str] = field(default_factory=Counter)
     snapshots: dict[tuple[str, int | None], tuple[float, dict[str, Any]]] = field(
         default_factory=dict
     )
 
-    def due(self) -> float:
+    def due(self, *, spacing: bool = True) -> float:
         now = time.time()
         while self.recent and self.recent[0] <= now - 3600:
             self.recent.popleft()
         return float(
             max(
                 self.cooldown,
-                self.spacing,
+                self.spacing if spacing else 0,
                 self.recent[0] + 3600 if len(self.recent) >= self.budget else 0,
                 self.reset
                 if self.remaining is not None and self.remaining <= self.limit * self.reserve
@@ -62,7 +68,9 @@ class Traffic:
 
     def start(self, write: bool) -> None:
         now = time.time()
-        if now < self.cooldown or (background.get() and not write and now < self.due()):
+        if now < self.cooldown or (
+            background.get() and not write and now < self.due(spacing=False)
+        ):
             raise Deferred(f"GitHub requests deferred until {self.due():.0f}")
         self.counts["writes" if write else "background" if background.get() else "checks"] += 1
         if background.get():
@@ -94,8 +102,8 @@ class Traffic:
             )
             self.cooldown = max(
                 deadline,
-                self.reset
-                if headers.get("x-ratelimit-remaining") == "0" and self.reset > time.time()
+                float(headers["x-ratelimit-reset"])
+                if headers.get("x-ratelimit-remaining") == "0" and "x-ratelimit-reset" in headers
                 else time.time() + min(300, 30 * 2 ** min(self.failures - 1, 4)),
             )
             raise Deferred(f"GitHub rate limit; cooling until {self.cooldown:.0f}")
@@ -192,7 +200,7 @@ class GitHub:
         return Traffic()
 
     @cached_property
-    def pending(self) -> dict[str, asyncio.Task[str]]:
+    def pending(self) -> dict[tuple[int, str], asyncio.Task[str]]:
         return {}
 
     @cached_property
@@ -200,6 +208,8 @@ class GitHub:
         return {}
 
     async def api(self, path: str) -> str:
+        key = (self.traffic.generation, path)
+
         async def fetch() -> str:
             token = traffic.set(self.traffic)
             try:
@@ -211,19 +221,19 @@ class GitHub:
         # join an older read that could straddle a write or an Agent execution.
         if not background.get():
             return await fetch()
-        if path in self.pending and not self.pending[path].done():
+        if key in self.pending and not self.pending[key].done():
             self.traffic.counts["saved"] += 1
-            return await self.pending[path]
-        task = self.pending[path] = asyncio.create_task(fetch())
+            return await self.pending[key]
+        task = self.pending[key] = asyncio.create_task(fetch())
         try:
             return await task
         finally:
-            if self.pending.get(path) is task:
-                self.pending.pop(path, None)
+            if self.pending.get(key) is task:
+                self.pending.pop(key, None)
 
-    async def repository(self, repo: str) -> dict[str, Any]:
+    async def repository(self, repo: str, *, fresh: bool = False) -> dict[str, Any]:
         cached = self.metadata.get(repo)
-        if cached is None or time.monotonic() >= cached[0]:
+        if fresh or cached is None or time.monotonic() >= cached[0]:
             self.metadata[repo] = (time.monotonic() + 60, await self.read(f"repos/{repo}"))
         return self.metadata[repo][1]
 
@@ -244,6 +254,7 @@ class GitHub:
         self, path: str, payload: dict[str, Any], *, method: str = "POST"
     ) -> dict[str, Any]:
         token = traffic.set(self.traffic)
+        self.traffic.generation += 1
         self.traffic.snapshots.clear()
         try:
             raw = await command(
@@ -259,6 +270,7 @@ class GitHub:
             result: dict[str, Any] = json.loads(response(raw)[1])
             return result
         finally:
+            self.traffic.generation += 1
             self.traffic.snapshots.clear()
             traffic.reset(token)
 
@@ -318,6 +330,10 @@ class GitHub:
         if background.get() and cached and time.monotonic() < cached[0]:
             self.traffic.counts["saved"] += 1
             return dict(cached[1])
+        if not background.get():
+            self.traffic.generation += 1
+        generation = self.traffic.generation
+        expires = time.monotonic() + 60
         target = Target.parse(task["url"])
         snapshot = await self.snapshot(target)
         if task.get("pr_number") and target.kind == "issues":
@@ -332,7 +348,9 @@ class GitHub:
             snapshot.update(pull_url=pull["url"], pull_title=pull["title"], pull_body=pull["body"])
             if pull["state"] != "open":
                 snapshot["state"] = "closed"
-        self.traffic.snapshots[key] = (time.monotonic() + 60, dict(snapshot))
+        cached = self.traffic.snapshots.get(key)
+        if generation == self.traffic.generation and (not cached or cached[0] <= expires):
+            self.traffic.snapshots[key] = (expires, dict(snapshot))
         return snapshot
 
     async def gates(self, task: dict[str, Any]) -> dict[str, Any]:

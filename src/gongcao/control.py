@@ -545,13 +545,13 @@ class Controls:
                 github.traffic.counts["saved"] += 1
                 return
             self.store.instruction_polls[task_id] = time.monotonic() + 60
+            if not force:
+                github.traffic.spacing = time.time() + 3600 / github.traffic.budget
             token = background.set(not force)
             try:
                 await self._collect(task_id, config, github)
             finally:
                 background.reset(token)
-                if not force:
-                    github.traffic.spacing = time.time() + 3600 / github.traffic.budget
 
     async def _collect(self, task_id: int, config: Config, github: GitHub) -> None:
         task = self.store.task(task_id)

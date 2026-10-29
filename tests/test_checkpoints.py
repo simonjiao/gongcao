@@ -483,6 +483,7 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
         raise ConnectionError("read unavailable")
 
     monkeypatch.setattr(github, "instructions", unavailable)
+    store.owned_comments.clear()  # Exercise first-ownership reconciliation and persisted backoff.
     with store.db:
         store.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))
     await publisher.handoff(task_id)

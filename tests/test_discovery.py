@@ -46,6 +46,7 @@ def intake(store, repo, sha, snapshot):
             self.rows[3]["labels"] = [{"name": "agent-ready-extra"}]
             self.comments, self.writes, self.failure = [], [], ""
             self.sha = sha
+            self.branch = "main"
             self.calls = Counter()
 
         async def read(self, path):
@@ -62,7 +63,9 @@ def intake(store, repo, sha, snapshot):
             if "/issues/" in path:
                 return deepcopy(self.rows[int(path.rsplit("/", 1)[1])])
             return (
-                {"object": {"sha": self.sha}} if "/git/ref/" in path else {"default_branch": "main"}
+                {"object": {"sha": self.sha if path.endswith("/" + self.branch) else sha}}
+                if "/git/ref/" in path
+                else {"default_branch": self.branch}
             )
 
         async def snapshot(self, target):
@@ -299,6 +302,7 @@ async def test_default_branch_refresh_invalidates_or_holds_remote_intents(
         store.intent(task, "unknown", "push", "{}")
     await command("git", "commit", "--allow-empty", "-qm", "new default", cwd=str(repo))
     intake.github.sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    intake.github.branch = "release"  # Old main still exists: cached branch names are unsafe here.
     async with Lease(store, task["id"]):
         with pytest.raises(InstructionChanged):
             await Recovery(store, intake.github).sync(task)
