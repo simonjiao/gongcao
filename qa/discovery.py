@@ -144,6 +144,8 @@ async def exercise(run: Run, github: GitHub) -> None:
         await asyncio.wait_for(asyncio.shield(serving), 30)
     before = signature(inspect(run))
     require(await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed")
+    traces = (json.loads(p.read_text())["stderr"] for p in run.root.glob("command-*.json"))
+    require(any("GitHub 周期请求：" in text for text in traces), "Missing request accounting")
     store = Store(run.root / "state")
     try:
         records = [dict(row) for row in store.db.execute("SELECT * FROM claims ORDER BY url")]

@@ -3,15 +3,17 @@ import json
 import sqlite3
 import subprocess
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 from test_runner import install_worker
 
 from gongcao.config import Config
-from gongcao.github import GitHub, command
+from gongcao.github import Deferred, GitHub, command
 from gongcao.model import Role, Stage, State
 from gongcao.quality import Quality
 from gongcao.remote import Controlled, UncertainWrite
+from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 from gongcao.workflow import Workflow
 
@@ -88,6 +90,9 @@ class FixtureGitHub(GitHub):
         return []
 
     async def mutate(self, path, payload):
+        if path == "graphql":
+            self.pull["draft"] = False
+            return {"data": {}}
         self.writes.append((path, payload))
         if path.endswith("/reviews"):
             self.reviews.append(payload | {"id": len(self.reviews) + 1})
@@ -96,6 +101,7 @@ class FixtureGitHub(GitHub):
             "url": "https://github.com/example/demo/pull/9",
             "kind": "pull",
             "number": 9,
+            "node_id": "PR_fixture",
             "body": payload["body"],
             "base_ref": "main",
             "base_sha": self.sha,
@@ -164,10 +170,30 @@ def policy(auth_file):
 
 
 async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
-    store, task_id, repo, fixture_github, policy, caplog
+    store, task_id, repo, fixture_github, policy, caplog, monkeypatch
 ):
     caplog.set_level("INFO", logger="gongcao")
+    original, limited = Quality.run, []
+
+    async def quality(self, task, **kwargs):
+        checks = await original(self, task, **kwargs)
+        if task["stage"] == Stage.REVIEW and task["revision_count"] and not limited:
+            limited.append(checks["run_id"])
+            fixture_github.traffic.cooldown = 2_000_000_000
+            raise Deferred("after quality")
+        return checks
+
+    monkeypatch.setattr(Quality, "run", quality)
     await Workflow(store, policy, fixture_github).run(task_id)
+    assert limited and store.task(task_id)["state"] == State.QUEUED
+    fixture_github.traffic.cooldown = 0
+    scheduler = Scheduler(store, policy, fixture_github)  # Reload persisted cooldown.
+    await scheduler.advance(task_id)
+    assert fixture_github.traffic.cooldown == 2_000_000_000
+    assert store.task(task_id)["state"] == State.QUEUED
+    monkeypatch.setattr("gongcao.github.time.time", lambda: 2_000_000_001.0)
+    await scheduler.advance(task_id)
+    assert store.db.execute("SELECT COUNT(*) FROM retries").fetchone()[0] == 0
     task = store.task(task_id)
     assert task["stage"] == Stage.MERGEABLE, task["reason"]
     assert task["state"] == State.COMPLETED
@@ -199,7 +225,7 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
         for path, payload in fixture_github.writes
         if path.endswith("/reviews")
     )
-    assert len(fixture_github.reviews) == 2
+    assert len(fixture_github.reviews) == 2 and len(fixture_github.writes) == 3
     assert (
         store.db.execute('SELECT count(*) FROM operations WHERE state="succeeded"').fetchone()[0]
         == 6
@@ -208,11 +234,17 @@ async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
     assert context["confirmed_analysis"] is None
     assert context["quality_evidence"]["passed"]
     assert context["diff"]["head_sha"] == runs[3]["target_sha"]
-    assert (await Quality(store, policy).run(task, include_e2e=True))["passed"]
+    checks = await Quality(store, policy).run(task, include_e2e=True)
+    assert checks["passed"] and checks["run_id"] == limited[0]
     # Repeating the command neither calls a new agent nor duplicates any remote mutation.
     writes = len(fixture_github.writes)
     assert await Workflow(store, policy, fixture_github).run(task_id) == []
     assert len(fixture_github.writes) == writes
+    run = AsyncMock()
+    monkeypatch.setattr(Workflow, "run", run)
+    for _ in range(3):
+        await scheduler.advance(task_id, immediate=False)
+    run.assert_not_awaited()
 
 
 @pytest.mark.parametrize("blocker", ["formal_approval", "revision_limit"])
@@ -264,13 +296,15 @@ async def test_writes_require_verified_os_isolation(
     assert fixture_github.writes == []
 
 
-@pytest.mark.parametrize("result", ["observed", "unknown"])
+@pytest.mark.parametrize("result", ["observed", "unknown", "query", "gate", "rejected"])
 async def test_ambiguous_write_queries_remote_and_never_replays(
     store, task_id, policy, monkeypatch, result
 ):
     controlled = Controlled(store, policy, GitHub())
 
-    async def before(task, kind, *, finish_operation=False):
+    async def before(task, kind, *, finish_operation=False, verified=None):
+        if result == "gate" and finish_operation and calls == 0:
+            raise Deferred("limited before write")
         return task
 
     monkeypatch.setattr(controlled, "before", before)
@@ -278,16 +312,25 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
     calls = 0
 
     async def query():
+        if result == "query" and calls == 0:
+            raise Deferred("limited before intent")
         return observed
 
     async def write():
         nonlocal observed, calls
         calls += 1
+        if result == "rejected" and calls == 1:
+            raise Deferred("HTTP 429: write rejected")
         if result == "observed":
             observed = {"id": 7}
         raise RuntimeError("lost response")
 
     task = store.task(task_id)
+    if result in {"query", "gate", "rejected"}:
+        with pytest.raises(Deferred):
+            await controlled.perform(task, "review", "9", {}, query, write)
+        assert store.evidence(task_id)["operations"] == []
+        result, calls = "observed", 0  # Fresh checks authorize the first write after cooling.
     if result == "observed":
         assert await controlled.perform(task, "review", "9", {}, query, write) == {"id": 7}
         assert await controlled.perform(task, "review", "9", {}, query, write) == {"id": 7}
@@ -381,8 +424,8 @@ async def test_refresh_never_relabels_old_evidence_or_overwrites_merged(
     operation = "review" if change == "head_after_review" else "ready"
     original = getattr(workflow.remote, operation)
 
-    async def changed(*args):
-        await original(*args)
+    async def changed(*args, **kwargs):
+        await original(*args, **kwargs)
         if change == "merged":
             fixture_github.pull.update(merged=True, state="closed")
         elif change == "base_after_ready":
@@ -421,11 +464,16 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
 
     async def raw(*args):
         calls.append(args)
-        return '{"items":[{"id":1}]}\n {"items":[{"id":2}]}'
+        pages = [
+            'HTTP/2.0 200 OK\nLink: <next?after=AbC>; rel="next"\n\n{"items":[{"id":1}]}',
+            '{"items":[{"id":2}]}',
+        ]
+        return pages[len(calls) - 1]
 
     monkeypatch.setattr("gongcao.github.command", raw)
     assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
     assert "--slurp" not in calls[0]
+    assert len(calls) == 2 and calls[-1][-1] == "next?after=AbC"
 
 
 async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id, planned_quality):

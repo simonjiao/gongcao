@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 
@@ -12,7 +13,7 @@ import pytest
 from gongcao.config import Config, DiscoveryConfig, Source
 from gongcao.control import Controls, InstructionChanged
 from gongcao.discovery import Discovery
-from gongcao.github import GitHub, command
+from gongcao.github import Deferred, GitHub, command
 from gongcao.leases import Lease
 from gongcao.model import Stage, State
 from gongcao.recovery import Recovery
@@ -45,8 +46,11 @@ def intake(store, repo, sha, snapshot):
             self.rows[3]["labels"] = [{"name": "agent-ready-extra"}]
             self.comments, self.writes, self.failure = [], [], ""
             self.sha = sha
+            self.branch = "main"
+            self.calls = Counter()
 
         async def read(self, path):
+            self.calls["read"] += 1
             if path == "user":
                 return {"login": "owner"}
             if "/comments/" in path:
@@ -58,14 +62,18 @@ def intake(store, repo, sha, snapshot):
                 return item
             if "/issues/" in path:
                 return deepcopy(self.rows[int(path.rsplit("/", 1)[1])])
+            current = self.sha if path.endswith("/" + self.branch) else sha
             return (
-                {"object": {"sha": self.sha}} if "/git/ref/" in path else {"default_branch": "main"}
+                {"object": {"sha": current}}
+                if "/git/ref/" in path
+                else {"default_branch": self.branch}
             )
 
         async def snapshot(self, target):
             return deepcopy(self.rows[target.number])
 
         async def pages(self, path, field=None):
+            self.calls["pages"] += 1
             if self.failure in {"403", "429"}:
                 raise PermissionError("HTTP " + self.failure)
             if "/labels" in path:
@@ -82,6 +90,8 @@ def intake(store, repo, sha, snapshot):
 
         async def mutate(self, path, payload, *, method="POST"):
             self.writes.append(method)
+            if self.failure == "limited":
+                raise Deferred("HTTP 429: rejected")
             if self.failure == "absent":
                 raise ConnectionError("POST result unknown")
             if method == "POST":
@@ -134,7 +144,7 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
         reopened.close()
 
 
-@pytest.mark.parametrize("failure", ["lost", "absent", "interrupted"])
+@pytest.mark.parametrize("failure", ["lost", "absent", "interrupted", "limited"])
 async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, store, failure):
     intake.github.failure = failure
     if failure == "interrupted":
@@ -144,10 +154,10 @@ async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, s
         await intake.scan()
     assert bool(store.tasks()) == (failure == "lost")
     intake.github.failure = ""
-    restarted = Discovery(store, Config(), intake.github)
+    restarted = Discovery(store, intake.config if failure == "limited" else Config(), intake.github)
     async with restarted.active(once=True):
         assert bool(store.tasks()) == (failure != "absent")
-    assert intake.github.writes.count("POST") == 1
+    assert intake.github.writes.count("POST") == 1 + (failure == "limited")
     assert not store.db.execute("SELECT 1 FROM runs").fetchone()
     if failure == "absent":
         assert "refusing replay" in restarted.records()[0]["reason"]
@@ -163,6 +173,10 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
     await intake.scan()
     task = store.tasks()[0]
     assert len(store.tasks()) == 1
+    intake.github.calls.clear()
+    writes = len(intake.github.writes)
+    await intake.publish(intake.records()[0])
+    assert intake.github.calls == {"read": 1} and len(intake.github.writes) == writes
 
     async def forbidden():
         pytest.fail("A status refresh must not scan for other issues")
@@ -177,27 +191,29 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
         assert len(intake.github.writes) == writes
     await intake.refresh(task["id"])
     assert len(store.tasks()) == 1 and len(intake.github.writes) == writes + 1
-    assert not intake.records()[0]["dirty"]
+    assert intake.github.calls == {"read": 3} and not intake.records()[0]["dirty"]
     assert "waiting_instruction" in intake.github.comments[0]["body"]
 
 
+@pytest.mark.parametrize("failure", ["absent", "limited"])
 async def test_progress_failure_is_durable_without_stopping_work_and_preserves_owner(
-    intake, store, monkeypatch
+    intake, store, monkeypatch, failure
 ):
     await intake.scan()
     task = store.tasks()[0]
-    intake.github.failure = "absent"
+    intake.github.failure = failure
     Controls(store).issue(task["id"], "pause")
     await intake.cycle(discover=False)
     row = intake.records()[0]
-    assert row["dirty"] and row["intent"] and row["reason"]
+    assert row["dirty"] and bool(row["intent"]) == (failure == "absent") and row["reason"]
     assert store.task(task["id"])["state"] == State.WAITING_INSTRUCTION
     writes = len(intake.github.writes)
     intake.github.failure = ""
     restarted = Discovery(store, Config(), intake.github)
     await restarted.cycle(discover=False)
-    assert len(intake.github.writes) == writes  # Unobserved PATCH is never blindly replayed.
-    intake.github.comments[0]["body"] = row["intent"]
+    assert len(intake.github.writes) == writes
+    if failure == "absent":
+        intake.github.comments[0]["body"] = row["intent"]
     restarted.retry.clear()
     import time
 
@@ -205,6 +221,7 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     monkeypatch.setattr("gongcao.discovery.time.time", lambda: future)
     await restarted.cycle(discover=False)
     assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
+    assert len(intake.github.writes) == writes + (failure == "limited")
     intake.github.comments[0]["user"]["login"] = "other"
     with pytest.raises(ValueError, match="author"):
         await restarted.publish(restarted.records()[0])
@@ -282,6 +299,7 @@ async def test_default_branch_refresh_invalidates_or_holds_remote_intents(
         store.intent(task, "unknown", "push", "{}")
     await command("git", "commit", "--allow-empty", "-qm", "new default", cwd=str(repo))
     intake.github.sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    intake.github.branch = "release"  # Old main still exists: cached branch names are unsafe here.
     async with Lease(store, task["id"]):
         with pytest.raises(InstructionChanged):
             await Recovery(store, intake.github).sync(task)
@@ -307,10 +325,11 @@ async def test_scan_errors_back_off_without_changing_registered_tasks(
 async def test_merged_fact_wins_over_new_default_base_without_operators(intake, store, entry):
     await intake.scan()
     task = store.tasks()[0]
+    state = State.COMPLETED if entry == "publisher" else State.WAITING_INSTRUCTION
     with store.db:
         store.db.execute(
             "UPDATE tasks SET pr_number=9,stage=?,state=? WHERE id=?",
-            (Stage.MERGEABLE, State.WAITING_INSTRUCTION, task["id"]),
+            (Stage.MERGEABLE, state, task["id"]),
         )
     intake.github.rows[9] = intake.github.rows[1] | {
         "merged": True,

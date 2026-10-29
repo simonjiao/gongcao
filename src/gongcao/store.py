@@ -21,6 +21,8 @@ class Store:
         self.owners: dict[int, str] = {}
         self.reported: dict[int, tuple[str, str, int | None]] = {}
         self.last_activity = time.monotonic()
+        self.instruction_polls: dict[int, float] = {}
+        self.owned_comments: dict[str, tuple[Any, ...]] = {}
         try:
             with (self.root / "schema.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)

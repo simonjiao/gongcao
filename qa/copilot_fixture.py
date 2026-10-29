@@ -116,7 +116,10 @@ class OfflineGitHub(GitHub):
         self, path: str, payload: dict[str, Any], *, method: str = "POST"
     ) -> dict[str, Any]:
         self.data["writes"].append({"path": path, "payload": payload})
-        if "/comments" in path:
+        if path == "graphql":
+            self.data["pull"]["draft"] = False
+            result: dict[str, Any] = {"data": {}}
+        elif "/comments" in path:
             rows = self.data.setdefault("status_comments", [])
             if method == "POST":
                 result = {
@@ -137,6 +140,7 @@ class OfflineGitHub(GitHub):
                 "url": "https://github.com/example/demo/pull/9",
                 "kind": "pull",
                 "number": 9,
+                "node_id": "PR_fixture",
                 "body": payload["body"],
                 "base_ref": "main",
                 "base_sha": self.data["sha"],

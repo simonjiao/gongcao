@@ -388,6 +388,14 @@ class Quality:
             f"质量结果：通过 {counts['passed']}；失败 {counts['failed']}；"
             f"未执行/缺环境 {counts['blocked']}",
         )
+        Controls(self.store).fence(task["id"])
+        if self.store.db.execute(
+            "SELECT 1 FROM processes WHERE task_id=? AND state!='stopped'", (task["id"],)
+        ).fetchone():
+            raise ValueError("Quality process cleanup requires recovery")
+        self.store.transition(
+            task, Stage(task["stage"]), State.QUEUED, "Validation plan execution completed"
+        )
         return data
 
 

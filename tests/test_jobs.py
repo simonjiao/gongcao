@@ -115,7 +115,7 @@ def checkout(tmp_path_factory):
         "        fcntl.flock(out,fcntl.LOCK_EX)\n"
         "        out.write(json.dumps({'kind':kind,'argv':sys.argv[1:]})+'\\n')\n"
         "event('started')\n"
-        "assert len(sys.argv)==3 and sys.argv[1]=='api'\n"
+        "assert len(sys.argv)==4 and sys.argv[1]=='api' and sys.argv[3]=='--include'\n"
         "assert sys.argv[2].startswith('repos/example/demo/issues/')\n"
         "deadline=time.monotonic()+30\n"
         "while not (gate/'release').exists() and time.monotonic()<deadline: time.sleep(.01)\n"

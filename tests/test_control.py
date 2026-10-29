@@ -30,6 +30,7 @@ class Comments(GitHub):
         self.sequence = 0
         self.listing_error = None
         self.listing_missing = False
+        self.reads = []
 
     def post(self, body, *, actor="owner", at=None):
         stamp = (datetime.now(UTC) if at is None else datetime.fromtimestamp(at, UTC)).isoformat()
@@ -45,6 +46,7 @@ class Comments(GitHub):
         return comment
 
     async def instructions(self, task):
+        self.reads.append(task["id"])
         assert observer.get() is None
         if self.listing_error:
             raise self.listing_error
@@ -309,11 +311,17 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     store, sha, snapshot, repo, monkeypatch, comments
 ):
     clock = [100.0]
-    monkeypatch.setattr("gongcao.control.time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(
+        "gongcao.control.time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    )
     task_id = store.register(snapshot["url"], repo, sha, snapshot)
     controls = Controls(store)
     controls.issue(task_id, "pause")
     config = Config(copilot_operators=["owner"])
+    await asyncio.gather(
+        *(controls.collect(task_id, config, comments, force=False) for _ in range(12))
+    )
+    assert comments.reads == [task_id]
 
     comments.post("/gongcao auto", actor="stranger", at=101)
     comments.post("ordinary comment", at=101)
@@ -321,6 +329,7 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     edited["updated_at"] = "2099-01-01T00:00:00Z"
     await controls.poll(task_id, config, comments)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert comments.reads == [task_id] * 2
     assert "Edited comments" in store.evidence(task_id)["instructions"][-1]["reason"]
     comments.post("/gongcao step\nAlso check the upper bound.", at=101)
     clock[0] = 102
@@ -351,6 +360,15 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     store.halt(task_id, State.RECONCILE, "Unknown write")
     controls.issue(task_id, "pause")
     assert store.task(task_id)["state"] == State.RECONCILE
+
+    monkeypatch.setattr("gongcao.github.time.time", lambda: clock[0])
+    clock[0] = 2_000_000_000.0
+    ids = {store.register(snapshot["url"] + str(i), repo, sha, snapshot) for i in range(25)}
+    for _ in range(30):
+        for task in controls.polling_tasks():
+            await controls.collect(task["id"], config, comments, force=False)
+        clock[0] += 5
+    assert ids <= set(comments.reads)
 
 
 @pytest.mark.parametrize(
@@ -646,8 +664,8 @@ async def test_until_current_review_pauses_after_review_write_without_advancing(
     workflow = reviewing
     original = workflow.remote.review
 
-    async def reviewed(task, result, run_id):
-        await original(task, result, run_id)
+    async def reviewed(task, result, run_id, **kwargs):
+        await original(task, result, run_id, **kwargs)
         comments.post("/gongcao until review")
         await asyncio.create_task(
             Controls(store).collect(task_id, workflow.config, fixture_github), context=Context()

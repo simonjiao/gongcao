@@ -15,7 +15,7 @@ from test_runner import SUCCESS, install_worker
 
 from gongcao.cli import logs
 from gongcao.config import Config
-from gongcao.github import GitHub
+from gongcao.github import Deferred, GitHub
 from gongcao.github import command as git_command
 from gongcao.leases import Lease, identity, session_alive
 from gongcao.model import AgentResult, Role, Stage, State
@@ -296,6 +296,8 @@ async def test_unknown_review_is_queried_and_never_replayed(
         return dict(task["snapshot"])
 
     monkeypatch.setattr(github, "task_snapshot", snapshot)
+    github.traffic.defer(store, task_id, Deferred("write readback limited"))
+    assert store.artifact(task_id, "github-cooldown", "")["recovery"]
     result = await Recovery(store, github).recover(task_id)
     assert github.writes == 0
     if match in {"yes", "cancel"}:
@@ -548,6 +550,7 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
     with store.db:
         store.db.execute("INSERT INTO retries VALUES(?,?,?,?)", (task_id, 1, "old", 0))
     scheduler = Scheduler(store, Config(), RegisteredGitHub(store))
+    scheduler.github.traffic.defer(store, task_id, Deferred("readback limited"), recovery=True)
     async with contextlib.AsyncExitStack() as stack:
         for tid in ids:
             assert (await stack.enter_async_context(Lease(store, tid))).acquired
@@ -560,6 +563,7 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
             == 1
         )
         assert not store.runs(task_id)
+        assert store.artifact(task_id, "github-cooldown", "")["recovery"]
         assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
 
 

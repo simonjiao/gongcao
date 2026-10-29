@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from .config import Config, Source
 from .control import baseline
 from .events import Redactor, task_event
-from .github import GitHub, Target
+from .github import Deferred, GitHub, Target, background
 from .model import Stage, State
 from .processes import CleanupError
 from .recovery import Recovery
@@ -37,6 +37,7 @@ def lock_path(repo: str) -> Path:
 class Discovery:
     def __init__(self, store: Store, config: Config, github: GitHub):
         self.store, self.config, self.github = store, config, github
+        github.traffic.restore(store)
         self.controller = store.db.execute("SELECT id FROM controller").fetchone()[0]
         self.locks: list[TextIO] = []
         self.retry: dict[str, tuple[int, float]] = {}
@@ -131,11 +132,15 @@ class Discovery:
     async def watch(self, *, discover: bool) -> None:
         while True:
             await asyncio.sleep(1)
-            await self.cycle(discover=discover)
+            token = background.set(True)
+            try:
+                await self.cycle(discover=discover)
+            finally:
+                background.reset(token)
 
     async def cycle(self, *, discover: bool) -> None:
         # Reconcile old claims and pending PATCHes before admitting new work.
-        facts_due = time.monotonic() >= self.next_facts
+        facts_due = time.monotonic() >= self.next_facts and time.time() >= self.github.traffic.due()
         if facts_due:
             self.next_facts = time.monotonic() + self.config.discovery.interval_seconds
         for row in self.records():
@@ -157,7 +162,12 @@ class Discovery:
                 self.retry.pop(row["url"], None)
             except Exception as exc:
                 self.warning(row["url"], exc)
-        if discover and self.config.discovery.enabled and time.monotonic() >= self.next_scan:
+        if (
+            discover
+            and self.config.discovery.enabled
+            and time.monotonic() >= self.next_scan
+            and time.time() >= self.github.traffic.due()
+        ):
             self.next_scan = time.monotonic() + self.config.discovery.interval_seconds
             await self.scan()
 
@@ -187,8 +197,17 @@ class Discovery:
                 "Published PR baseline changed; manual reconciliation required",
             )
 
-    async def eligible(self, target: Target, label: str, marker: str = "") -> dict[str, Any]:
-        raw = await self.github.read(f"repos/{target.repository}/issues/{target.number}")
+    async def eligible(
+        self,
+        target: Target,
+        label: str,
+        marker: str = "",
+        *,
+        raw: dict[str, Any] | None = None,
+        comments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if raw is None:
+            raw = await self.github.read(f"repos/{target.repository}/issues/{target.number}")
         if (
             raw["state"] != "open"
             or "pull_request" in raw
@@ -209,15 +228,14 @@ class Discovery:
             raise ValueError(
                 "Issue has prior handling or a linked PR; manual reconciliation required"
             )
-        comments = await self.github.instructions({"url": target.url})
+        if comments is None:
+            comments = await self.github.instructions({"url": target.url})
         if any(
             "<!-- gongcao:" in item.get("body", "") and (not marker or marker not in item["body"])
             for item in comments
         ):
             raise ValueError("Another controller/unknown Gongcao status marker already exists")
-        snapshot = await self.github.snapshot(target)
-        snapshot["labels"] = [item["name"] for item in raw["labels"]]
-        return snapshot
+        return self.github.facts(target, raw)
 
     async def scan(self) -> None:
         # Preparation is independent of claim capacity and pending-task backlog.
@@ -326,7 +344,7 @@ class Discovery:
                     ):
                         continue
                     try:
-                        await self.prepare(source, target)
+                        await self.prepare(source, target, item)
                     except ValueError:
                         # Rejected candidates remain visible in read-only diagnostics; don't
                         # repeat one warning per candidate on every empty-progress scan.
@@ -338,8 +356,10 @@ class Discovery:
             except Exception as exc:
                 self.warning(source.repo, exc)
 
-    async def prepare(self, source: Source, target: Target) -> None:
-        snapshot = await self.eligible(target, source.label)
+    async def prepare(
+        self, source: Source, target: Target, raw: dict[str, Any] | None = None
+    ) -> None:
+        snapshot = await self.eligible(target, source.label, raw=raw)
         actor = (await self.github.read("user"))["login"].lower()
         sha = await Recovery(self.store, self.github).default_base(
             {
@@ -372,9 +392,42 @@ class Discovery:
         except Exception as exc:
             self.warning(target.url, exc)
 
-    async def owned(self, row: dict[str, Any]) -> dict[str, Any] | None:
+    async def owned(
+        self, row: dict[str, Any], comments: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any] | None:
         data = json.loads(row["data"])
-        comments = await self.github.instructions({"url": row["url"]})
+        target = Target.parse(row["url"])
+        proof = self.store.owned_comments.get(row["url"])
+        if (
+            proof
+            and row["comment_id"] == proof[0]
+            and row["confirmed"]
+            and not row["intent"]
+            and not row["reason"]
+        ):
+            try:
+                item: dict[str, Any] = await self.github.read(
+                    f"repos/{target.repository}/issues/comments/{proof[0]}"
+                )
+                if (
+                    (
+                        item["id"],
+                        item["user"].get("id"),
+                        item["user"]["login"].lower(),
+                        data["marker"],
+                    )
+                    == proof
+                    and data["marker"] in item.get("body", "")
+                    and item["body"] == row["confirmed"]
+                ):
+                    return item
+            except Deferred:
+                raise
+            except Exception:
+                pass  # An anomalous direct read requires full uniqueness/ownership reconciliation.
+            self.store.owned_comments.pop(row["url"], None)
+        if comments is None:
+            comments = await self.github.instructions({"url": row["url"]})
         matches = [item for item in comments if data["marker"] in item.get("body", "")]
         if len(matches) > 1:
             raise ValueError("Duplicate claim markers; refusing to choose a status comment")
@@ -388,7 +441,6 @@ class Discovery:
         ):
             raise ValueError("Claim comment author or ID does not match the recorded owner")
         # Verify the ID directly as well as uniqueness across all comment pages.
-        target = Target.parse(row["url"])
         observed = await self.github.read(f"repos/{target.repository}/issues/comments/{item['id']}")
         if (
             any(observed.get(key) != item.get(key) for key in ("id", "body"))
@@ -396,18 +448,32 @@ class Discovery:
             or observed.get("user", {}).get("id") != item["user"].get("id")
         ):
             raise ValueError("Status comment changed during observation")
+        self.store.owned_comments[row["url"]] = (
+            item["id"],
+            item["user"].get("id"),
+            data["actor"],
+            data["marker"],
+        )
         return item
 
     async def claim(self, row: dict[str, Any]) -> None:
+        token = background.set(False)
+        try:
+            await self._claim(row)
+        finally:
+            background.reset(token)
+
+    async def _claim(self, row: dict[str, Any]) -> None:
         data = json.loads(row["data"])
         target = Target.parse(row["url"])
-        item = await self.owned(row)
+        comments = await self.github.instructions({"url": row["url"]})
+        item = await self.owned(row, comments)
         if item is None:
             if data["attempted"]:
                 raise ValueError("Unconfirmed claim POST; refusing replay or Agent execution")
             if not self.config.discovery.enabled:
                 raise ValueError("Discovery disabled; retaining the planned claim without a POST")
-            await self.eligible(target, data["label"], data["marker"])
+            await self.eligible(target, data["label"], data["marker"], comments=comments)
             body = (
                 data["marker"]
                 + f"\nGongcao claim pending confirmation. Mode: {data['mode']}."
@@ -421,6 +487,10 @@ class Discovery:
                 )
                 self.save(row["url"], comment_id=response["id"])
                 row["comment_id"] = response["id"]
+            except Deferred:
+                data["attempted"] = False
+                self.save(row["url"], data=json.dumps(data), intent="")
+                raise
             except Exception:
                 item = await self.owned(row)
                 if item is None:
@@ -432,8 +502,9 @@ class Discovery:
             raise ValueError("Claim content was not confirmed; Agent execution is prohibited")
         self.save(row["url"], comment_id=item["id"], confirmed=item["body"], intent="")
         # A confirmed claim survives label removal; lifecycle changes remain a registration gate.
-        snapshot = await self.github.snapshot(target)
-        snapshot["labels"] = await self.github.labels(target)
+        snapshot = self.github.facts(
+            target, await self.github.read(f"repos/{target.repository}/issues/{target.number}")
+        )
         task_id = self.store.register(
             target.url,
             Path(data["path"]),
@@ -593,6 +664,13 @@ class Discovery:
                     self.warning(row["url"], exc)
 
     async def publish(self, row: dict[str, Any]) -> None:
+        token = background.set(False)
+        try:
+            await self._publish_locked(row)
+        finally:
+            background.reset(token)
+
+    async def _publish_locked(self, row: dict[str, Any]) -> None:
         # Foreground handoff and the background ticker must share the same PATCH intent.
         key = hashlib.sha256(row["url"].encode()).hexdigest()
         with (self.store.root / f"status-{key}.lock").open("a") as lock:
@@ -624,6 +702,7 @@ class Discovery:
         body = self.render(row)
         if item["body"] != body:
             self.save(row["url"], intent=body)
+            row["intent"] = body
             target = Target.parse(row["url"])
             try:
                 await self.github.mutate(
@@ -631,11 +710,15 @@ class Discovery:
                     {"body": body},
                     method="PATCH",
                 )
+            except Deferred:
+                self.save(row["url"], intent="")
+                raise
             except Exception:
                 observed = await self.owned(row)
                 if observed is None or observed["body"] != body:
                     raise
-            observed = await self.owned(row)
+            else:
+                observed = await self.owned(row | {"intent": "", "confirmed": body})
             if observed is None or observed["body"] != body:
                 raise ValueError("Status PATCH was not confirmed")
             self.save(row["url"], confirmed=body, intent="", reason="")
