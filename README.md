@@ -118,11 +118,12 @@ Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远
 ```yaml
 discovery:
   enabled: true
+  repo_root: /absolute/repositories
   interval_seconds: 60
   max_new_per_scan: 10
   sources:
     - repo: OWNER/REPO
-      path: /absolute/local/checkout
+      # path: /absolute/local/checkout  # 可选：覆盖 repo_root 推导的路径
       label: agent-ready
       mode: step
 ```
@@ -131,6 +132,17 @@ discovery:
 来源显式配置 `auto` 才连续推进。互斥的 `gongcao:*` 模式标签优先于来源模式，
 标签冲突会暂停。GitHub 评论控制还须配置下文的 `copilot.operators`，默认为空；
 本地 `gongcao control` 始终可用。
+
+未显式设置来源 `path` 时使用 `<repo_root>/<owner>/<repo>`；两者不能同时缺失。
+路径必须为绝对路径，不允许 `.`/`..`、符号链接或不同仓库共用一个目录。
+扫描前独立准备全部配置仓库，不受领取积压上限影响：缺失仓库由宿主通过现有
+GitHub 授权 clone 到临时目录，校验 origin 后原子发布；已有目录仅校验，不覆盖、
+不 pull、不改 HEAD。准备失败按现有有界退避重试，其他仓库仍可扫描。
+历史任务保留原登记路径，不自动迁移；失效路径进入待核对/待处理。
+
+`serve` 首次准备/扫描后向 stderr 输出一次中文启动概览，后续仅输出阶段、结果、
+已确认 PR、阻塞/恢复等关键变化及约五分钟的空闲心跳。stdout 保持原有 JSON。
+SDK 原始输出、提示词及详细诊断继续保存在私有状态目录；`--state-dir` 与仓库根目录独立。
 
 `serve --once` 扫描一次并完成一次调度周期，周期内仍遵守各任务的 step/until/auto 策略。
 每轮新增数和未终结的自动领取积压均以 `max_new_per_scan` 为上限（1–100）。

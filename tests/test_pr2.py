@@ -164,14 +164,21 @@ def policy(auth_file):
 
 
 async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
-    store, task_id, repo, fixture_github, policy
+    store, task_id, repo, fixture_github, policy, caplog
 ):
+    caplog.set_level("INFO", logger="gongcao")
     await Workflow(store, policy, fixture_github).run(task_id)
     task = store.task(task_id)
     assert task["stage"] == Stage.MERGEABLE, task["reason"]
     assert task["state"] == State.COMPLETED
     assert task["revision_count"] == 1
     assert task["pr_number"] == 9
+    # One Workflow call crosses every stage; polling only at its end would miss these.
+    for stage in ("分析", "开发", "修订", "审查", "验证", "等待人工合并"):
+        assert f"阶段：{stage}" in caplog.text
+    assert "质量结果：通过" in caplog.text and "Agent developer 结束" in caplog.text
+    assert "PR 已远端确认：https://github.com/example/demo/pull/9" in caplog.text
+    assert "Inspected the exact worktree" not in caplog.text  # Raw reports stay private.
     assert (repo / "sample.txt").read_text() == "original\n"
     runs = store.runs(task_id)
     assert [r["role"] for r in runs] == [

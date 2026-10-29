@@ -783,6 +783,9 @@ class Controls:
                                 "roles_hash": config.roles_hash,
                             },
                         )
+                from .events import task_event
+
+                task_event(self.store, task_id, "GitHub retry 已授权并完成恢复核验，将创建新会话")
             except (UncertainWrite, InstructionChanged, ValueError) as exc:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))

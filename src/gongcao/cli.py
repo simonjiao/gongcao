@@ -263,9 +263,14 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         loop.add_signal_handler(signal.SIGTERM, current.cancel)
         try:
             if args.command == "serve":
+                from .events import terminal_logging
+
                 config = Config.load(args.config)
                 jobs = args.jobs if args.jobs is not None else config.scheduler_jobs
-                await Scheduler(store, config, github, jobs).serve(once=args.once, poll=args.poll)
+                scheduler = Scheduler(store, config, github, jobs)
+                scheduler.config_path = args.config.resolve() if args.config else None
+                with terminal_logging():
+                    await scheduler.serve(once=args.once, poll=args.poll)
                 output(store.tasks())
                 return 0
             run_ids = await Workflow(store, Config.load(args.config), github).run(args.task)

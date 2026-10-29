@@ -1,0 +1,25 @@
+{
+  "implementation_sha": "03fb9fc391d584664886ddb83603af20517bac79",
+  "actor": "simonjiao",
+  "repositories": [
+    {
+      "repository": "simonjiao/airdb",
+      "head": "9f388a42a08b4947dfa8cee8f011db477041d48d",
+      "clone": "已克隆",
+      "restart": "已复用",
+      "fresh_process_reuse": true,
+      "preserved_dirty_worktree": true
+    },
+    {
+      "repository": "simonjiao/gongcao",
+      "head": "97652811896578ebcac62f0735ff5eb2b2e4a068",
+      "clone": "已克隆",
+      "restart": "已复用",
+      "fresh_process_reuse": true,
+      "preserved_dirty_worktree": true
+    }
+  ],
+  "real": true,
+  "remote_writes": [],
+  "passed": true
+}

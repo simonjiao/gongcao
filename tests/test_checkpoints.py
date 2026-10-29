@@ -113,8 +113,9 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
 
 
 async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_at_review(
-    store, task_id, blocked
+    store, task_id, blocked, caplog
 ):
+    caplog.set_level("INFO", logger="gongcao")
     config, github, post, status, step = blocked
     first = store.runs(task_id)[-1]
     saved = first["details"]["save"]
@@ -136,6 +137,7 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         runs = restarted.runs(task_id)
         second = runs[-1]
         assert second["thread_id"] != first["thread_id"]
+        assert "GitHub retry 已授权并完成恢复核验" in caplog.text
         assert second["details"]["source"]["sha"] == saved["sha"]
         assert (
             Path(second["worktree"], "sample.txt").read_text()

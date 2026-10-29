@@ -185,6 +185,7 @@ class OfflineGitHub(GitHub):
 
 def main() -> None:
     import gongcao.cli as cli
+    import gongcao.workspace as workspace
 
     fixture = OfflineGitHub(Path(os.environ["GONGCAO_COPILOT_FIXTURE"]))
     original_argv = Sandbox.argv
@@ -196,6 +197,12 @@ def main() -> None:
         return original_argv(self, *payload)
 
     async def routed(*args: str, **kwargs: Any) -> str:
+        if args[0] == "git" and "clone" in args:
+            await command("git", "clone", "--", fixture.data["clone_from"], args[-1])
+            await command("git", "remote", "set-url", "origin", args[-2], cwd=args[-1])
+            fixture.data["clones"] = fixture.data.get("clones", 0) + 1
+            fixture.save()
+            return ""
         if args[:2] in {("git", "push"), ("git", "ls-remote")}:
             args = (*args[:2], fixture.data["bare"], *args[3:])
         if args[:3] == ("gh", "pr", "ready"):
@@ -209,6 +216,7 @@ def main() -> None:
 
     cli.GitHub = lambda: fixture  # type: ignore[attr-defined,assignment]
     remote.command = routed  # type: ignore[attr-defined]
+    workspace.command = routed  # type: ignore[attr-defined]
     Sandbox.argv = argv  # type: ignore[method-assign]
     native_main()
 

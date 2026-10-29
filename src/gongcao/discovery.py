@@ -15,12 +15,13 @@ from urllib.parse import urlencode
 
 from .config import Config, Source
 from .control import baseline
-from .events import Redactor
+from .events import Redactor, task_event
 from .github import GitHub, Target
 from .model import Stage, State
+from .processes import CleanupError
 from .recovery import Recovery
 from .store import Store
-from .workspace import repository
+from .workspace import clone_prefix, prepare_repository
 
 LOG = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class Discovery:
         self.retry: dict[str, tuple[int, float]] = {}
         self.next_scan = 0.0
         self.next_facts = 0.0
+        self.repositories: dict[str, str] = {}
+        self.scan_results: dict[tuple[str, str], tuple[int, ...]] = {}
 
     def records(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.store.db.execute("SELECT * FROM claims ORDER BY url")]
@@ -65,7 +68,7 @@ class Discovery:
         failures = self.retry.get(key, (0, 0))[0] + 1
         self.retry[key] = failures, time.monotonic() + min(300, 5 * 2 ** min(failures, 6))
         message = Redactor().text(f"{type(exc).__name__}: {exc}")
-        LOG.warning("Discovery/status %s: %s", key, message)
+        LOG.warning("[%s] 扫描/同步异常（%s），退避后重试", key, type(exc).__name__)
         self.save(key, dirty=1, reason=message)
         row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
         if row and row["task_id"]:
@@ -217,6 +220,55 @@ class Discovery:
         return snapshot
 
     async def scan(self) -> None:
+        # Preparation is independent of claim capacity and pending-task backlog.
+        prepared = set()
+        for source in self.config.discovery.sources:
+            if source.repo in prepared:
+                continue
+            prepared.add(source.repo)
+            key = "prepare:" + source.repo
+            if not self.due(key):
+                continue
+            try:
+                if self.locks:
+                    result = await prepare_repository(source)
+                else:
+                    # Direct one-shot scans share the same OS lock as serve.
+                    with lock_path(source.repo).open("a") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        result = await prepare_repository(source)
+                if self.repositories.get(source.repo) not in {"已复用", "已克隆"}:
+                    LOG.info("[%s] 仓库%s：%s", source.repo, result, source.path)
+                    self.store.last_activity = time.monotonic()
+                if self.repositories.get(source.repo) != "已克隆":
+                    self.repositories[source.repo] = result
+                self.retry.pop(key, None)
+            except CleanupError:
+                self.repositories[source.repo] = "待核对：clone 归属或进程收束未确认"
+                self.retry[key] = (0, float("inf"))
+                LOG.warning(
+                    "[%s] 仓库准备待核对，暂停自动重试；保留临时目录及 JSON 意图，"
+                    "位置：%s；先核对子进程/目录归属，勿直接删除",
+                    source.repo,
+                    source.path.parent / (clone_prefix(source.path) + "*"),
+                )
+            except Exception as exc:
+                reason = (
+                    "目标目录已存在或发生竞争"
+                    if isinstance(exc, FileExistsError)
+                    else "目录或认证权限不足"
+                    if isinstance(exc, PermissionError) or "Authentication failed" in str(exc)
+                    else "现有目录不是 Git 仓库"
+                    if "not a git repository" in str(exc)
+                    else "网络不可达或超时"
+                    if isinstance(exc, (ConnectionError, TimeoutError))
+                    or any(word in str(exc) for word in ("Could not resolve", "Failed to connect"))
+                    else str(exc).splitlines()[0][:160]
+                    if isinstance(exc, ValueError)
+                    else f"Git/文件系统不可用（{type(exc).__name__}）"
+                )
+                self.repositories[source.repo] = "准备失败：" + Redactor().text(reason)
+                self.warning(key, exc)
         maximum = self.config.discovery.max_new_per_scan
         backlog = self.store.db.execute(
             "SELECT count(*) FROM claims c LEFT JOIN tasks t ON c.task_id=t.id "
@@ -227,10 +279,13 @@ class Discovery:
         for source in sorted(
             self.config.discovery.sources, key=lambda item: (item.repo, item.label)
         ):
-            if not available or not self.due(source.repo):
+            if (
+                not available
+                or not self.due(source.repo)
+                or self.repositories.get(source.repo) not in {"已复用", "已克隆"}
+            ):
                 continue
             try:
-                await repository(source.path, Target(source.repo, "issues", 1))
                 query = urlencode(
                     {
                         "state": "open",
@@ -241,6 +296,20 @@ class Discovery:
                     }
                 )
                 rows = await self.github.pages(f"repos/{source.repo}/issues?{query}")
+                found = tuple(sorted(item["number"] for item in rows if "pull_request" not in item))
+                scan_key = (source.repo, source.label)
+                previous = self.scan_results.get(scan_key, ())
+                if found != previous:
+                    LOG.info(
+                        "[%s] 扫描变化：标签 %s，候选 %s，新增 %s，移除 %s",
+                        source.repo,
+                        source.label,
+                        len(found),
+                        len(set(found) - set(previous)),
+                        len(set(previous) - set(found)),
+                    )
+                    self.store.last_activity = time.monotonic()
+                self.scan_results[scan_key] = found
                 for item in sorted(rows, key=lambda item: int(item["number"])):
                     if not available:
                         break
@@ -258,10 +327,11 @@ class Discovery:
                         continue
                     try:
                         await self.prepare(source, target)
-                    except ValueError as exc:
-                        LOG.warning(
-                            "Discovery skipped %s: %s", target.url, Redactor().text(str(exc))
-                        )
+                    except ValueError:
+                        # Rejected candidates remain visible in read-only diagnostics; don't
+                        # repeat one warning per candidate on every empty-progress scan.
+                        if found != previous:
+                            LOG.info("[%s #%s] 未领取：资格核验未通过", source.repo, target.number)
                         continue
                     available -= 1
                 self.retry.pop(source.repo, None)
@@ -374,8 +444,32 @@ class Discovery:
             policy=data["policy"],
         )
         self.save(row["url"], task_id=task_id, dirty=1, reason="")
+        task_event(self.store, task_id, "领取已远端确认")
         row.update(task_id=task_id, comment_id=item["id"], confirmed=item["body"], intent="")
         await self.publish(row)
+
+    def overview(self, *, once: bool, config_path: Path | None, jobs: int) -> None:
+        sources = self.config.discovery.sources
+        LOG.info(
+            "启动概览：%s；配置=%s；状态目录=%s；仓库根目录=%s；已登记任务=%s；jobs=%s；扫描间隔=%s秒；授权操作员=%s",
+            "单次运行（--once）" if once else "持续运行",
+            config_path or "默认配置",
+            self.store.root,
+            self.config.discovery.repo_root or "显式来源路径",
+            len(self.store.tasks()),
+            jobs,
+            self.config.discovery.interval_seconds,
+            ",".join(self.config.copilot_operators) or "未配置",
+        )
+        for source in sources:
+            LOG.info(
+                "[%s] %s；路径=%s；标签=%s；模式=%s",
+                source.repo,
+                self.repositories.get(source.repo, "未初始化（发现已禁用）"),
+                source.path,
+                source.label,
+                source.mode,
+            )
 
     def render(self, row: dict[str, Any]) -> str:
         task = self.store.task(row["task_id"])

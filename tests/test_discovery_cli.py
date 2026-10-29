@@ -43,6 +43,7 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
                 "writes": [],
                 "reviews": [],
                 "slow": continuous,
+                "clone_from": str(repo),
             }
         )
     )
@@ -56,6 +57,9 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
             "sources": [{"repo": name, "path": str(repo)}],
         },
     }
+    if not continuous:
+        settings["discovery"]["repo_root"] = str(tmp_path / "clones")
+        del settings["discovery"]["sources"][0]["path"]
     config.write_text(yaml.safe_dump(settings))
     root = Path(__file__).resolve().parents[1]
     env = {
@@ -68,6 +72,10 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
     def cli(*args):
         result = subprocess.run([*argv, *args], env=env, capture_output=True, text=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
+        if args[0] == "serve":
+            assert result.stderr.count("启动概览：") == 1
+            assert "单次运行（--once）" in result.stderr and "持续运行" not in result.stderr
+            assert "jobs=2" in result.stderr and "已登记任务=" in result.stderr
         return json.loads(result.stdout)
 
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True)
@@ -95,8 +103,13 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
             process.terminate()
             stdout, stderr = process.communicate(timeout=15)
             assert process.returncode == 130, stdout + stderr
+            assert stderr.count("启动概览：持续运行") == 1
+            assert "仓库已复用" in stderr and "领取已远端确认" in stderr
+            assert "阶段：分析" in stderr and "阶段：开发" in stderr
+            assert "暂停等待指令" in stderr
     else:
         tasks = cli("serve", "--once", "--config", str(config))
+        assert tasks[0]["repo_path"] == str(tmp_path / "clones" / name)
         assert len(tasks) == 1 and tasks[0]["stage"] == "pending_development"
         assert tasks[0]["state"] == "waiting_instruction"
     before = [cli("inspect", str(task["id"])) for task in cli("status")]
@@ -109,6 +122,7 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
         assert [t["runs"] for t in after] == [t["runs"] for t in before]
         assert json.loads(fixture.read_text())["writes"] == writes
     data = json.loads(fixture.read_text())
+    assert data.get("clones", 0) == (0 if continuous else 1)
     assert len(data["status_comments"]) == len(issues) and not data.get("pull")
     assert all(t["control"]["source"] == "discovery" and not t["runtime"]["lease"] for t in after)
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True) == head
