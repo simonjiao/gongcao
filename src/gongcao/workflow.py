@@ -73,11 +73,34 @@ class Workflow:
         cached = self.cached_run(task, role)
         if cached is not None:
             return cached
+        if role == Role.DEVELOPER:
+            prior = self.store.runs(task["id"])
+            if (
+                prior
+                and prior[-1]["role"] == Role.DEVELOPER
+                and prior[-1]["target_sha"] == task["target_sha"]
+                and prior[-1]["details"].get("save", {}).get("state")
+                not in {"confirmed", "unchanged"}
+            ):
+                await self.remote.checkpoint(task, prior[-1])
         if task["state"] != State.QUEUED:
             self.store.transition(
                 self.safe(task), Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
             )
-        await self.runner.run(task["id"], evidence, expected_task=task)
+        run_id = await self.runner.run(task["id"], evidence, expected_task=task)
+        if role == Role.DEVELOPER:
+            settled = next(r for r in self.store.runs(task["id"]) if r["id"] == run_id)
+            current = self.store.task(task["id"])
+            if current["state"] != State.RECONCILE and (
+                not settled["result"]
+                or json.loads(settled["result"])["conclusion"] != "ready"
+                or current["state"] == State.WAITING_INSTRUCTION
+            ):
+                try:
+                    await self.remote.checkpoint(current, settled)
+                except Exception as exc:
+                    self.store.run_details(run_id, save_error=Redactor().text(str(exc)))
+                    raise
         await controls.poll(task["id"], self.config, self.github)
         controls.revalidate(task["id"], self.config)
         current = self.store.task(task["id"])
@@ -266,12 +289,17 @@ class Workflow:
             )
 
     async def run(self, task_id: int) -> list[str]:
-        if self.watch_instructions:
-            async with Controls(self.store).listen(self.config, self.github, task_id):
-                if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
-                    await Controls(self.store).poll(task_id, self.config, self.github)
-                return await self.execute(task_id)
-        return await self.execute(task_id)
+        try:
+            if self.watch_instructions:
+                async with Controls(self.store).listen(self.config, self.github, task_id):
+                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                        await Controls(self.store).poll(task_id, self.config, self.github)
+                    return await self.execute(task_id)
+            return await self.execute(task_id)
+        finally:
+            from .discovery import Discovery
+
+            await Discovery(self.store, self.config, self.github).handoff(task_id)
 
     async def execute(self, task_id: int) -> list[str]:
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:

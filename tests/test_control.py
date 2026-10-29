@@ -380,6 +380,7 @@ def test_schema_upgrade_preserves_intents_and_legacy_auto(store, task_id, versio
     store.intent(store.task(task_id), "unknown", "push", "{}")
     expected = {} if version == 2 else store.task(task_id)["control"]
     with store.db:
+        store.db.execute("ALTER TABLE runs DROP COLUMN details")
         store.db.execute("DROP TRIGGER status_dirty")
         store.db.execute("DROP TABLE claims")
         store.db.execute("DROP TABLE controller")

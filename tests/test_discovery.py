@@ -129,7 +129,7 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
         disabled = Discovery(reopened, Config(), intake.github)
         async with disabled.active(once=True):
             assert len(reopened.tasks()) == 2 and len(intake.github.writes) == 2
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         reopened.close()
 

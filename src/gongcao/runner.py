@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Config
 from .control import Controls, Paused
+from .control import baseline as controls_baseline
 from .events import Journal, Redactor
 from .github import GitHub
 from .model import AgentResult, Role, Stage, State, after_run, same_version
@@ -79,7 +80,16 @@ class Runner:
                 return run_id
             repo = Path(task["repo_path"])
             workspace = self.store.root / "worktrees" / run_id
-            await worktree(repo, workspace, task["target_sha"], role, run_id)
+            from .remote import Controlled
+
+            source = (
+                await Controlled(self.store, self.config, self.github).source(task)
+                if role == Role.DEVELOPER
+                else {"sha": task["target_sha"], "baseline": controls_baseline(task)}
+            )
+            self.store.run_details(run_id, source=source)
+            self.store.run_details(run_id, requested_execution=self.config.execution)
+            await worktree(repo, workspace, source["sha"], role, run_id)
             self.store.run_metadata(run_id, worktree=str(workspace))
             analysis = None
             if role == Role.DEVELOPER and stage == Stage.DEVELOPMENT:
@@ -98,7 +108,7 @@ class Runner:
                 not evidence or evidence.get("target_sha") != task["target_sha"]
             ):
                 raise ValueError("Revision requires confirmed findings for the current SHA")
-            data, digest = await context(repo, task, role, self.config, analysis, evidence)
+            data, digest = await context(repo, task, role, self.config, analysis, evidence, source)
             (run_dir / "context.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
             self.store.run_metadata(run_id, context_hash=digest)
             sandbox = Sandbox(workspace, run_dir, role)
@@ -115,6 +125,7 @@ class Runner:
                     {
                         "context": data,
                         "model": self.config.model,
+                        "reasoning_effort": self.config.reasoning_effort,
                         "writable": role.writable,
                     }
                 ).encode()
@@ -236,6 +247,11 @@ class Runner:
             journal.emit(kind, data)
             if kind == "thread":
                 self.store.run_metadata(run_id, thread_id=str(data["thread_id"]))
+            elif kind == "execution":
+                expected = self.config.execution
+                if any(data.get(key) != expected[key] for key in ("model", "reasoning_effort")):
+                    raise ValueError("SDK execution differs from the requested model/effort")
+                self.store.run_details(run_id, execution=data | {"source": expected["source"]})
             elif kind == "result":
                 if result is not None:
                     raise ValueError("Duplicate worker result")

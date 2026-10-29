@@ -31,7 +31,7 @@ class Store:
         """Serialize first-open WAL setup and upgrades across CLI processes."""
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 5:
             self.db.close()
             raise ValueError("Database schema is newer than this Gongcao version")
         self.db.executescript("""
@@ -125,6 +125,9 @@ class Store:
                     "UPDATE claims SET dirty=1 WHERE task_id=NEW.id; END"
                 )
                 self.db.execute("PRAGMA user_version=4")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == 4:
+                self.db.execute("ALTER TABLE runs ADD COLUMN details TEXT NOT NULL DEFAULT '{}'")
+                self.db.execute("PRAGMA user_version=5")
 
     def close(self) -> None:
         self.db.close()
@@ -196,7 +199,7 @@ class Store:
 
     def runs(self, task_id: int) -> list[dict[str, Any]]:
         return [
-            dict(row)
+            dict(row) | {"details": json.loads(row["details"])}
             for row in self.db.execute(
                 "SELECT * FROM runs WHERE task_id=? ORDER BY started", (task_id,)
             )
@@ -360,6 +363,40 @@ class Store:
         with self.db:
             for key, value in values.items():
                 self.db.execute(f"UPDATE runs SET {key}=? WHERE id=?", (value, run_id))
+
+    def run_details(self, run_id: str, **values: Any) -> None:
+        with self.db:
+            row = self.db.execute(
+                "SELECT task_id,details FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            assert row is not None
+            details = json.loads(row["details"]) | values
+            self.db.execute("UPDATE runs SET details=? WHERE id=?", (json.dumps(details), run_id))
+            self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (row["task_id"],))
+
+    def save_guard(self, expected: dict[str, Any]) -> dict[str, Any]:
+        """Narrow authority to preserve settled output, never to advance a stage or PR."""
+        from .control import Controls, baseline
+
+        task = self.task(expected["id"])
+        Controls(self).fence(task["id"])
+        if task["id"] not in self.owners:
+            raise ValueError("Saving output requires the task lease")
+        if (
+            task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION}
+            or task["state"] in {State.RUNNING, State.RECONCILE}
+            or task["snapshot"].get("state") != "open"
+            or baseline(task) != baseline(expected)
+            or task["stage"] != expected["stage"]
+        ):
+            raise ValueError("Task version/state does not authorize saving output")
+        if self.db.execute(
+            "SELECT 1 FROM processes WHERE task_id=? AND state!='stopped' "
+            "UNION SELECT 1 FROM runs WHERE task_id=? AND state='running'",
+            (task["id"], task["id"]),
+        ).fetchone():
+            raise ValueError("Execution cleanup is not confirmed; retaining local output")
+        return task
 
     def finish(
         self,
@@ -549,13 +586,13 @@ class Store:
     def intent(self, expected: dict[str, Any], key: str, kind: str, payload: str) -> bool:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            task = self.guard(expected)
+            task = self.save_guard(expected) if kind == "checkpoint" else self.guard(expected)
             row = self.operation(key)
             if row:
                 if row["payload"] != payload or row["sha"] != expected["target_sha"]:
                     raise ValueError("Operation identity conflicts with existing intent")
                 return False
-            if task["control"].get("pause_requested"):
+            if kind != "checkpoint" and task["control"].get("pause_requested"):
                 from .control import Paused
 
                 raise Paused("Pause requested before opening a new write intent")

@@ -36,6 +36,7 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
         return {}
     if not isinstance(raw, dict) or raw.keys() - {
         "model",
+        "reasoning_effort",
         "timeout_seconds",
         "max_log_bytes",
         "auth_file",
@@ -137,7 +138,7 @@ class DiscoveryConfig:
 
 @dataclass(frozen=True)
 class Config:
-    model: str | None = None
+    model: str = "gpt-6.1-sol"
     timeout_seconds: int = 900
     max_log_bytes: int = 2_000_000
     auth_file: Path = field(default_factory=lambda: Path.home() / ".codex" / "auth.json")
@@ -148,6 +149,40 @@ class Config:
     copilot_operators: list[str] = field(default_factory=list)
     copilot_mode: str | None = None
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    reasoning_effort: str = "xhigh"
+    configured: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model, str)
+            or not self.model.strip()
+            or self.model != self.model.strip()
+        ):
+            raise ValueError("model must be a nonempty model identifier without surrounding spaces")
+        if not isinstance(self.reasoning_effort, str) or self.reasoning_effort not in {
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise ValueError("Invalid reasoning_effort; use a supported named reasoning level")
+
+    @property
+    def execution(self) -> dict[str, Any]:
+        values = {"model": self.model, "reasoning_effort": self.reasoning_effort}
+        defaults = {"model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}
+        return values | {
+            "source": {
+                key: "configuration"
+                if key in self.configured or value != defaults[key]
+                else "project-default"
+                for key, value in values.items()
+            }
+        }
 
     @property
     def policy_hash(self) -> str:
@@ -156,6 +191,7 @@ class Config:
                 {
                     "roles": {role.value: prompt for role, prompt in self.prompts.items()},
                     "model": self.model,
+                    "reasoning_effort": self.reasoning_effort,
                 },
                 sort_keys=True,
             ).encode()
@@ -178,9 +214,11 @@ class Config:
             raise ValueError("timeout_seconds must be an integer between 1 and 86400")
         if type(limit) is not int or not 4096 <= limit <= 20_000_000:
             raise ValueError("max_log_bytes must be between 4096 and 20000000")
-        model = raw.get("model")
-        if model is not None and (not isinstance(model, str) or not model.strip()):
+        model = raw.get("model", "gpt-6.1-sol")
+        if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
+        if not isinstance(raw.get("reasoning_effort", "xhigh"), str):
+            raise ValueError("reasoning_effort must be a named reasoning level")
         revisions = raw.get("max_revisions", 3)
         if type(revisions) is not int or not 0 <= revisions <= 10:
             raise ValueError("Invalid revision limit")
@@ -207,6 +245,8 @@ class Config:
             operators,
             mode,
             DiscoveryConfig.load(raw.get("discovery", {})),
+            raw.get("reasoning_effort", "xhigh"),
+            frozenset(raw.keys() & {"model", "reasoning_effort"}),
         )
 
     @classmethod

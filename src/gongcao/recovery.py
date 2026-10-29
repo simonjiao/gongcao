@@ -70,7 +70,7 @@ class Recovery:
             from .archive import observe
 
             return await observe(task, payload, self.github)
-        if op["kind"] == "push":
+        if op["kind"] in {"push", "checkpoint"}:
             refs = (
                 await command(
                     "git",
@@ -191,13 +191,14 @@ class Recovery:
                 raise ValueError("Allocated run workspace is missing; manual inspection required")
             if workspace and run["evidence_valid"]:
                 head = (await command("git", "rev-parse", "HEAD", cwd=workspace)).strip()
-                if head != run["target_sha"]:
+                parent = run["details"].get("source", {}).get("sha", run["target_sha"])
+                if head != parent:
                     commit = (
                         await command("git", "show", "-s", "--format=%P%n%B", head, cwd=workspace)
                     ).splitlines()
                     if (
                         run["role"] != "developer"
-                        or commit[0] != run["target_sha"]
+                        or commit[0] != parent
                         or f"Gongcao-Run: {run['id']}" not in commit
                     ):
                         raise ValueError(
@@ -219,6 +220,10 @@ class Recovery:
                 self.store.operation_result(op["id"], "succeeded", result)
             else:
                 result = op["response"]
+            if op["kind"] == "checkpoint":
+                self.store.run_details(
+                    op["payload"]["run_id"], save=op["payload"] | {"state": "confirmed"}
+                )
             if op["kind"] == "pull" and not task["pr_number"]:
                 with self.store.db:
                     self.store.db.execute(
@@ -301,30 +306,36 @@ class Recovery:
                 or task["stage"] == Stage.MERGED
             ):
                 raise ValueError("Closed, cancelled or merged tasks cannot be retried")
-            with self.store.db:
-                self.store.db.execute("BEGIN IMMEDIATE")
-                if refreshed_sha != task["target_sha"]:
-                    self.store.refresh_base(task_id, refreshed_sha)
-                self.store.db.execute(
-                    "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
-                    "(state!='completed' OR json_extract(result,'$.conclusion')!='ready' "
-                    "OR json_extract(result,'$.target_sha')!=target_sha "
-                    "OR role IN ('reviewer','validator'))",
-                    (task_id,),
-                )
-                self.store.db.execute(
-                    "UPDATE artifacts SET valid=0 WHERE task_id=? "
-                    "AND kind IN ('quality-results','validation')",
-                    (task_id,),
-                )
-                self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))
-                self.store.db.execute(
-                    "UPDATE tasks SET state=?,reason=?,revision_count=CASE WHEN ? THEN 0 "
-                    "ELSE revision_count END,updated=? WHERE id=? AND cancel_requested=0",
-                    (State.QUEUED, "Manual retry requested", reset_revisions, time.time(), task_id),
-                )
-                Controls(self.store).checkpoint(task_id)
+            self.reset_retry(task_id, refreshed_sha, reset_revisions=reset_revisions)
             return {"task_id": task_id, "recovered": True, "task": self.store.task(task_id)}
+
+    def reset_retry(
+        self, task_id: int, refreshed_sha: str, *, reset_revisions: bool = False
+    ) -> None:
+        """Caller holds the same lease throughout reconciliation and authorization."""
+        task = self.store.task(task_id)
+        with Controls(self.store).transaction():
+            if refreshed_sha != task["target_sha"]:
+                self.store.refresh_base(task_id, refreshed_sha)
+            self.store.db.execute(
+                "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
+                "(state!='completed' OR json_extract(result,'$.conclusion')!='ready' "
+                "OR json_extract(result,'$.target_sha')!=target_sha "
+                "OR role IN ('reviewer','validator'))",
+                (task_id,),
+            )
+            self.store.db.execute(
+                "UPDATE artifacts SET valid=0 WHERE task_id=? "
+                "AND kind IN ('quality-results','validation')",
+                (task_id,),
+            )
+            self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))
+            self.store.db.execute(
+                "UPDATE tasks SET state=?,reason=?,revision_count=CASE WHEN ? THEN 0 "
+                "ELSE revision_count END,updated=? WHERE id=? AND cancel_requested=0",
+                (State.QUEUED, "Manual retry requested", reset_revisions, time.time(), task_id),
+            )
+            Controls(self.store).checkpoint(task_id)
 
 
 def diagnose(store: Store, task_id: int) -> dict[str, Any]:
