@@ -107,7 +107,8 @@ class Workflow:
         runs = self.store.runs(task_id)
         if (
             task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION}
-            or task["state"] in {State.RUNNING, State.RECONCILE}
+            or task["state"] in {State.RUNNING, State.RECONCILE, State.CANCELLED}
+            or task["cancel_requested"]
             or not runs
         ):
             return

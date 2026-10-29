@@ -210,6 +210,67 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
         await restarted.publish(restarted.records()[0])
 
 
+@pytest.mark.parametrize("lost_response", [False, True])
+async def test_status_recovers_after_repeated_failures_and_restart_without_replaying_patch(
+    intake, store, monkeypatch, lost_response
+):
+    import time
+
+    await intake.scan()
+    task_id = store.tasks()[0]["id"]
+    Controls(store).issue(task_id, "pause")
+    now = time.time()
+    monkeypatch.setattr("gongcao.discovery.time.time", lambda: now)
+    original_owned, original_mutate = intake.owned, intake.github.mutate
+    offline = not lost_response
+    reads = 0
+
+    async def owned(self, row):
+        nonlocal reads
+        reads += 1
+        if offline:
+            raise ConnectionError("Status read unavailable")
+        return await original_owned(row)
+
+    async def mutate(*args, **kwargs):
+        nonlocal offline
+        result = await original_mutate(*args, **kwargs)
+        if lost_response:
+            offline = True
+            raise ConnectionError("PATCH applied, response lost")
+        return result
+
+    monkeypatch.setattr(Discovery, "owned", owned)
+    monkeypatch.setattr(intake.github, "mutate", mutate)
+    patches = intake.github.writes.count("PATCH")
+    # Exceed the old three-attempt cutoff and reach the capped delay.
+    for failures in range(1, 8):
+        await intake.handoff(task_id)
+        row = intake.records()[0]
+        retry = json.loads(row["data"])["status_retry"]
+        assert retry["failures"] == failures
+        assert retry["next_at"] - now == min(300, 5 * 2**failures)
+        attempted_reads = reads
+        await Discovery(store, intake.config, intake.github).handoff(task_id)
+        assert reads == attempted_reads  # No busy retry, including after publisher recreation.
+        now = retry["next_at"]
+
+    reopened = Store(store.root)
+    try:
+        restarted = Discovery(reopened, intake.config, intake.github)
+        offline = False
+        await restarted.handoff(task_id)
+        row = restarted.records()[0]
+        assert not row["dirty"] and not row["intent"] and not row["reason"]
+        assert "status_retry" not in json.loads(row["data"])
+        assert row["confirmed"] == intake.github.comments[0]["body"] == restarted.render(row)
+        assert intake.github.writes.count("PATCH") == patches + 1
+        await restarted.handoff(task_id)
+        assert intake.github.writes.count("PATCH") == patches + 1
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("unsafe", [False, True])
 async def test_default_branch_refresh_invalidates_or_holds_remote_intents(
     intake, store, repo, unsafe

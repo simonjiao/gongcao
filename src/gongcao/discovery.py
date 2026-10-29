@@ -76,7 +76,7 @@ class Discovery:
             data["status_retry"] = {
                 "digest": digest,
                 "failures": failures,
-                "next_at": time.time() + min(300, 5 * 2**failures),
+                "next_at": time.time() + min(300, 5 * 2 ** min(failures, 6)),
             }
             self.save(key, data=json.dumps(data))
 
@@ -85,7 +85,7 @@ class Discovery:
         if row and row["task_id"]:
             retry = json.loads(row["data"]).get("status_retry", {})
             if retry.get("digest") == hashlib.sha256(self.render(dict(row)).encode()).hexdigest():
-                return bool(retry["failures"] < 3 and retry["next_at"] <= time.time())
+                return bool(retry["next_at"] <= time.time())
         return self.retry.get(key, (0, 0))[1] <= time.monotonic()
 
     @asynccontextmanager
@@ -412,7 +412,6 @@ class Discovery:
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
 
-        runs = self.store.runs(task["id"])
         if runs:
             run = runs[-1]
             result = json.loads(run["result"]) if run["result"] else {}
@@ -429,15 +428,25 @@ class Discovery:
                 body += "\nReported checks/basis: " + "; ".join(result["basis"])[:6000]
                 body += "\nRemaining / missing inputs: " + "; ".join(result["next_steps"])[:6000]
             save = run["details"].get("save", {})
-            if save.get("state") == "confirmed":
+            body += "\nRemote checkpoint: " + save.get("state", "not confirmed")
+            saved = next(
+                (
+                    r["details"]["save"]
+                    for r in reversed(runs)
+                    if r["details"].get("save", {}).get("state") == "confirmed"
+                    and r["details"]["save"]["target_sha"] == task["target_sha"]
+                    and r["details"]["save"]["baseline"] == baseline(task)
+                ),
+                None,
+            )
+            if saved:
                 url = f"https://github.com/{task['snapshot']['repository']}"
                 body += (
-                    f"\nSaved WIP: [{save['branch']}]({url}/tree/{save['branch']})"
-                    f" · [{save['sha']}]({url}/commit/{save['sha']})"
-                    f"\nChanges: {save['summary'][:4000]}"
+                    f"\nSaved WIP: [{saved['branch']}]({url}/tree/{saved['branch']})"
+                    f" · [{saved['sha']}]({url}/commit/{saved['sha']})"
+                    f" · Run: `{saved['run_id']}` (last confirmed for this task version)"
+                    f"\nChanges: {saved['summary'][:4000]}"
                 )
-            else:
-                body += "\nRemote checkpoint: " + save.get("state", "not confirmed")
             if run["details"].get("save_error"):
                 body += "\nSave error: " + run["details"]["save_error"][:2000]
             execution = run["details"].get("execution")

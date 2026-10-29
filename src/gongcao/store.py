@@ -384,7 +384,8 @@ class Store:
             raise ValueError("Saving output requires the task lease")
         if (
             task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION}
-            or task["state"] in {State.RUNNING, State.RECONCILE}
+            or task["state"] in {State.RUNNING, State.RECONCILE, State.CANCELLED}
+            or task["cancel_requested"]
             or task["snapshot"].get("state") != "open"
             or baseline(task) != baseline(expected)
             or task["stage"] != expected["stage"]

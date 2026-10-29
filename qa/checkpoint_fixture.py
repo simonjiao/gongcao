@@ -26,3 +26,8 @@ print(json.dumps({'kind':'result','data':{
     'target_sha':data['target_sha'],
     'next_steps':['Supply original/r1 packages and Release metadata']}}))
 """
+
+# Repeated blockage: the new session verifies inherited output without changing it.
+BLOCKED_AGAIN = WORKER.replace(
+    "sample.write_text('partial work\\ncompleted after retry\\n')", "conclusion = 'blocked'"
+)

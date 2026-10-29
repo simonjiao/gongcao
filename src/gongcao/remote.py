@@ -206,6 +206,7 @@ class Controlled:
             if (await command("git", "status", "--porcelain", cwd=str(workspace))).strip():
                 raise UncertainWrite("Output changed after the controller commit")
             return head
+        self.store.save_guard(task)
         await command(
             "git", "-c", "core.hooksPath=/dev/null", "add", "--all", "--", ".", cwd=str(workspace)
         )
@@ -213,6 +214,7 @@ class Controlled:
             await command("git", "diff", "--cached", "--name-only", cwd=str(workspace))
         ).strip():
             return head
+        self.store.save_guard(task)
         await command(
             "git",
             "-c",

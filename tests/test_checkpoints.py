@@ -14,7 +14,7 @@ from gongcao.github import command
 from gongcao.model import Stage, State
 from gongcao.store import Store
 from gongcao.workflow import Workflow
-from qa.checkpoint_fixture import WORKER
+from qa.checkpoint_fixture import BLOCKED_AGAIN, WORKER
 
 
 @pytest.fixture
@@ -238,9 +238,10 @@ def test_v4_upgrade_preserves_history_without_inventing_execution_defaults(store
             reopened.close()
 
 
-@pytest.mark.parametrize("arrival", ["after_run", "before_push"])
-async def test_ready_then_late_pause_still_saves_output(
-    store, task_id, fixture_github, policy, monkeypatch, arrival
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+@pytest.mark.parametrize("arrival", ["after_run", "before_push", "before_commit"])
+async def test_late_pause_saves_but_cancellation_preserves_local_output(
+    store, task_id, fixture_github, policy, monkeypatch, arrival, action
 ):
     from gongcao.remote import Controlled
     from gongcao.runner import Runner
@@ -250,30 +251,143 @@ async def test_ready_then_late_pause_still_saves_output(
     await Workflow(store, policy, fixture_github).run(task_id)
     controls.issue(task_id, "step", policy=policy.policy_hash)
     triggered = False
+
+    def interrupt():
+        if action == "cancel":
+            store.cancel(task_id)
+        else:
+            controls.issue(task_id, "pause", safe=True)
+
     if arrival == "after_run":
         original = Runner.run
 
         async def late_pause(self, *args, **kwargs):
             result = await original(self, *args, **kwargs)
-            controls.issue(task_id, "pause", safe=True)
+            interrupt()
             return result
 
         monkeypatch.setattr(Runner, "run", late_pause)
-    else:
+    elif arrival == "before_push":
         original = Controlled.before
 
         async def late_pause(self, task, kind, **kwargs):
             nonlocal triggered
             if kind == "push" and not triggered:
                 triggered = True
-                controls.issue(task_id, "pause", safe=True)
+                interrupt()
             return await original(self, task, kind, **kwargs)
 
         monkeypatch.setattr(Controlled, "before", late_pause)
+    else:
+        from gongcao.remote import command as routed
+
+        async def late_interrupt(*args, **kwargs):
+            nonlocal triggered
+            result = await routed(*args, **kwargs)
+            if args[:3] == ("git", "diff", "--cached") and not triggered:
+                triggered = True
+                interrupt()
+            return result
+
+        monkeypatch.setattr("gongcao.remote.command", late_interrupt)
     await Workflow(store, policy, fixture_github).run(task_id)
-    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
-    assert store.runs(task_id)[-1]["details"]["save"]["state"] == "confirmed"
     assert fixture_github.pull is None
+    run = store.runs(task_id)[-1]
+    if action == "pause":
+        assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        assert run["details"]["save"]["state"] == "confirmed"
+    else:
+        assert store.task(task_id)["state"] == State.CANCELLED
+        assert not store.evidence(task_id)["operations"]
+        assert "save" not in run["details"]
+        assert (await command("git", "rev-parse", "HEAD", cwd=run["worktree"])).strip() == run[
+            "details"
+        ]["source"]["sha"]
+        assert (await command("git", "status", "--porcelain", cwd=run["worktree"])).strip()
+        assert Path(run["worktree"], "sample.txt").read_text() == "incomplete\n"
+        assert not await command(
+            "git", "--git-dir", str(fixture_github.bare), "for-each-ref", "refs/heads/gongcao"
+        )
+
+
+@pytest.mark.parametrize("cancelled", ["cancel_requested=1", "state='cancelled'"])
+async def test_checkpoint_guard_refuses_cancellation_even_with_stale_task(
+    store, task_id, blocked, cancelled
+):
+    from gongcao.leases import Lease
+
+    expected = store.task(task_id)
+    with store.db:
+        store.db.execute(f"UPDATE tasks SET {cancelled} WHERE id=?", (task_id,))
+    async with Lease(store, task_id) as lease:
+        assert lease.acquired
+        with pytest.raises(ValueError, match="authorize saving"):
+            store.save_guard(expected)
+
+
+async def test_cancel_after_checkpoint_intent_retains_commit_without_pushing(
+    store, task_id, fixture_github, policy, monkeypatch
+):
+    from gongcao.remote import Controlled
+
+    install_worker(monkeypatch, WORKER)
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    original = Controlled.before
+
+    async def cancel_before_write(self, task, kind, **kwargs):
+        if kind == "checkpoint" and kwargs.get("finish_operation"):
+            store.cancel(task_id)
+        return await original(self, task, kind, **kwargs)
+
+    monkeypatch.setattr(Controlled, "before", cancel_before_write)
+    await Workflow(store, policy, fixture_github).run(task_id)
+    assert store.task(task_id)["state"] == State.CANCELLED
+    run = store.runs(task_id)[-1]
+    saved = run["details"]["save"]
+    assert saved["state"] == "pending"
+    assert (await command("git", "rev-parse", "HEAD", cwd=run["worktree"])).strip() == saved["sha"]
+    operations = store.evidence(task_id)["operations"]
+    assert len(operations) == 1 and operations[0]["state"] == "pending"
+    assert Path(run["worktree"], "sample.txt").read_text() == "partial work\n"
+    assert fixture_github.pull is None
+    assert not await command(
+        "git", "--git-dir", str(fixture_github.bare), "for-each-ref", "refs/heads/gongcao"
+    )
+
+
+async def test_retry_without_changes_keeps_confirmed_checkpoint_link(
+    store, task_id, blocked, monkeypatch
+):
+    from gongcao.discovery import Discovery
+
+    config, github, post, status, step = blocked
+    saved = store.runs(task_id)[-1]["details"]["save"]
+    install_worker(monkeypatch, BLOCKED_AGAIN)
+    post("/gongcao retry")
+    await Workflow(store, config, github).run(task_id)
+    current = store.runs(task_id)[-1]
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert current["details"]["source"]["sha"] == saved["sha"]
+    assert current["details"]["save"]["state"] == "unchanged"
+    assert len(store.evidence(task_id)["operations"]) == 1
+    assert "Remote checkpoint: unchanged" in status["body"]
+    assert f"/commit/{saved['sha']}" in status["body"]
+    assert f"/tree/{saved['branch']}" in status["body"]
+    assert saved["run_id"] in status["body"] and "/gongcao retry" in status["body"]
+
+    # An unconfirmed new save must not be presented as remotely saved.
+    store.run_details(current["id"], save={"state": "pending", "sha": "f" * 40})
+    discovery = Discovery(store, config, github)
+    await discovery.handoff(task_id)
+    assert "Remote checkpoint: pending" in status["body"]
+    assert f"/commit/{saved['sha']}" in status["body"]
+    assert "/commit/" + "f" * 40 not in status["body"]
+
+    # Changed requirements invalidate the old checkpoint's relevance to this task version.
+    task = store.task(task_id)
+    store.sync(task_id, task["snapshot"] | {"body": "Changed requirements"})
+    await discovery.handoff(task_id)
+    assert "Saved WIP:" not in status["body"]
 
 
 async def test_older_retry_cannot_clear_newer_unverified_pause(
