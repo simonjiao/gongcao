@@ -18,6 +18,7 @@ from .control import baseline
 from .events import Redactor, task_event
 from .github import GitHub, Target
 from .model import Stage, State
+from .processes import CleanupError
 from .recovery import Recovery
 from .store import Store
 from .workspace import prepare_repository
@@ -242,6 +243,10 @@ class Discovery:
                 if self.repositories.get(source.repo) != "已克隆":
                     self.repositories[source.repo] = result
                 self.retry.pop(key, None)
+            except CleanupError:
+                self.repositories[source.repo] = "待核对：clone 归属或进程收束未确认"
+                self.retry[key] = (0, float("inf"))
+                LOG.warning("[%s] 仓库准备待核对，保留临时意图及目录，暂停自动重试", source.repo)
             except Exception as exc:
                 reason = (
                     "目标目录已存在或发生竞争"

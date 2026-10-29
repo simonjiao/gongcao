@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from test_discovery import intake as intake
@@ -9,6 +10,7 @@ from gongcao.config import DiscoveryConfig, Source
 from gongcao.discovery import Discovery
 from gongcao.github import command
 from gongcao.model import State
+from gongcao.processes import CleanupError
 from gongcao.scheduler import Scheduler
 from gongcao.workspace import prepare_repository
 
@@ -97,7 +99,9 @@ async def test_clone_and_restart_preserve_existing_head_and_dirty_worktree(
     assert not list(source.path.parent.glob(".gongcao-clone-*"))
 
 
-@pytest.mark.parametrize("fault", ["network", "auth", "cancel", "race", "origin", "symlink"])
+@pytest.mark.parametrize(
+    "fault", ["network", "auth", "cancel", "cleanup", "race", "origin", "symlink"]
+)
 async def test_clone_failures_preserve_foreign_directories_and_clean_only_own_clone(
     tmp_path, clone_transport, monkeypatch, fault
 ):
@@ -110,11 +114,12 @@ async def test_clone_failures_preserve_foreign_directories_and_clean_only_own_cl
     async def inject(*args, **kwargs):
         result = await original(*args, **kwargs)
         if "clone" in args:
-            if fault in {"network", "auth", "cancel"}:
+            if fault in {"network", "auth", "cancel", "cleanup"}:
                 raise {
                     "network": ConnectionError,
                     "auth": PermissionError,
                     "cancel": asyncio.CancelledError,
+                    "cleanup": CleanupError,
                 }[fault]("injected")
             if fault == "race":
                 source.path.mkdir()  # Even an empty competing target must never be replaced.
@@ -132,10 +137,15 @@ async def test_clone_failures_preserve_foreign_directories_and_clean_only_own_cl
         return result
 
     monkeypatch.setattr("gongcao.workspace.command", inject)
-    with pytest.raises((OSError, ValueError, asyncio.CancelledError)):
+    with pytest.raises((OSError, ValueError, CleanupError, asyncio.CancelledError)):
         await prepare_repository(source)
     assert (other / "sentinel").read_text() == "untouched"
-    assert not list(source.path.parent.glob(".gongcao-clone-*"))
+    if fault in {"cancel", "cleanup"}:
+        assert len(list(source.path.parent.glob(".gongcao-clone-*"))) == 2
+        with pytest.raises(CleanupError, match="Unconfirmed clone intent"):
+            await prepare_repository(source)
+    else:
+        assert not list(source.path.parent.glob(".gongcao-clone-*"))
     if fault == "race":
         assert source.path.is_dir() and list(source.path.iterdir()) == []
     elif fault == "symlink":
@@ -226,7 +236,7 @@ async def test_concurrent_publish_never_replaces_competing_clone(tmp_path, clone
         prepare_repository(source), prepare_repository(source), return_exceptions=True
     )
     assert results.count("已克隆") == 1
-    assert sum(isinstance(result, FileExistsError) for result in results) == 1
+    assert sum(isinstance(result, (FileExistsError, CleanupError)) for result in results) == 1
     assert (source.path / ".git").is_dir()
     assert not list(source.path.parent.glob(".gongcao-clone-*"))
 
@@ -281,3 +291,76 @@ async def test_preparation_failure_backs_off_and_recovers(intake, store, monkeyp
     await intake.scan()
     assert len(store.tasks()) == 1
     assert intake.repositories[intake.config.discovery.sources[0].repo] == "已复用"
+
+
+@pytest.mark.parametrize("arrival", ["after_clone", "after_validate"])
+async def test_replaced_clone_is_never_published(
+    tmp_path, repo, clone_transport, monkeypatch, arrival
+):
+    original, _ = clone_transport
+    source = Source("example/demo", tmp_path / "clones/demo")
+    replaced = False
+    moved = tmp_path / "owned-moved"
+
+    async def substitute(*args, **kwargs):
+        nonlocal replaced
+        result = await original(*args, **kwargs)
+        clone = Path(args[-1]) if "clone" in args else Path(kwargs.get("cwd", "/"))
+        boundary = (
+            "clone" in args
+            if arrival == "after_clone"
+            else args == ("git", "rev-parse", "HEAD^{commit}")
+        )
+        if boundary and ".gongcao-clone-" in str(clone) and not replaced:
+            replaced = True
+            clone.rename(moved)
+            await command("git", "clone", str(repo), str(clone))
+            await command(
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/demo.git",
+                cwd=str(clone),
+            )
+            (clone / "foreign-sentinel").write_text("not ours")
+        return result
+
+    monkeypatch.setattr("gongcao.workspace.command", substitute)
+    with pytest.raises(CleanupError, match="ownership changed"):
+        await prepare_repository(source)
+    assert replaced and not source.path.exists()
+    assert moved.is_dir()
+    foreign = next(p for p in source.path.parent.glob(".gongcao-clone-*") if p.is_dir())
+    assert (foreign / "foreign-sentinel").read_text() == "not ours"
+    with pytest.raises(CleanupError, match="Unconfirmed clone intent"):
+        await prepare_repository(source)
+
+
+async def test_unknown_clone_blocks_retries_across_discovery_restart_but_not_other_repos(
+    intake, store, tmp_path, clone_transport, monkeypatch
+):
+    transport, calls = clone_transport
+    slug = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    unknown = Source("other/unknown-" + slug, tmp_path / "clones/unknown")
+
+    async def unconfirmed(*args, **kwargs):
+        result = await transport(*args, **kwargs)
+        if "clone" in args:
+            raise CleanupError("descendant exit not confirmed")
+        return result
+
+    monkeypatch.setattr("gongcao.workspace.command", unconfirmed)
+    config = replace(
+        intake.config,
+        discovery=replace(
+            intake.config.discovery, sources=(unknown, *intake.config.discovery.sources)
+        ),
+    )
+    for _ in range(2):
+        discovery = Discovery(store, config, intake.github)
+        async with discovery.active(once=True):
+            await discovery.scan()
+            assert discovery.repositories[unknown.repo].startswith("待核对")
+        assert len(calls) == 1 and len(store.tasks()) == 1
+        assert not unknown.path.exists()
