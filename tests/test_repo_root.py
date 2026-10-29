@@ -8,6 +8,7 @@ from test_discovery import intake as intake
 
 from gongcao.config import DiscoveryConfig, Source
 from gongcao.discovery import Discovery
+from gongcao.events import terminal_logging
 from gongcao.github import command
 from gongcao.model import State
 from gongcao.processes import CleanupError
@@ -97,6 +98,49 @@ async def test_clone_and_restart_preserve_existing_head_and_dirty_worktree(
     assert await command("git", "rev-parse", "HEAD", cwd=str(source.path)) == head
     assert (source.path / "sample.txt").read_text() == "keep local work"
     assert not list(source.path.parent.glob(".gongcao-clone-*"))
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_slow_clone_logs_before_completion_and_not_again_on_reuse(
+    intake, store, tmp_path, clone_transport, monkeypatch, capsys, failure
+):
+    transport, calls = clone_transport
+    source = replace(intake.config.discovery.sources[0], path=tmp_path / "clone")
+    config = replace(intake.config, discovery=replace(intake.config.discovery, sources=(source,)))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked(*args, **kwargs):
+        if "clone" in args:
+            entered.set()
+            await release.wait()
+            if failure:
+                raise ConnectionError("private transport diagnostic")
+        return await transport(*args, **kwargs)
+
+    monkeypatch.setattr("gongcao.workspace.command", blocked)
+    discovery = Discovery(store, config, intake.github)
+    with terminal_logging():
+        pending = asyncio.create_task(discovery.scan())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            output = capsys.readouterr()
+            assert not pending.done() and not output.out
+            assert output.err.count("正在克隆") == 1
+            assert source.repo in output.err and str(source.path) in output.err
+            assert "已克隆" not in output.err and "失败" not in output.err
+        finally:
+            release.set()
+            await pending
+        output = capsys.readouterr()
+        assert not output.out and "正在克隆" not in output.err
+        assert ("重试" if failure else "已克隆") in output.err
+        assert "private transport diagnostic" not in output.err
+        if not failure:
+            await discovery.scan()
+            await Discovery(store, config, intake.github).scan()
+            output = capsys.readouterr()
+            assert not output.out and "正在克隆" not in output.err
+            assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -338,7 +382,7 @@ async def test_replaced_clone_is_never_published(
 
 
 async def test_unknown_clone_blocks_retries_across_discovery_restart_but_not_other_repos(
-    intake, store, tmp_path, clone_transport, monkeypatch
+    intake, store, tmp_path, clone_transport, monkeypatch, capsys
 ):
     transport, calls = clone_transport
     slug = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
@@ -357,10 +401,27 @@ async def test_unknown_clone_blocks_retries_across_discovery_restart_but_not_oth
             intake.config.discovery, sources=(unknown, *intake.config.discovery.sources)
         ),
     )
-    for _ in range(2):
+    preserved = None
+    for attempt in range(2):
         discovery = Discovery(store, config, intake.github)
-        async with discovery.active(once=True):
-            await discovery.scan()
-            assert discovery.repositories[unknown.repo].startswith("待核对")
+        with terminal_logging():
+            async with discovery.active(once=True):
+                await discovery.scan()
+                assert discovery.repositories[unknown.repo].startswith("待核对")
+                assert discovery.repositories[config.discovery.sources[1].repo] == "已复用"
+        output = capsys.readouterr()
+        assert not output.out
+        assert output.err.count("仓库准备待核对") == 1
+        assert output.err.count("正在克隆") == (1 if attempt == 0 else 0)
+        line = next(line for line in output.err.splitlines() if "仓库准备待核对" in line)
+        assert unknown.repo in line and "先核对子进程/目录归属，勿直接删除" in line
+        location = Path(line.split("位置：", 1)[1].split("；", 1)[0])
+        assert location.parent == unknown.path.parent
+        residuals = set(location.parent.glob(location.name))
+        assert len(residuals) == 2
+        marker = next(path for path in residuals if path.suffix == ".json")
+        current = (residuals, marker.read_text())
+        assert preserved is None or preserved == current
+        preserved = current
         assert len(calls) == 1 and len(store.tasks()) == 1
         assert not unknown.path.exists()

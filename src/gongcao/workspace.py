@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -14,6 +15,12 @@ from .config import Config, Source, repository_path
 from .github import Target, command
 from .model import Role
 from .processes import CleanupError
+
+LOG = logging.getLogger(__name__)
+
+
+def clone_prefix(path: Path) -> str:
+    return ".gongcao-clone-" + hashlib.sha256(str(path).encode()).hexdigest()[:12] + "-"
 
 
 async def repository(path: Path, target: Target) -> tuple[Path, str]:
@@ -35,7 +42,7 @@ async def prepare_repository(source: Source) -> str:
     """Under the discovery repository lock, publish only our own verified clone."""
     path = repository_path(str(source.path))
     target = Target(source.repo, "issues", 1)
-    prefix = ".gongcao-clone-" + hashlib.sha256(str(path).encode()).hexdigest()[:12] + "-"
+    prefix = clone_prefix(path)
     if any(path.parent.glob(prefix + "*")):
         raise CleanupError(
             "Unconfirmed clone intent remains; reconcile its directory/process first"
@@ -98,6 +105,7 @@ async def prepare_repository(source: Source) -> str:
         # A pinned directory descriptor keeps clone/cleanup away from replaced ancestors.
         pinned = Path(f"/proc/{os.getpid()}/fd/{parent}")
         clone = pinned / temporary
+        LOG.info("[%s] 正在克隆，目标路径：%s", source.repo, path)
         await command(
             "git",
             "-c",

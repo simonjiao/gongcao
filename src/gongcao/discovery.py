@@ -21,7 +21,7 @@ from .model import Stage, State
 from .processes import CleanupError
 from .recovery import Recovery
 from .store import Store
-from .workspace import prepare_repository
+from .workspace import clone_prefix, prepare_repository
 
 LOG = logging.getLogger(__name__)
 
@@ -246,7 +246,12 @@ class Discovery:
             except CleanupError:
                 self.repositories[source.repo] = "待核对：clone 归属或进程收束未确认"
                 self.retry[key] = (0, float("inf"))
-                LOG.warning("[%s] 仓库准备待核对，保留临时意图及目录，暂停自动重试", source.repo)
+                LOG.warning(
+                    "[%s] 仓库准备待核对，暂停自动重试；保留临时目录及 JSON 意图，"
+                    "位置：%s；先核对子进程/目录归属，勿直接删除",
+                    source.repo,
+                    source.path.parent / (clone_prefix(source.path) + "*"),
+                )
             except Exception as exc:
                 reason = (
                     "目标目录已存在或发生竞争"
