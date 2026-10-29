@@ -136,6 +136,7 @@ class Recovery:
                 return {
                     "task_id": task_id,
                     "recovered": False,
+                    "busy": True,
                     "reason": "Task or resource is occupied",
                 }
             try:

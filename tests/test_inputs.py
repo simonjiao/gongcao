@@ -167,7 +167,7 @@ async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
         ),
     ],
 )
-async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, headers, limited):
+async def test_rate_limit_headers_count_and_cooldown(store, monkeypatch, status, headers, limited):
     now = [1000.0]
     monkeypatch.setattr("gongcao.github.time.time", lambda: now[0])
 
@@ -187,11 +187,15 @@ async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, header
     monkeypatch.setattr("gongcao.github.launch", launch)
     monkeypatch.setattr("gongcao.github.completed", lambda process: None)
     api = GitHub()
+    api.traffic.restore(store)  # Also persists before Discovery has registered any task.
     api.traffic.reset = 2000.0  # A core reset must not replace a GraphQL reset.
     with pytest.raises(Deferred if limited else PermissionError):
         await api.read("user")
     assert api.traffic.counts["checks"] == 1
     if limited:
+        restarted = Traffic()
+        restarted.restore(store)
+        assert restarted.cooldown == api.traffic.cooldown
         if headers and "9000" in headers:
             assert api.traffic.cooldown == 9000
         with pytest.raises(Deferred):

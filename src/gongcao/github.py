@@ -1,6 +1,7 @@
 """GitHub facts and low-level transport. Only the controller authorizes mutations."""
 
 import asyncio
+import fcntl
 import json
 import re
 import time
@@ -9,6 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 from .events import Redactor
@@ -47,6 +49,7 @@ class Traffic:
     spacing: float = 0
     failures: int = 0
     generation: int = 0
+    cooldown_path: Path | None = None
     recent: deque[float] = field(default_factory=deque)
     counts: Counter[str] = field(default_factory=Counter)
     snapshots: dict[tuple[str, int | None], tuple[float, dict[str, Any]]] = field(
@@ -54,12 +57,27 @@ class Traffic:
     )
 
     def restore(self, store: Store) -> None:
+        self.cooldown_path = store.root / "github-cooldown"
         row = store.db.execute(
             "SELECT MAX(json_extract(data,'$.until')) FROM artifacts WHERE kind='github-cooldown'"
         ).fetchone()
         self.cooldown = max(self.cooldown, row[0] or 0)
+        self.persist()
+
+    def persist(self) -> None:
+        if self.cooldown_path is None:
+            return
+        path = self.cooldown_path
+        with path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.cooldown = max(self.cooldown, float(path.read_text()) if path.exists() else 0)
+            if self.cooldown:
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(str(self.cooldown))
+                temporary.replace(path)
 
     def defer(self, store: Store, task_id: int, exc: Deferred, *, recovery: bool = False) -> None:
+        self.persist()
         task = store.task(task_id)
         recovery = recovery or bool(
             store.db.execute(
@@ -133,6 +151,7 @@ class Traffic:
                 if headers.get("x-ratelimit-remaining") == "0" and "x-ratelimit-reset" in headers
                 else time.time() + min(300, 30 * 2 ** min(self.failures - 1, 4)),
             )
+            self.persist()
             raise Deferred(f"GitHub rate limit; cooling until {self.cooldown:.0f}")
         if not failed:
             self.failures = 0

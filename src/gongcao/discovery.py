@@ -37,6 +37,7 @@ def lock_path(repo: str) -> Path:
 class Discovery:
     def __init__(self, store: Store, config: Config, github: GitHub):
         self.store, self.config, self.github = store, config, github
+        github.traffic.restore(store)
         self.controller = store.db.execute("SELECT id FROM controller").fetchone()[0]
         self.locks: list[TextIO] = []
         self.retry: dict[str, tuple[int, float]] = {}

@@ -109,6 +109,15 @@ async def test_rate_limit_preserves_stage_and_resumes_after_restart(
     await scheduler.advance(task_id)
     assert len(calls) == 1 and fixture_github.traffic.cooldown == until
     monkeypatch.setattr("gongcao.github.time.time", lambda: until + 1)
+    if written:
+
+        async def busy(*args):
+            return {"recovered": False, "busy": True}
+
+        with monkeypatch.context() as occupied:
+            occupied.setattr("gongcao.recovery.Recovery.recover", busy)
+            await scheduler.advance(task_id)
+        assert store.artifact(task_id, "github-cooldown", "")["recovery"]
     await scheduler.advance(task_id)
     assert calls == [stage, stage] and store.task(task_id)["state"] == State.COMPLETED
     assert store.db.execute("SELECT COUNT(*) FROM retries").fetchone()[0] == 0

@@ -87,7 +87,7 @@ class Scheduler:
         cooldown = self.store.artifact(task_id, "github-cooldown", "")
         if cooldown and cooldown.get("recovery"):
             result = await Recovery(self.store, self.github).recover(task_id)
-            if time.time() < self.github.traffic.cooldown:
+            if result.get("busy") or time.time() < self.github.traffic.cooldown:
                 return
             with self.store.db:
                 self.store.db.execute(
