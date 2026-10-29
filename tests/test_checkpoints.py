@@ -358,3 +358,100 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
         await Discovery(store, config, github).handoff(task_id)
     assert calls == 1  # A fresh publisher must honor the persisted backoff.
     assert store.task(task_id)["status_sync"]["dirty"]
+
+
+@pytest.mark.parametrize("change", ["execution", "roles"])
+async def test_fresh_retry_adopts_execution_changes_but_preserves_history(
+    store, task_id, blocked, change
+):
+    config, github, post, status, step = blocked
+    old = store.runs(task_id)[-1]
+    old_execution = dict(old["details"]["execution"])
+    changed = replace(config, model="configured-model", reasoning_effort="high")
+    if change == "roles":
+        from gongcao.model import Role
+
+        changed = replace(changed, prompts=changed.prompts | {Role.DEVELOPER: "different role"})
+    post("/gongcao retry")
+    await Workflow(store, changed, github).run(task_id)
+    if change == "roles":
+        assert len(store.runs(task_id)) == 2
+        assert "Role policy" in store.evidence(task_id)["instructions"][-1]["reason"]
+    else:
+        assert store.task(task_id)["stage"] == Stage.REVIEW, store.task(task_id)["reason"]
+        new = store.runs(task_id)[-1]
+        assert new["details"]["execution"]["model"] == "configured-model"
+        assert new["details"]["execution"]["reasoning_effort"] == "high"
+        assert new["details"]["source"]["sha"] == old["details"]["save"]["sha"]
+        assert "configured-model" in status["body"]
+    retained = next(r for r in store.runs(task_id) if r["id"] == old["id"])
+    assert retained["details"]["execution"] == old_execution
+
+
+async def test_retry_order_uses_comment_ids_not_collection_order(store, task_id, blocked):
+    config, github, post, status, step = blocked
+    newest = post("/gongcao retry")
+    newest["id"] = 100
+    older = post("/gongcao retry")
+    older["id"] = 99  # Collected later; must not starve the actual newer authorization.
+    await Workflow(store, config, github).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.REVIEW, store.task(task_id)["reason"]
+    assert store.task(task_id)["control"]["command_id"] == "github:100"
+    receipts = {r["id"]: r for r in store.evidence(task_id)["instructions"]}
+    assert receipts["github:99"]["status"] == "superseded"
+
+
+async def test_retry_rechecks_barrier_under_the_consumption_transaction(
+    store, task_id, blocked, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from gongcao.control import bind
+
+    config, github, post, status, step = blocked
+    candidate = post("/gongcao retry")
+    old_transaction = Controls.transaction
+    armed = False
+    barrier = Controls.retry_barrier
+
+    def observe(self, *args):
+        nonlocal armed
+        result = barrier(self, *args)
+        if not self.db.in_transaction:
+            armed = True
+        return result
+
+    @contextmanager
+    def transaction(self):
+        nonlocal armed
+        # Model another collector's commit immediately before the consumption write lock.
+        if armed and not self.db.in_transaction:
+            armed = False
+            task = store.task(task_id)
+            with store.db:
+                self.record(
+                    task_id,
+                    "github:100",
+                    bind(
+                        task,
+                        {
+                            "mode": "pause",
+                            "target": None,
+                            "feedback": "",
+                            "actor": "owner",
+                            "created": task["updated"],
+                        },
+                    ),
+                    "pending",
+                    "Instruction verification pending: HTTP 403",
+                )
+        with old_transaction(self):
+            yield
+
+    monkeypatch.setattr(Controls, "retry_barrier", observe)
+    monkeypatch.setattr(Controls, "transaction", transaction)
+    await Workflow(store, config, github).run(task_id)
+    assert len(store.runs(task_id)) == 2
+    receipts = {r["id"]: r for r in store.evidence(task_id)["instructions"]}
+    assert receipts["github:100"]["status"] == "pending"
+    assert receipts["github:" + str(candidate["id"])]["status"] != "accepted"

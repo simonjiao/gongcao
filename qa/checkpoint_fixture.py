@@ -15,6 +15,9 @@ if data['role'] == 'developer':
     else:
         assert sample.read_text() == 'partial work\n', 'Prior changes were lost'
         sample.write_text('partial work\ncompleted after retry\n')
+print(json.dumps({'kind':'execution','data':{
+    'model':request['model'],'reasoning_effort':request['reasoning_effort'],
+    'evidence':'offline SDK fixture'}}))
 print(json.dumps({'kind':'thread','data':{'thread_id':str(uuid.uuid4())}}))
 print(json.dumps({'kind':'result','data':{
     'conclusion':conclusion,

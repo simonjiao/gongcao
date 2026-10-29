@@ -500,7 +500,14 @@ async def test_remote_revocation_is_read_after_agent_before_publication(
     monkeypatch.setattr(Runner, "receive", receive)
     grant = comments.post("/gongcao auto")
     await Controls(store).poll(task_id, config, comments)
-    monkeypatch.setattr(fixture_github, "read", comments.read)
+    original_read = fixture_github.read
+
+    async def read(path):
+        if "/comments/" in path:
+            return await comments.read(path)
+        return await original_read(path)
+
+    monkeypatch.setattr(fixture_github, "read", read)
     await Workflow(store, config, fixture_github).run(task_id)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
     assert store.task(task_id)["stage"] == Stage.DEVELOPMENT

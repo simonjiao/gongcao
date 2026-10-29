@@ -630,6 +630,7 @@ class Controls:
                     task,
                     {
                         "actor": actor,
+                        "policy": config.policy_hash,
                         "created": datetime.fromisoformat(
                             comment["created_at"].replace("Z", "+00:00")
                         ).timestamp(),
@@ -676,7 +677,7 @@ class Controls:
             return
         rows = self.db.execute(
             "SELECT id,data FROM instructions WHERE task_id=? AND status='pending' AND reason='' "
-            "AND json_extract(data,'$.mode')='retry' ORDER BY rowid DESC",
+            "AND json_extract(data,'$.mode')='retry' ORDER BY CAST(substr(id,8) AS INTEGER) DESC",
             (task_id,),
         ).fetchall()
         for row in rows:
@@ -690,8 +691,13 @@ class Controls:
             reason = rejection(task, data, received=data)
             if data["actor"].casefold() not in {a.casefold() for a in config.copilot_operators}:
                 reason = "Operator is not authorized"
-            if task["control"].get("policy") not in {None, config.policy_hash}:
-                reason = "Execution policy changed; reconcile and renew stage authorization"
+            changed_policy = task["control"].get("policy") not in {None, config.policy_hash}
+            policy = self.store.artifact(task_id, "policy", "") or {}
+            if changed_policy and (
+                data.get("policy") != config.policy_hash
+                or policy.get("roles_hash") != config.roles_hash
+            ):
+                reason = "Role policy changed or unverified; reconcile and renew authorization"
             if reason:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", reason)
@@ -720,18 +726,18 @@ class Controls:
                     await remote.source(self.store.task(task_id))
                 # Re-read the immutable receipt after all network/OS checks, before reset.
                 await asyncio.create_task(self.collect(task_id, config, github), context=Context())
-                receipt = self.db.execute(
-                    "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
-                    (task_id, row["id"]),
-                ).fetchone()
-                if (
-                    receipt["status"] != "pending"
-                    or receipt["reason"]
-                    or self.retry_barrier(task_id, row["id"])
-                ):
-                    return
                 with self.transaction():
                     self.fence(task_id)
+                    receipt = self.db.execute(
+                        "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
+                        (task_id, row["id"]),
+                    ).fetchone()
+                    if (
+                        receipt["status"] != "pending"
+                        or receipt["reason"]
+                        or self.retry_barrier(task_id, row["id"])
+                    ):
+                        return
                     current = self.store.task(task_id)
                     if baseline(current) != data["baseline"] or current["stage"] != data["stage"]:
                         raise ValueError("Task changed during retry reconciliation")
@@ -742,8 +748,9 @@ class Controls:
                     old = current["control"]
                     self.db.execute(
                         "UPDATE instructions SET status='superseded',reason=? WHERE task_id=? "
-                        "AND id!=? AND status='pending'",
-                        ("Verified newer retry", task_id, row["id"]),
+                        "AND status='pending' AND id LIKE 'github:%' "
+                        "AND CAST(substr(id,8) AS INTEGER)<?",
+                        ("Verified newer retry", task_id, int(row["id"].split(":")[1])),
                     )
                     self.mark(task_id, row["id"], "accepted", "")
                     if old.get("command_id"):
@@ -766,6 +773,16 @@ class Controls:
                         },
                     )
                     recovery.reset_retry(task_id, task["target_sha"])
+                    if changed_policy:
+                        self.store.record(
+                            self.store.task(task_id),
+                            "policy",
+                            "",
+                            {
+                                "hash": config.policy_hash,
+                                "roles_hash": config.roles_hash,
+                            },
+                        )
             except (UncertainWrite, InstructionChanged, ValueError) as exc:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))

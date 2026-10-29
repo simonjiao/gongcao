@@ -571,8 +571,9 @@ class Store:
     def record(
         self, expected: dict[str, Any], kind: str, policy: str, data: dict[str, Any]
     ) -> None:
-        with self.db:
-            self.db.execute("BEGIN IMMEDIATE")
+        from .control import Controls
+
+        with Controls(self).transaction():
             self.guard(expected)
             self.db.execute(
                 "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",

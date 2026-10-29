@@ -185,6 +185,10 @@ class Config:
         }
 
     @property
+    def roles_hash(self) -> str:
+        return hashlib.sha256(json.dumps(self.prompts, sort_keys=True).encode()).hexdigest()
+
+    @property
     def policy_hash(self) -> str:
         return hashlib.sha256(
             json.dumps(

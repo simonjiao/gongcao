@@ -361,7 +361,15 @@ class Workflow:
                         )
                         task = self.store.task(task_id)
                     if not policy or policy["hash"] != self.config.policy_hash:
-                        self.store.record(task, "policy", "", {"hash": self.config.policy_hash})
+                        self.store.record(
+                            task,
+                            "policy",
+                            "",
+                            {
+                                "hash": self.config.policy_hash,
+                                "roles_hash": self.config.roles_hash,
+                            },
+                        )
                     await self.step(task)
                     await controls.poll(task_id, self.config, self.github)
                     controls.checkpoint(task_id)
