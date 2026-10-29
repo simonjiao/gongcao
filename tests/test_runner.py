@@ -169,13 +169,15 @@ async def test_initialization_failures_have_terminal_records(
         (store.root / "runs").write_text("blocking file")
     else:
 
-        def broken_sink(*_):
+        def broken_sink(self, kind, data, *, controller=False):
             raise PermissionError("log sink unavailable")
 
         monkeypatch.setattr(Journal, "emit", broken_sink)
     await Runner(store, Config(auth_file=auth_file), ReadOnlyGitHub(snapshot)).run(task_id)
     assert store.task(task_id)["state"] == State.WAITING_ENVIRONMENT
     assert store.runs(task_id)[0]["ended"] is not None
+    if failure == "log_sink":
+        assert "log sink unavailable" in store.task(task_id)["reason"]
 
 
 async def test_closing_remote_object_during_execution_stops_advancement(

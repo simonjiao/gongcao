@@ -38,3 +38,7 @@ uv run python -m qa.repo_root --real --directory /absolute/new-qa-directory \
 结果保存为该目录的 evidence.json，包含实现 SHA、账户、实际仓库 SHA、复用后
 HEAD/本地修改保持不变的验证。故障和破坏性边界只在离线夹具中演练，不对业务
 仓库执行。不改远程开发/PR 目标分支解析策略，不自动合并或部署。
+
+真实仓库准备证据见 [JSON](evidence/issue90-repo-root.json)，实际执行绑定
+`03fb9fc391d584664886ddb83603af20517bac79`。后续仅修正日志故障测试替身签名并
+归档证据，生产与 QA 实现内容保持相同；两个 Python 版本的最终全量结果见 PR。
