@@ -29,7 +29,18 @@ async def execute(request: dict[str, Any]) -> None:
         await codex.initialize()
         model, effort = request["model"], request["reasoning_effort"]
         catalog = await codex.model_list(include_hidden=True)
-        selected = next((item for item in catalog.data if item.model == model), None)
+        models = list(catalog.data)
+        while catalog.next_cursor:
+            catalog = await codex.request(
+                "model/list",
+                {
+                    "includeHidden": True,
+                    "cursor": catalog.next_cursor,
+                },
+                response_model=type(catalog),
+            )
+            models.extend(catalog.data)
+        selected = next((item for item in models if item.model == model), None)
         if selected is None:
             raise ValueError(f"Configured model is unavailable in the SDK catalog: {model}")
         if effort not in {

@@ -55,6 +55,7 @@ def sdk(monkeypatch):
 
         async def model_list(self, **kwargs):
             return SimpleNamespace(
+                next_cursor=None,
                 data=[
                     SimpleNamespace(
                         model=self.actual_model,
@@ -64,7 +65,7 @@ def sdk(monkeypatch):
                     )
                 ]
                 if self.available
-                else []
+                else [],
             )
 
         async def thread_start(self, params):
@@ -156,3 +157,22 @@ def test_invalid_model_configuration_fails_before_session(tmp_path, text):
     path.write_text(text)
     with pytest.raises(ValueError):
         Config.load(path)
+
+
+async def test_configured_model_on_later_catalog_page_is_supported(sdk, monkeypatch):
+    client, calls = sdk
+    original = client.model_list
+
+    async def first(self, **kwargs):
+        return SimpleNamespace(data=[], next_cursor="page-two")
+
+    async def request(self, method, params, *, response_model):
+        assert method == "model/list" and params["cursor"] == "page-two"
+        return await original(self)
+
+    monkeypatch.setattr(client, "model_list", first)
+    monkeypatch.setattr(client, "request", request, raising=False)
+    await worker.execute(
+        {"writable": False, "context": {}, "model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}
+    )
+    assert len(calls) == 2

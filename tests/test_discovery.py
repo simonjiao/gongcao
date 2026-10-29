@@ -181,7 +181,9 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
     assert "waiting_instruction" in intake.github.comments[0]["body"]
 
 
-async def test_progress_failure_is_durable_without_stopping_work_and_preserves_owner(intake, store):
+async def test_progress_failure_is_durable_without_stopping_work_and_preserves_owner(
+    intake, store, monkeypatch
+):
     await intake.scan()
     task = store.tasks()[0]
     intake.github.failure = "absent"
@@ -197,6 +199,10 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     assert len(intake.github.writes) == writes  # Unobserved PATCH is never blindly replayed.
     intake.github.comments[0]["body"] = row["intent"]
     restarted.retry.clear()
+    import time
+
+    future = time.time() + 1000
+    monkeypatch.setattr("gongcao.discovery.time.time", lambda: future)
     await restarted.cycle(discover=False)
     assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
     intake.github.comments[0]["user"]["login"] = "other"

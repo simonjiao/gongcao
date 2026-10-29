@@ -87,20 +87,7 @@ class Workflow:
             self.store.transition(
                 self.safe(task), Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
             )
-        run_id = await self.runner.run(task["id"], evidence, expected_task=task)
-        if role == Role.DEVELOPER:
-            settled = next(r for r in self.store.runs(task["id"]) if r["id"] == run_id)
-            current = self.store.task(task["id"])
-            if current["state"] != State.RECONCILE and (
-                not settled["result"]
-                or json.loads(settled["result"])["conclusion"] != "ready"
-                or current["state"] == State.WAITING_INSTRUCTION
-            ):
-                try:
-                    await self.remote.checkpoint(current, settled)
-                except Exception as exc:
-                    self.store.run_details(run_id, save_error=Redactor().text(str(exc)))
-                    raise
+        await self.runner.run(task["id"], evidence, expected_task=task)
         await controls.poll(task["id"], self.config, self.github)
         controls.revalidate(task["id"], self.config)
         current = self.store.task(task["id"])
@@ -114,6 +101,33 @@ class Workflow:
         }:
             return None
         return self.cached_run(current, role)
+
+    async def save_output(self, task_id: int) -> None:
+        task = self.store.task(task_id)
+        runs = self.store.runs(task_id)
+        if (
+            task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION}
+            or task["state"] in {State.RUNNING, State.RECONCILE}
+            or not runs
+        ):
+            return
+        run = runs[-1]
+        if (
+            run["role"] != Role.DEVELOPER
+            or run["state"] == State.RUNNING
+            or run["details"].get("save", {}).get("state") in {"confirmed", "unchanged"}
+        ):
+            return
+        try:
+            await self.remote.checkpoint(task, run)
+        except Exception as exc:
+            message = Redactor().text(str(exc))
+            self.store.run_details(run["id"], save_error=message)
+            self.store.halt(
+                task_id,
+                State.RECONCILE if isinstance(exc, UncertainWrite) else State.HUMAN,
+                task["reason"] + "; Output not saved: " + message,
+            )
 
     def revision(self, task: dict[str, Any], findings: dict[str, Any]) -> None:
         task = self.safe(task, complete=True)
@@ -382,4 +396,6 @@ class Workflow:
                     )
                 )
                 self.store.halt(task_id, state, Redactor().text(f"{type(exc).__name__}: {exc}"))
+            finally:
+                await self.save_output(task_id)
             return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]

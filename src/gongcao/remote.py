@@ -67,6 +67,12 @@ class Controlled:
         }
         if current["stage"] not in allowed[kind] or latest["state"] != "open":
             raise ValueError("This stage does not authorize the requested GitHub mutation")
+        if kind == "checkpoint" and not current["pr_number"]:
+            if (
+                await Recovery(self.store, self.github).default_base(current)
+                != current["target_sha"]
+            ):
+                raise UncertainWrite("Issue baseline changed before saving output")
         repo, _ = await repository(Path(current["repo_path"]), target)
         if current["target_sha"] not in self.verified:
             key = "control-" + uuid.uuid4().hex
@@ -315,6 +321,15 @@ class Controlled:
             raise ValueError("Publishing requires a confirmed developer result for this target")
         run = valid[0]
         task = await self.before(task, "push")
+        source = await self.source(task)
+        expected = run["details"].get("source", {}).get("sha", task["target_sha"])
+        saved = run["details"].get("save", {})
+        if source["sha"] != expected and not (
+            saved.get("state") == "confirmed" and saved.get("sha") == source["sha"]
+        ):
+            raise UncertainWrite(
+                "Developer output does not continue the confirmed checkpoint chain"
+            )
         snapshot = task["snapshot"]
         workspace = Path(run["worktree"]).resolve()
         if not workspace.is_relative_to(self.store.root / "worktrees"):

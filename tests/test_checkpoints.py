@@ -236,3 +236,125 @@ def test_v4_upgrade_preserves_history_without_inventing_execution_defaults(store
             assert reopened.runs(task_id)[0]["id"] == run
         finally:
             reopened.close()
+
+
+@pytest.mark.parametrize("arrival", ["after_run", "before_push"])
+async def test_ready_then_late_pause_still_saves_output(
+    store, task_id, fixture_github, policy, monkeypatch, arrival
+):
+    from gongcao.remote import Controlled
+    from gongcao.runner import Runner
+
+    controls = Controls(store)
+    controls.issue(task_id, "until", "development", policy=policy.policy_hash)
+    await Workflow(store, policy, fixture_github).run(task_id)
+    controls.issue(task_id, "step", policy=policy.policy_hash)
+    triggered = False
+    if arrival == "after_run":
+        original = Runner.run
+
+        async def late_pause(self, *args, **kwargs):
+            result = await original(self, *args, **kwargs)
+            controls.issue(task_id, "pause", safe=True)
+            return result
+
+        monkeypatch.setattr(Runner, "run", late_pause)
+    else:
+        original = Controlled.before
+
+        async def late_pause(self, task, kind, **kwargs):
+            nonlocal triggered
+            if kind == "push" and not triggered:
+                triggered = True
+                controls.issue(task_id, "pause", safe=True)
+            return await original(self, task, kind, **kwargs)
+
+        monkeypatch.setattr(Controlled, "before", late_pause)
+    await Workflow(store, policy, fixture_github).run(task_id)
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert store.runs(task_id)[-1]["details"]["save"]["state"] == "confirmed"
+    assert fixture_github.pull is None
+
+
+async def test_older_retry_cannot_clear_newer_unverified_pause(
+    store, task_id, blocked, monkeypatch
+):
+    config, github, post, status, step = blocked
+    older = post("/gongcao retry")
+    newer = post("/gongcao pause")
+    await Controls(store).collect(task_id, config, github)
+    original = github.read
+
+    async def instructions(task):
+        return deepcopy([status, step, older])
+
+    async def read(path):
+        if path.endswith("/" + str(newer["id"])):
+            raise PermissionError("HTTP 403")
+        return await original(path)
+
+    monkeypatch.setattr(github, "instructions", instructions)
+    monkeypatch.setattr(github, "read", read)
+    count = len(store.runs(task_id))
+    await Workflow(store, config, github).run(task_id)
+    assert len(store.runs(task_id)) == count
+    assert store.task(task_id)["control"]["pause_requested"]
+    assert store.task(task_id)["state"] == State.HUMAN
+
+
+async def test_transient_retry_read_failure_remains_recoverable(
+    store, task_id, blocked, monkeypatch
+):
+    from gongcao.recovery import Recovery
+
+    config, github, post, status, step = blocked
+    post("/gongcao retry")
+    original = Recovery.reconcile
+
+    async def unavailable(*args):
+        raise ConnectionError("read unavailable")
+
+    monkeypatch.setattr(Recovery, "reconcile", unavailable)
+    count = len(store.runs(task_id))
+    await Workflow(store, config, github).run(task_id)
+    assert len(store.runs(task_id)) == count
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert store.evidence(task_id)["instructions"][-1]["status"] == "pending"
+    monkeypatch.setattr(Recovery, "reconcile", original)
+    with store.db:
+        store.db.execute("UPDATE retries SET next_at=0 WHERE task_id=?", (task_id,))
+    await Workflow(store, config, github).run(task_id)
+    assert store.task(task_id)["stage"] == Stage.REVIEW, store.task(task_id)["reason"]
+
+
+async def test_long_report_and_persistent_status_backoff(store, task_id, blocked, monkeypatch):
+    from gongcao.discovery import Discovery
+
+    config, github, post, status, step = blocked
+    run = store.runs(task_id)[-1]
+    result = json.loads(run["result"])
+    result["basis"] = ["x" * 100_000]
+    result["next_steps"] = ["Need original/r1 packages " + "x" * 100_000]
+    with store.db:
+        store.db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), run["id"]))
+        store.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))
+    publisher = Discovery(store, config, github)
+    await publisher.handoff(task_id)
+    assert len(status["body"]) < 60_000
+    assert "Saved WIP:" in status["body"] and "/gongcao retry" in status["body"]
+    calls = 0
+
+    async def unavailable(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("read unavailable")
+
+    monkeypatch.setattr(github, "instructions", unavailable)
+    with store.db:
+        store.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))
+    await publisher.handoff(task_id)
+    assert calls == 1
+    for _ in range(3):
+        await Discovery(store, config, github).handoff(task_id)
+    assert calls == 1  # A fresh publisher must honor the persisted backoff.
+    assert store.task(task_id)["status_sync"]["dirty"]

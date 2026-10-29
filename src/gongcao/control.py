@@ -657,6 +657,19 @@ class Controls:
                         reason = "Retry comment predates the current execution"
                 self.record(task_id, command_id, data, "rejected" if reason else "pending", reason)
 
+    def retry_barrier(self, task_id: int, command_id: str) -> bool:
+        task = self.store.task(task_id)
+        rows = self.db.execute(
+            "SELECT id FROM instructions WHERE task_id=? AND (status='pending' OR "
+            "(status='accepted' AND id=?))",
+            (task_id, task["control"].get("command_id")),
+        )
+        return any(
+            row["id"].startswith("github:")
+            and int(row["id"].split(":")[1]) > int(command_id.split(":")[1])
+            for row in rows
+        )
+
     async def retry_pending(self, task_id: int, config: Config, github: GitHub) -> None:
         owner = self.store.owners.get(task_id)
         if not owner:
@@ -669,6 +682,11 @@ class Controls:
         for row in rows:
             task = self.store.task(task_id)
             data = json.loads(row["data"])
+            if self.retry_barrier(task_id, row["id"]):
+                return
+            retry = self.db.execute("SELECT * FROM retries WHERE task_id=?", (task_id,)).fetchone()
+            if retry and retry["fingerprint"] == row["id"] and retry["next_at"] > time.time():
+                return
             reason = rejection(task, data, received=data)
             if data["actor"].casefold() not in {a.casefold() for a in config.copilot_operators}:
                 reason = "Operator is not authorized"
@@ -679,7 +697,7 @@ class Controls:
                     self.mark(task_id, row["id"], "rejected", reason)
                 continue
             from .recovery import Recovery
-            from .remote import Controlled
+            from .remote import Controlled, UncertainWrite
 
             recovery = Recovery(self.store, github)
             try:
@@ -706,14 +724,27 @@ class Controls:
                     "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
                     (task_id, row["id"]),
                 ).fetchone()
-                if receipt["status"] != "pending" or receipt["reason"]:
+                if (
+                    receipt["status"] != "pending"
+                    or receipt["reason"]
+                    or self.retry_barrier(task_id, row["id"])
+                ):
                     return
                 with self.transaction():
                     self.fence(task_id)
                     current = self.store.task(task_id)
                     if baseline(current) != data["baseline"] or current["stage"] != data["stage"]:
                         raise ValueError("Task changed during retry reconciliation")
+                    reason = rejection(current, data, received=data)
+                    if reason:
+                        self.mark(task_id, row["id"], "rejected", reason)
+                        return
                     old = current["control"]
+                    self.db.execute(
+                        "UPDATE instructions SET status='superseded',reason=? WHERE task_id=? "
+                        "AND id!=? AND status='pending'",
+                        ("Verified newer retry", task_id, row["id"]),
+                    )
                     self.mark(task_id, row["id"], "accepted", "")
                     if old.get("command_id"):
                         self.mark(
@@ -735,10 +766,24 @@ class Controls:
                         },
                     )
                     recovery.reset_retry(task_id, task["target_sha"])
-            except (OSError, RuntimeError, ValueError) as exc:
+            except (UncertainWrite, InstructionChanged, ValueError) as exc:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))
                 self.store.halt(task_id, State.RECONCILE, Redactor().text(str(exc)))
+            except (OSError, RuntimeError) as exc:
+                failures = (
+                    retry["failures"] + 1 if retry and retry["fingerprint"] == row["id"] else 1
+                )
+                message = "Retry verification unavailable: " + Redactor().text(str(exc))
+                with self.transaction():
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO retries VALUES(?,?,?,?)",
+                        (task_id, failures, row["id"], time.time() + 5 * 2**failures),
+                    )
+                    if failures >= 3:
+                        self.mark(task_id, row["id"], "rejected", message)
+                        message += "; restore access and post a new /gongcao retry"
+                self.store.halt(task_id, State.HUMAN, message)
             return
 
     async def poll(self, task_id: int, config: Config, github: GitHub) -> None:

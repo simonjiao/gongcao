@@ -14,6 +14,7 @@ from typing import Any, TextIO
 from urllib.parse import urlencode
 
 from .config import Config, Source
+from .control import baseline
 from .events import Redactor
 from .github import GitHub, Target
 from .model import Stage, State
@@ -66,8 +67,25 @@ class Discovery:
         message = Redactor().text(f"{type(exc).__name__}: {exc}")
         LOG.warning("Discovery/status %s: %s", key, message)
         self.save(key, dirty=1, reason=message)
+        row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
+        if row and row["task_id"]:
+            data = json.loads(row["data"])
+            digest = hashlib.sha256(self.render(dict(row)).encode()).hexdigest()
+            previous = data.get("status_retry", {})
+            failures = previous.get("failures", 0) + 1 if previous.get("digest") == digest else 1
+            data["status_retry"] = {
+                "digest": digest,
+                "failures": failures,
+                "next_at": time.time() + min(300, 5 * 2**failures),
+            }
+            self.save(key, data=json.dumps(data))
 
     def due(self, key: str) -> bool:
+        row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
+        if row and row["task_id"]:
+            retry = json.loads(row["data"]).get("status_retry", {})
+            if retry.get("digest") == hashlib.sha256(self.render(dict(row)).encode()).hexdigest():
+                return bool(retry["failures"] < 3 and retry["next_at"] <= time.time())
         return self.retry.get(key, (0, 0))[1] <= time.monotonic()
 
     @asynccontextmanager
@@ -362,6 +380,10 @@ class Discovery:
     def render(self, row: dict[str, Any]) -> str:
         task = self.store.task(row["task_id"])
         control = task["control"]
+        runs = self.store.runs(task["id"])
+        retry_available = bool(
+            runs and runs[-1]["details"].get("source", {}).get("baseline") == baseline(task)
+        )
         pull = (
             f"https://github.com/{task['snapshot']['repository']}/pull/{task['pr_number']}"
             if task["pr_number"]
@@ -374,11 +396,12 @@ class Discovery:
             if task["state"] in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
             and task["snapshot"].get("state") == "open"
             and not task["cancel_requested"]
-            else "Reconciliation required; retry cannot bypass unknown writes or process cleanup"
-            if task["state"] == State.RECONCILE
+            and retry_available
+            else "Reconciliation required; retry cannot bypass unverified provenance or cleanup"
+            if task["state"] in {State.RECONCILE, State.HUMAN}
             else "Await human merge"
             if task["stage"] == Stage.MERGEABLE
-            else task["reason"] or "Controller will advance within the configured policy"
+            else task["reason"][:2000] or "Controller will advance within the configured policy"
         )
         marker: str = json.loads(row["data"])["marker"]
         body = (
@@ -386,7 +409,7 @@ class Discovery:
             f"Stage: `{task['stage']}` · State: `{task['state']}`\n"
             f"Mode: `{control['mode']}` · Until: `{control.get('target') or '-'}`\n"
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
-            f"\nReason: {task['reason'] or '-'}"
+            f"\nReason: {task['reason'][:2000] or '-'}"
         )
 
         runs = self.store.runs(task["id"])
@@ -399,21 +422,24 @@ class Discovery:
                 "\nA session ending does not complete the business stage or acceptance gates."
             )
             if result:
-                body += "\nAgent report: " + result["summary"]
-                body += "\nReported checks/basis: " + "; ".join(result["basis"])
-                body += "\nRemaining / missing inputs: " + "; ".join(result["next_steps"])
+                body += (
+                    "\nAgent report excerpts (full report retained locally): "
+                    + result["summary"][:4000]
+                )
+                body += "\nReported checks/basis: " + "; ".join(result["basis"])[:6000]
+                body += "\nRemaining / missing inputs: " + "; ".join(result["next_steps"])[:6000]
             save = run["details"].get("save", {})
             if save.get("state") == "confirmed":
                 url = f"https://github.com/{task['snapshot']['repository']}"
                 body += (
                     f"\nSaved WIP: [{save['branch']}]({url}/tree/{save['branch']})"
                     f" · [{save['sha']}]({url}/commit/{save['sha']})"
-                    f"\nChanges: {save['summary']}"
+                    f"\nChanges: {save['summary'][:4000]}"
                 )
             else:
                 body += "\nRemote checkpoint: " + save.get("state", "not confirmed")
             if run["details"].get("save_error"):
-                body += "\nSave error: " + run["details"]["save_error"]
+                body += "\nSave error: " + run["details"]["save_error"][:2000]
             execution = run["details"].get("execution")
             if execution:
                 body += (
@@ -453,7 +479,11 @@ class Discovery:
     async def handoff(self, task_id: int) -> None:
         """Await the sole status publisher even while serve holds the discovery lock."""
         for row in self.records():
-            if row["task_id"] == task_id:
+            if (
+                row["task_id"] == task_id
+                and (row["dirty"] or row["intent"])
+                and self.due(row["url"])
+            ):
                 try:
                     await self.publish(row)
                 except Exception as exc:
@@ -473,6 +503,9 @@ class Discovery:
                 "SELECT * FROM claims WHERE url=?", (row["url"],)
             ).fetchone()
             await self._publish(dict(current))
+            data = json.loads(current["data"])
+            if data.pop("status_retry", None) is not None:
+                self.save(row["url"], data=json.dumps(data))
 
     async def _publish(self, row: dict[str, Any]) -> None:
         item = await self.owned(row)
