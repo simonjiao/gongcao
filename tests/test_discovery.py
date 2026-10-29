@@ -62,8 +62,9 @@ def intake(store, repo, sha, snapshot):
                 return item
             if "/issues/" in path:
                 return deepcopy(self.rows[int(path.rsplit("/", 1)[1])])
+            current = self.sha if path.endswith("/" + self.branch) else sha
             return (
-                {"object": {"sha": self.sha if path.endswith("/" + self.branch) else sha}}
+                {"object": {"sha": current}}
                 if "/git/ref/" in path
                 else {"default_branch": self.branch}
             )
@@ -107,19 +108,6 @@ def intake(store, repo, sha, snapshot):
 
     config = replace(Config(), discovery=DiscoveryConfig(True, 60, 1, (Source(name, repo),)))
     return Discovery(store, config, API())
-
-
-async def test_confirmed_status_uses_detail_only_without_redundant_patch(intake, store):
-    await intake.scan()
-    intake.github.calls.clear()
-    writes = len(intake.github.writes)
-    await intake.publish(intake.records()[0])
-    assert intake.github.calls == {"read": 1}
-    assert len(intake.github.writes) == writes
-    Controls(store).issue(store.tasks()[0]["id"], "pause")
-    await intake.publish(intake.records()[0])
-    assert intake.github.calls == {"read": 3}
-    assert intake.github.writes[writes:] == ["PATCH"]
 
 
 async def test_filter_dedupe_backlog_status_and_cross_state_lock(
@@ -185,6 +173,10 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
     await intake.scan()
     task = store.tasks()[0]
     assert len(store.tasks()) == 1
+    intake.github.calls.clear()
+    writes = len(intake.github.writes)
+    await intake.publish(intake.records()[0])
+    assert intake.github.calls == {"read": 1} and len(intake.github.writes) == writes
 
     async def forbidden():
         pytest.fail("A status refresh must not scan for other issues")
@@ -199,7 +191,7 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
         assert len(intake.github.writes) == writes
     await intake.refresh(task["id"])
     assert len(store.tasks()) == 1 and len(intake.github.writes) == writes + 1
-    assert not intake.records()[0]["dirty"]
+    assert intake.github.calls == {"read": 3} and not intake.records()[0]["dirty"]
     assert "waiting_instruction" in intake.github.comments[0]["body"]
 
 
@@ -218,15 +210,10 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     writes = len(intake.github.writes)
     intake.github.failure = ""
     restarted = Discovery(store, Config(), intake.github)
-    if failure == "limited":
-        monkeypatch.setattr("gongcao.discovery.time.time", lambda: 2000000000.0)
     await restarted.cycle(discover=False)
-    if failure == "limited":
-        assert len(intake.github.writes) == writes + 1
-        assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
-        return
-    assert len(intake.github.writes) == writes  # Unobserved PATCH is never blindly replayed.
-    intake.github.comments[0]["body"] = row["intent"]
+    assert len(intake.github.writes) == writes
+    if failure == "absent":
+        intake.github.comments[0]["body"] = row["intent"]
     restarted.retry.clear()
     import time
 
@@ -234,6 +221,7 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     monkeypatch.setattr("gongcao.discovery.time.time", lambda: future)
     await restarted.cycle(discover=False)
     assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
+    assert len(intake.github.writes) == writes + (failure == "limited")
     intake.github.comments[0]["user"]["login"] = "other"
     with pytest.raises(ValueError, match="author"):
         await restarted.publish(restarted.records()[0])
@@ -337,10 +325,11 @@ async def test_scan_errors_back_off_without_changing_registered_tasks(
 async def test_merged_fact_wins_over_new_default_base_without_operators(intake, store, entry):
     await intake.scan()
     task = store.tasks()[0]
+    state = State.COMPLETED if entry == "publisher" else State.WAITING_INSTRUCTION
     with store.db:
         store.db.execute(
             "UPDATE tasks SET pr_number=9,stage=?,state=? WHERE id=?",
-            (Stage.MERGEABLE, State.WAITING_INSTRUCTION, task["id"]),
+            (Stage.MERGEABLE, state, task["id"]),
         )
     intake.github.rows[9] = intake.github.rows[1] | {
         "merged": True,

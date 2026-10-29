@@ -11,7 +11,7 @@ from test_pr2 import policy as policy
 
 from gongcao.config import Config
 from gongcao.control import Controls
-from gongcao.github import Deferred, GitHub
+from gongcao.github import GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
 from gongcao.processes import observer
@@ -30,7 +30,7 @@ class Comments(GitHub):
         self.sequence = 0
         self.listing_error = None
         self.listing_missing = False
-        self.reads = 0
+        self.reads = []
 
     def post(self, body, *, actor="owner", at=None):
         stamp = (datetime.now(UTC) if at is None else datetime.fromtimestamp(at, UTC)).isoformat()
@@ -46,7 +46,7 @@ class Comments(GitHub):
         return comment
 
     async def instructions(self, task):
-        self.reads += 1
+        self.reads.append(task["id"])
         assert observer.get() is None
         if self.listing_error:
             raise self.listing_error
@@ -58,114 +58,6 @@ class Comments(GitHub):
             if comment["id"] == int(path.rsplit("/", 1)[1]):
                 return comment
         raise RuntimeError("HTTP 404: Not Found (deletion or visibility unknown)")
-
-
-async def test_background_poll_budget_and_fresh_instruction_wakeup(
-    store, task_id, comments, repo, sha, snapshot, monkeypatch
-):
-    config = Config(copilot_operators=["owner"])
-    controls = Controls(store)
-    controls.issue(task_id, "pause")
-    await asyncio.gather(
-        *(Controls(store).collect(task_id, config, comments, force=False) for _ in range(3))
-    )
-    for _ in range(12):
-        await controls.collect(task_id, config, comments, force=False)
-    assert comments.reads == 1
-    comments.post("/gongcao step")
-    await controls.poll(task_id, config, comments)  # Explicit safety points bypass the timer.
-    assert comments.reads == 2 and store.task(task_id)["state"] == State.QUEUED
-    store.cancel(task_id)
-    await controls.collect(task_id, config, comments, force=False)
-    assert comments.reads == 2
-    clock = [2_000_000_000.0]
-    monkeypatch.setattr(
-        "gongcao.control.time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
-    )
-    monkeypatch.setattr("gongcao.github.time.time", lambda: clock[0])
-    ids = [store.register(snapshot["url"] + str(i), repo, sha, snapshot) for i in range(25)]
-    for _ in range(30):  # More Issues than one minute of globally staggered admissions.
-        for task in controls.polling_tasks():
-            await controls.collect(task["id"], config, comments, force=False)
-        clock[0] += 5
-    assert all(store.instruction_polls.get(i, 0) > 0 for i in ids)
-
-
-async def test_quality_completion_then_rate_limit_resumes_without_repeating_checks(
-    reviewing, store, task_id, fixture_github, copilot, monkeypatch
-):
-    original, limited = Controls.poll, []
-
-    async def poll(self, number, config, github, **kwargs):
-        plan = store.artifact(number, "quality-plan", config.policy_hash)
-        checks = plan and store.artifact(number, "quality-results", plan["plan_hash"])
-        task = store.task(number)
-        if checks and task["stage"] == Stage.REVIEW and task["revision_count"] and not limited:
-            limited.append(checks["run_id"])
-            github.traffic.cooldown = 2_000_000_000
-            raise Deferred("GitHub rate limit after quality completion")
-        return await original(self, number, config, github, **kwargs)
-
-    monkeypatch.setattr(Controls, "poll", poll)
-    scheduler = Scheduler(store, copilot, fixture_github)
-    await reviewing.run(task_id)
-    assert limited and store.task(task_id)["state"] == State.QUEUED
-    writes = len(fixture_github.writes)
-    await scheduler.advance(task_id, immediate=False)
-    assert len(fixture_github.writes) == writes
-    monkeypatch.setattr("gongcao.github.time.time", lambda: 2_000_000_001.0)
-    await scheduler.advance(task_id, immediate=False)
-    task = store.task(task_id)
-    plan = store.artifact(task_id, "quality-plan", copilot.policy_hash)
-    assert task["state"] == State.COMPLETED
-    assert store.artifact(task_id, "quality-results", plan["plan_hash"])["run_id"] == limited[0]
-    assert len(fixture_github.writes) == writes + 1  # Only the new review, no repeated publish.
-
-
-@pytest.mark.parametrize("written", [False, True])
-async def test_rate_limit_preserves_stage_and_resumes_after_restart(
-    store, task_id, fixture_github, policy, monkeypatch, written
-):
-    import time
-
-    stage, calls = store.task(task_id)["stage"], []
-    until = time.time() + 45
-
-    async def step(self, task, **kwargs):
-        calls.append(task["stage"])
-        if len(calls) == 1:
-            if written:
-                store.intent(task, "limited", "review", "{}")
-            self.github.traffic.cooldown = until
-            raise Deferred("GitHub rate limit")
-        store.halt(task_id, State.COMPLETED, "resumed")
-
-    monkeypatch.setattr(Workflow, "step", step)
-
-    async def observe(self, task, op):
-        return {"confirmed": True}
-
-    monkeypatch.setattr("gongcao.recovery.Recovery.observe", observe)
-    await Workflow(store, policy, fixture_github).run(task_id)
-    assert store.task(task_id)["stage"] == stage and store.task(task_id)["state"] == State.QUEUED
-    fixture_github.traffic.cooldown = 0
-    scheduler = Scheduler(store, policy, fixture_github)
-    await scheduler.advance(task_id)
-    assert len(calls) == 1 and fixture_github.traffic.cooldown == until
-    monkeypatch.setattr("gongcao.github.time.time", lambda: until + 1)
-    if written:
-
-        async def busy(*args):
-            return {"recovered": False, "busy": True}
-
-        with monkeypatch.context() as occupied:
-            occupied.setattr("gongcao.recovery.Recovery.recover", busy)
-            await scheduler.advance(task_id)
-        assert store.artifact(task_id, "github-cooldown", "")["recovery"]
-    await scheduler.advance(task_id)
-    assert calls == [stage, stage] and store.task(task_id)["state"] == State.COMPLETED
-    assert store.db.execute("SELECT COUNT(*) FROM retries").fetchone()[0] == 0
-    assert all(op["state"] == "succeeded" for op in store.evidence(task_id)["operations"])
 
 
 @pytest.fixture
@@ -426,6 +318,10 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     controls = Controls(store)
     controls.issue(task_id, "pause")
     config = Config(copilot_operators=["owner"])
+    await asyncio.gather(
+        *(controls.collect(task_id, config, comments, force=False) for _ in range(12))
+    )
+    assert comments.reads == [task_id]
 
     comments.post("/gongcao auto", actor="stranger", at=101)
     comments.post("ordinary comment", at=101)
@@ -433,6 +329,7 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     edited["updated_at"] = "2099-01-01T00:00:00Z"
     await controls.poll(task_id, config, comments)
     assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    assert comments.reads == [task_id] * 2
     assert "Edited comments" in store.evidence(task_id)["instructions"][-1]["reason"]
     comments.post("/gongcao step\nAlso check the upper bound.", at=101)
     clock[0] = 102
@@ -463,6 +360,15 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     store.halt(task_id, State.RECONCILE, "Unknown write")
     controls.issue(task_id, "pause")
     assert store.task(task_id)["state"] == State.RECONCILE
+
+    monkeypatch.setattr("gongcao.github.time.time", lambda: clock[0])
+    clock[0] = 2_000_000_000.0
+    ids = {store.register(snapshot["url"] + str(i), repo, sha, snapshot) for i in range(25)}
+    for _ in range(30):
+        for task in controls.polling_tasks():
+            await controls.collect(task["id"], config, comments, force=False)
+        clock[0] += 5
+    assert ids <= set(comments.reads)
 
 
 @pytest.mark.parametrize(

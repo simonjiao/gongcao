@@ -84,6 +84,8 @@ class Scheduler:
         if time.time() < self.github.traffic.cooldown:
             return
         task = self.store.task(task_id)
+        if not immediate and task["state"] == State.COMPLETED:
+            return  # Discovery still synchronizes remote merge/close lifecycle changes.
         cooldown = self.store.artifact(task_id, "github-cooldown", "")
         if cooldown and cooldown.get("recovery"):
             result = await Recovery(self.store, self.github).recover(task_id)
@@ -154,6 +156,7 @@ class Scheduler:
                 task["stage"] == Stage.MERGED
                 or task["cancel_requested"]
                 or task["state"] == State.WAITING_INSTRUCTION
+                or (not immediate and task["state"] == State.COMPLETED)
             ):
                 return
             due = self.store.db.execute(

@@ -386,6 +386,8 @@ class Workflow:
                                 "roles_hash": self.config.roles_hash,
                             },
                         )
+                    if task["stage"] == Stage.MERGEABLE and task["state"] == State.COMPLETED:
+                        break
                     await self.step(task, instructions_verified=True)
                     if task["stage"] != Stage.ANALYSIS:
                         await controls.poll(task_id, self.config, self.github)

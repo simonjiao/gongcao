@@ -39,19 +39,29 @@ async def test_idle_heartbeat_uses_elapsed_time_not_poll_count(store, monkeypatc
 
     now = store.last_activity
     monkeypatch.setattr("gongcao.scheduler.time", SimpleNamespace(monotonic=lambda: now))
+    github = GitHub()
+    github.traffic.reported_at = now
+    monkeypatch.setattr(
+        "gongcao.github.time", SimpleNamespace(monotonic=lambda: now, time=lambda: now)
+    )
     intervals = iter((1, 1, 297, 1, 1, 299, 1))
 
     async def sleep(delay):
         nonlocal now
         try:
             now += next(intervals)
+            github.traffic.counts["saved"] += 1
         except StopIteration:
             raise asyncio.CancelledError from None
 
     monkeypatch.setattr("gongcao.scheduler.asyncio.sleep", sleep)
     with pytest.raises(asyncio.CancelledError):
-        await Scheduler(store, Config(), GitHub()).schedule(once=False, poll=1.0)
+        await Scheduler(store, Config(), github).schedule(once=False, poll=1.0)
     assert caplog.text.count("空闲心跳") == 2
+    assert caplog.text.count("GitHub 周期请求") == 2
+    github.traffic.start(False)
+    github.report()
+    assert caplog.text.count("GitHub 周期请求") == 3
 
 
 def test_dependency_environment_failure_and_retry_are_logged_once_per_change(
