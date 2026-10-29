@@ -1,0 +1,105 @@
+{
+  "issue": 91,
+  "scope": "Real model, controlled checkpoint push/readback, GitHub retry, inherited worktree, draft PR and review-entry pause. Automatic status handoff covered by offline E2E.",
+  "implementation_sha": "8766580ca27acaa702de96549258e611ab5fbd48",
+  "target_base_sha": "671db652b889930e17682dc15f11f71bf5832a12",
+  "run_id": "98609bd6e20f4680bad879d8f143aab1",
+  "test_issue": "https://github.com/simonjiao/gongcao/issues/92",
+  "test_pr": "https://github.com/simonjiao/gongcao/pull/93",
+  "result_comment": "https://github.com/simonjiao/gongcao/issues/92#issuecomment-6486697924",
+  "checkpoint": {
+    "sha": "29bec6a62b43c21720dbd5060f63d9c875a580f1",
+    "branch": "gongcao/save-01749b9037a5-be803c4093614708a1f25fc1c03bfb87",
+    "run_id": "be803c4093614708a1f25fc1c03bfb87",
+    "parent": "671db652b889930e17682dc15f11f71bf5832a12",
+    "target_sha": "671db652b889930e17682dc15f11f71bf5832a12"
+  },
+  "published_head": "4df635cfbddbdbbe80a88f98a90288ffb07362b2",
+  "stage": "pending_review",
+  "state": "waiting_instruction",
+  "sessions": [
+    {
+      "id": "5fb055a1fc4640d192d42fd63712c977",
+      "role": "analyst",
+      "state": "completed",
+      "thread_id": "01a18597-8d09-79a3-a18f-efa166a2c91a",
+      "target_sha": "671db652b889930e17682dc15f11f71bf5832a12",
+      "execution": {
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "xhigh",
+        "evidence": "SDK thread/start response",
+        "source": {
+          "model": "project-default",
+          "reasoning_effort": "project-default"
+        }
+      },
+      "source": {
+        "sha": "671db652b889930e17682dc15f11f71bf5832a12",
+        "baseline": "85f41aa41e2f6abdc2aeb817531e37d8235082c5c4ac7a6f65e44da40d0952d4"
+      }
+    },
+    {
+      "id": "be803c4093614708a1f25fc1c03bfb87",
+      "role": "developer",
+      "state": "completed",
+      "thread_id": "01a18598-79e1-7d81-87c3-d1f2a1d8bbea",
+      "target_sha": "671db652b889930e17682dc15f11f71bf5832a12",
+      "execution": {
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "xhigh",
+        "evidence": "SDK thread/start response",
+        "source": {
+          "model": "project-default",
+          "reasoning_effort": "project-default"
+        }
+      },
+      "source": {
+        "sha": "671db652b889930e17682dc15f11f71bf5832a12",
+        "baseline": "85f41aa41e2f6abdc2aeb817531e37d8235082c5c4ac7a6f65e44da40d0952d4"
+      }
+    },
+    {
+      "id": "2c7450e9740c4f94ba37355f28c24e00",
+      "role": "developer",
+      "state": "completed",
+      "thread_id": "01a18599-d39c-74a0-a9b4-a527f173fa89",
+      "target_sha": "671db652b889930e17682dc15f11f71bf5832a12",
+      "execution": {
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "xhigh",
+        "evidence": "SDK thread/start response",
+        "source": {
+          "model": "project-default",
+          "reasoning_effort": "project-default"
+        }
+      },
+      "source": {
+        "sha": "29bec6a62b43c21720dbd5060f63d9c875a580f1",
+        "baseline": "85f41aa41e2f6abdc2aeb817531e37d8235082c5c4ac7a6f65e44da40d0952d4",
+        "run_id": "be803c4093614708a1f25fc1c03bfb87",
+        "branch": "gongcao/save-01749b9037a5-be803c4093614708a1f25fc1c03bfb87"
+      }
+    }
+  ],
+  "archives_sha256": {
+    "script.json": "bd7635b1665ab255a19b68635a893b451d74020b95400ff7fe831fc3f2309090",
+    "blocked-checkpoint.json": "27dd6beb31af16918b30590499f9702d6638e83814ea4ebf547325b3177ad6ca",
+    "acceptance.json": "98eacfeae07146880e64b87b5c08cc467c39de3bc3e55f912fc793ec529ee103",
+    "cleanup-confirmed.json": "f3faf351103006fe0c82a42dcb349528c9fbb8bc416aa30f8710783115bf0bce"
+  },
+  "cleanup": {
+    "base": {
+      "branch": "main",
+      "sha": "671db652b889930e17682dc15f11f71bf5832a12"
+    },
+    "pull": {
+      "number": 93,
+      "state": "closed",
+      "merged": false
+    },
+    "issue_closed": true,
+    "branch_deleted": true
+  },
+  "saved_checkpoint_retained": true,
+  "later_changes": "4c2c048 adds transactional instruction ordering and verified model-policy renewal; covered by offline regression, not represented as a second real run."
+}

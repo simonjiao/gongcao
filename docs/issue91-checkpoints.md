@@ -40,3 +40,29 @@ SQLite v5 只增加 Run `details`，升级保留历史会话和未知操作，�
 测试包括 v4 升级/重启、旧版本升级，以及真实 Git/worktree/OS 沙箱下的完整离线链路。
 `qa/checkpoint_fixture.py` 是明确的 SDK 替身，不是真实模型验收；真实验证须显式 `--real`，
 使用独立状态目录与 QA 资源，不启动第二个 serve，不触碰 AirDB #307 及现有运行实例。
+
+## 验收记录
+
+需求依据为 #91 正文 SHA-256
+`416e1f97346f83dda0172aed30f6239ff25bf66e800aa7da56b78ca05f10b85d`。
+
+- 固定实现 `4c2c0489d9f2415d8a07cc12378f855c61f71699`，本地 Python 3.12.3：
+  `uv run ruff check .`、`uv run ruff format --check .`、`uv run mypy`、
+  `uv run pytest -q` 全部通过（322 passed，341.49 秒）。
+- 同一实现的 `uv run python -m qa check --offline` 通过；真实 OS 检查确认
+  宿主凭据、宿主仓库、外部写入均隔离，质量检查环境也保持隔离。
+- Standards / Spec 独立复审无剩余阻断。全部验证在本机进行，不依赖 GitHub CI。
+- 真实定向验收绑定 `8766580ca27acaa702de96549258e611ab5fbd48`：
+  [QA #92 的结果](https://github.com/simonjiao/gongcao/issues/92#issuecomment-6486697924)，
+  Run `98609bd6e20f4680bad879d8f143aab1`，三次新 SDK 会话均确认
+  `gpt-6.1-sol` / `xhigh`。首次 Developer blocked 后实际 commit/push/回读，
+  GitHub retry 创建新会话接续检查点，真实 draft PR 到达 review 入口暂停。
+  [PR #93](https://github.com/simonjiao/gongcao/pull/93) 与 QA Issue 已关闭，未合并；
+  正式工作分支已删除，检查点分支保留作证据。
+- 该真实任务采用手工登记，未声称验证自动发现/自动状态发布，也未执行 review 后的
+  业务质量验收。完整状态交接由离线 E2E 覆盖。后续指令事务与模型参数恢复修订采用
+  离线回归和最终全量测试，未将旧真实结果追记为最新实现的真实运行。
+
+可共享的会话、提交链、资源清理和私有原始归档哈希见
+[证据索引](evidence/issue91-directed.json)。AirDB #307 的现有 worktree、阻塞状态和
+正在运行的实例未修改或重启；没有启动第二个 serve。本变更尚未部署到该实例。
