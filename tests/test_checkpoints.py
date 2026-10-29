@@ -325,21 +325,37 @@ async def test_checkpoint_guard_refuses_cancellation_even_with_stale_task(
             store.save_guard(expected)
 
 
+@pytest.mark.parametrize("arrival", ["before_write", "during_preflight"])
 async def test_cancel_after_checkpoint_intent_retains_commit_without_pushing(
-    store, task_id, fixture_github, policy, monkeypatch
+    store, task_id, fixture_github, policy, monkeypatch, arrival
 ):
     from gongcao.remote import Controlled
 
     install_worker(monkeypatch, WORKER)
     Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
     original = Controlled.before
+    remote_head = Controlled.remote_head
+    writing = False
 
     async def cancel_before_write(self, task, kind, **kwargs):
+        nonlocal writing
         if kind == "checkpoint" and kwargs.get("finish_operation"):
-            store.cancel(task_id)
+            if arrival == "before_write":
+                store.cancel(task_id)
+            else:
+                writing = True
         return await original(self, task, kind, **kwargs)
 
+    async def cancel_during_preflight(self, task, branch):
+        nonlocal writing
+        result = await remote_head(self, task, branch)
+        if writing:
+            writing = False
+            store.cancel(task_id)
+        return result
+
     monkeypatch.setattr(Controlled, "before", cancel_before_write)
+    monkeypatch.setattr(Controlled, "remote_head", cancel_during_preflight)
     await Workflow(store, policy, fixture_github).run(task_id)
     assert store.task(task_id)["state"] == State.CANCELLED
     run = store.runs(task_id)[-1]
@@ -347,7 +363,8 @@ async def test_cancel_after_checkpoint_intent_retains_commit_without_pushing(
     assert saved["state"] == "pending"
     assert (await command("git", "rev-parse", "HEAD", cwd=run["worktree"])).strip() == saved["sha"]
     operations = store.evidence(task_id)["operations"]
-    assert len(operations) == 1 and operations[0]["state"] == "pending"
+    assert len(operations) == 1
+    assert operations[0]["state"] == ("pending" if arrival == "before_write" else "unknown")
     assert Path(run["worktree"], "sample.txt").read_text() == "partial work\n"
     assert fixture_github.pull is None
     assert not await command(

@@ -177,6 +177,8 @@ class Controlled:
                 ).strip()
                 if ancestor != expected:
                     raise UncertainWrite("Publication must fast-forward the confirmed remote head")
+            guard = self.store.save_guard if kind == "checkpoint" else self.store.guard
+            guard(task)
             await command(
                 "git",
                 "push",
