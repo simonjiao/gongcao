@@ -7,7 +7,7 @@ from typing import Any
 from .config import Config
 from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor, progress
-from .github import GitHub
+from .github import Deferred, GitHub
 from .leases import Lease
 from .model import Role, Stage, State, same_version
 from .quality import Quality, verdict
@@ -21,6 +21,7 @@ from .store import Store
 class Workflow:
     def __init__(self, store: Store, config: Config, github: GitHub):
         self.store, self.config, self.github = store, config, github
+        github.traffic.restore(store)
         self.runner = Runner(store, config, github)
         self.quality = Quality(store, config)
         self.remote = Controlled(store, config, github)
@@ -127,6 +128,8 @@ class Workflow:
             return
         try:
             await self.remote.checkpoint(task, run)
+        except Deferred as exc:
+            self.github.traffic.defer(self.store, task_id, exc)
         except Exception as exc:
             message = Redactor().text(str(exc))
             self.store.run_details(run["id"], save_error=message)
@@ -401,6 +404,8 @@ class Workflow:
                     self.store.halt(task_id, State.CANCELLED, "Cancelled by user")
             except (Paused, InstructionChanged):
                 Controls(self.store).checkpoint(task_id)
+            except Deferred as exc:
+                self.github.traffic.defer(self.store, task_id, exc)
             except Exception as exc:
                 if self.store.task(task_id)["stage"] == Stage.MERGED:
                     return [

@@ -144,13 +144,10 @@ async def exercise(run: Run, github: GitHub) -> None:
         await asyncio.wait_for(asyncio.shield(serving), 30)
     before = signature(inspect(run))
     require(await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed")
-    cycles = [
-        line
-        for command in run.root.glob("command-*.json")
-        for line in json.loads(command.read_text())["stderr"].splitlines()
-        if "GitHub 周期请求：" in line
-    ]
-    require(bool(cycles), "Missing controller GitHub request accounting")
+    cycles = [json.loads(path.read_text())["stderr"] for path in run.root.glob("command-*.json")]
+    require(
+        any("GitHub 周期请求：" in text for text in cycles), "Missing GitHub request accounting"
+    )
     run.archive("github-traffic", {"cycles": cycles})
     store = Store(run.root / "state")
     try:

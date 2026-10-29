@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 from .control import Controls, InstructionChanged
 from .events import Redactor
-from .github import GitHub, Target, command
+from .github import Deferred, GitHub, Target, command
 from .leases import Lease, identity, session_alive
 from .model import AgentResult, Stage, State
 from .store import Store
@@ -140,6 +140,9 @@ class Recovery:
                 }
             try:
                 return await self.reconcile(task_id, lease.owner)
+            except Deferred as exc:
+                self.github.traffic.defer(self.store, task_id, exc, recovery=True)
+                return {"task_id": task_id, "recovered": False, "reason": str(exc)}
             except (OSError, RuntimeError, ValueError) as exc:
                 message = Redactor().text(f"{type(exc).__name__}: {exc}")
                 self.store.halt(task_id, State.RECONCILE, message)

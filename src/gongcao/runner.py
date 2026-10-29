@@ -12,7 +12,7 @@ from .config import Config
 from .control import Controls, Paused
 from .control import baseline as controls_baseline
 from .events import Journal, Redactor
-from .github import GitHub
+from .github import Deferred, GitHub
 from .model import AgentResult, Role, Stage, State, after_run, same_version
 from .processes import CleanupError, launch, lease_lost, stop
 from .sandbox import IsolationError, Sandbox
@@ -56,6 +56,7 @@ class Runner:
         consumers: list[asyncio.Task[Any]] = []
         started = time.monotonic()
         stage = Stage(task["stage"])
+        result: AgentResult | None = None
         outcome: tuple[State, Stage, State, str, str | None] = (
             State.FAILED,
             stage,
@@ -171,6 +172,15 @@ class Runner:
                 reason,
                 journal.redactor.text(result.model_dump_json()),
             )
+        except Deferred as exc:
+            outcome = (
+                State.FAILED,
+                stage,
+                State.QUEUED,
+                str(exc),
+                journal.redactor.text(result.model_dump_json()) if result and journal else None,
+            )
+            raise
         except asyncio.CancelledError:
             if lease_lost():
                 outcome = (State.RECONCILE, stage, State.RECONCILE, "Execution lease lost", None)

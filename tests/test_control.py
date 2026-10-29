@@ -11,7 +11,7 @@ from test_pr2 import policy as policy
 
 from gongcao.config import Config
 from gongcao.control import Controls
-from gongcao.github import GitHub
+from gongcao.github import Deferred, GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
 from gongcao.processes import observer
@@ -76,6 +76,34 @@ async def test_background_poll_budget_and_fresh_instruction_wakeup(store, task_i
     store.cancel(task_id)
     await controls.collect(task_id, config, comments, force=False)
     assert comments.reads == 2
+
+
+async def test_rate_limit_preserves_stage_and_resumes_after_restart(
+    store, task_id, fixture_github, policy, monkeypatch
+):
+    import time
+
+    stage, calls = store.task(task_id)["stage"], []
+    until = time.time() + 45
+
+    async def step(self, task, **kwargs):
+        calls.append(task["stage"])
+        if len(calls) == 1:
+            self.github.traffic.cooldown = until
+            raise Deferred("GitHub rate limit")
+        store.halt(task_id, State.COMPLETED, "resumed")
+
+    monkeypatch.setattr(Workflow, "step", step)
+    await Workflow(store, policy, fixture_github).run(task_id)
+    assert store.task(task_id)["stage"] == stage and store.task(task_id)["state"] == State.QUEUED
+    fixture_github.traffic.cooldown = 0
+    scheduler = Scheduler(store, policy, fixture_github)
+    await scheduler.advance(task_id)
+    assert len(calls) == 1 and fixture_github.traffic.cooldown == until
+    monkeypatch.setattr("gongcao.github.time.time", lambda: until + 1)
+    await scheduler.advance(task_id)
+    assert calls == [stage, stage] and store.task(task_id)["state"] == State.COMPLETED
+    assert store.db.execute("SELECT COUNT(*) FROM retries").fetchone()[0] == 0
 
 
 @pytest.fixture

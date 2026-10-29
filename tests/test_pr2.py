@@ -8,7 +8,7 @@ import pytest
 from test_runner import install_worker
 
 from gongcao.config import Config
-from gongcao.github import GitHub, command
+from gongcao.github import Deferred, GitHub, command
 from gongcao.model import Role, Stage, State
 from gongcao.quality import Quality
 from gongcao.remote import Controlled, UncertainWrite
@@ -268,13 +268,15 @@ async def test_writes_require_verified_os_isolation(
     assert fixture_github.writes == []
 
 
-@pytest.mark.parametrize("result", ["observed", "unknown"])
+@pytest.mark.parametrize("result", ["observed", "unknown", "query", "gate", "rejected"])
 async def test_ambiguous_write_queries_remote_and_never_replays(
     store, task_id, policy, monkeypatch, result
 ):
     controlled = Controlled(store, policy, GitHub())
 
     async def before(task, kind, *, finish_operation=False, verified=None):
+        if result == "gate" and finish_operation and calls == 0:
+            raise Deferred("limited before write")
         return task
 
     monkeypatch.setattr(controlled, "before", before)
@@ -282,16 +284,26 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
     calls = 0
 
     async def query():
+        if result == "query" and calls == 0:
+            raise Deferred("limited before intent")
         return observed
 
     async def write():
         nonlocal observed, calls
         calls += 1
+        if result == "rejected" and calls == 1:
+            raise Deferred("HTTP 429: write rejected")
         if result == "observed":
             observed = {"id": 7}
         raise RuntimeError("lost response")
 
     task = store.task(task_id)
+    if result in {"query", "gate", "rejected"}:
+        with pytest.raises(Deferred):
+            await controlled.perform(task, "review", "9", {}, query, write)
+        assert store.evidence(task_id)["operations"] == []
+        result = "observed"  # Cooling finished: fresh checks may now authorize the first write.
+        calls = 0
     if result == "observed":
         assert await controlled.perform(task, "review", "9", {}, query, write) == {"id": 7}
         assert await controlled.perform(task, "review", "9", {}, query, write) == {"id": 7}

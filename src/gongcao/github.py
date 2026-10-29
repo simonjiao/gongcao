@@ -12,14 +12,16 @@ from functools import cached_property
 from typing import Any
 
 from .events import Redactor
+from .model import State
 from .processes import completed, launch, stop
+from .store import Store
 
 background: ContextVar[bool] = ContextVar("github_background", default=False)
 traffic: ContextVar["Traffic | None"] = ContextVar("github_traffic", default=None)
 
 
 class Deferred(RuntimeError):
-    """No request was sent; the next controller cycle may try after the deadline."""
+    """Request was not sent or was rejected by GitHub's rate limiter."""
 
 
 def response(raw: str) -> tuple[dict[str, str], str]:
@@ -51,6 +53,26 @@ class Traffic:
         default_factory=dict
     )
 
+    def restore(self, store: Store) -> None:
+        row = store.db.execute(
+            "SELECT MAX(json_extract(data,'$.until')) FROM artifacts WHERE kind='github-cooldown'"
+        ).fetchone()
+        self.cooldown = max(self.cooldown, row[0] or 0)
+
+    def defer(self, store: Store, task_id: int, exc: Deferred, *, recovery: bool = False) -> None:
+        task = store.task(task_id)
+        with store.db:
+            store.db.execute(
+                "INSERT INTO artifacts(task_id,sha,kind,policy,data) "
+                "VALUES(?,?,'github-cooldown','',?)",
+                (
+                    task_id,
+                    task["target_sha"],
+                    json.dumps({"until": self.cooldown, "recovery": recovery}),
+                ),
+            )
+        store.halt(task_id, State(task["state"]), str(exc))
+
     def due(self, *, spacing: bool = True) -> float:
         now = time.time()
         while self.recent and self.recent[0] <= now - 3600:
@@ -76,20 +98,19 @@ class Traffic:
         if background.get():
             self.recent.append(now)
 
-    def observe(self, raw: str, failed: bool) -> None:
+    def observe(self, raw: str, failed: bool, error: str = "") -> None:
         headers, body = response(raw)
         if headers.get("x-ratelimit-resource") == "core":
             self.remaining = int(headers["x-ratelimit-remaining"])
             self.limit = int(headers["x-ratelimit-limit"])
             self.reset = float(headers["x-ratelimit-reset"])
-        status = raw.splitlines()[0] if raw.startswith("HTTP/") else ""
-        limited = " 429" in status or (
-            " 403" in status
+        status = raw.splitlines()[0] if raw.startswith("HTTP/") else error
+        limited = bool(re.search(r"\b429\b", status)) or (
+            bool(re.search(r"\b403\b", status))
             and (
                 headers.get("x-ratelimit-remaining") == "0"
                 or "retry-after" in headers
-                or "rate limit" in body.lower()
-                or "abuse detection" in body.lower()
+                or re.search(r"rate limit|abuse detection", body + error, re.I)
             )
         )
         if failed and limited:
@@ -150,7 +171,7 @@ async def command(*args: str, cwd: str | None = None, input_data: str | None = N
         raise
     completed(process)
     if usage:
-        usage.observe(stdout.decode(), bool(process.returncode))
+        usage.observe(stdout.decode(), bool(process.returncode), stderr.decode(errors="replace"))
     if process.returncode:
         message = Redactor().text(stderr.decode(errors="replace"))[-2000:]
         if args[0] == "gh" and ("HTTP 403" in message or "HTTP 401" in message):
@@ -358,6 +379,8 @@ class GitHub:
             data = json.loads(response(raw)[1])
             if data.get("errors"):
                 raise RuntimeError(Redactor().text(json.dumps(data["errors"])))
-            return data["data"]["repository"]["pullRequest"]  # type: ignore[no-any-return]
+            pull: dict[str, Any] = data["data"]["repository"]["pullRequest"]
+            pull["reviewDecision"] = pull.get("reviewDecision") or ""
+            return pull
         finally:
             traffic.reset(token)

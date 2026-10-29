@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from .config import Config
 from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
-from .github import GitHub, Target, command
+from .github import Deferred, GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage, State
 from .recovery import Recovery
 from .sandbox import Sandbox
@@ -111,22 +111,34 @@ class Controlled:
     ) -> dict[str, Any]:
         task = await self.before(task, kind, verified=verified)
         key = self.identity(task, kind, object_id)
-        created = self.store.intent(task, key, kind, json.dumps(payload, sort_keys=True))
         found = await observe()
+        created = self.store.intent(task, key, kind, json.dumps(payload, sort_keys=True))
         if found is not None:
             self.store.operation_result(key, "succeeded", found)
             return found
         if not created:
             raise UncertainWrite("Existing write intent is not confirmed remotely; refusing replay")
-        await self.before(task, kind, finish_operation=True)
         try:
+            await self.before(task, kind, finish_operation=True)
             await write()
+        except Deferred:
+            # This newly created intent has no accepted write. Older ambiguous
+            # intents never reach here: they must reconcile above, without replay.
+            with self.store.db:
+                self.store.db.execute(
+                    "DELETE FROM operations WHERE id=? AND state='pending'", (key,)
+                )
+            raise
         except BaseException as exc:
             self.store.operation_result(
                 key, "unknown", {"error": Redactor().text(f"{type(exc).__name__}: {exc}")}
             )
             try:
                 found = await observe()
+            except Deferred:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc from None
+                raise
             except Exception:
                 found = None
             if found is None:

@@ -67,6 +67,15 @@ async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
     snapshot = await api.snapshot(Target.parse("https://github.com/a/b/issues/1"))
     assert calls == [("gh", "api", "repos/a/b/issues/1")]
     assert snapshot["body"] == "[REDACTED]"
+
+    async def gates(*args):
+        return json.dumps({"data": {"repository": {"pullRequest": {"reviewDecision": None}}}})
+
+    monkeypatch.setattr("gongcao.github.read_command", gates)
+    assert (await api.gates({"snapshot": {"repository": "a/b"}, "pr_number": 1}))[
+        "reviewDecision"
+    ] == ""
+    monkeypatch.setattr("gongcao.github.read_command", read)
     calls.clear()
     token = background.set(True)
     try:
@@ -149,6 +158,8 @@ async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
         (403, "X-RateLimit-Remaining: 0\n", True),
         (403, "Retry-After: 45\n", True),
         (429, "Retry-After: 45\n", True),
+        (403, None, True),
+        (429, None, True),
         (
             403,
             "X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 9000\nX-RateLimit-Resource: graphql\n",
@@ -162,7 +173,14 @@ async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, header
 
     async def launch(*args, **kwargs):
         async def communicate(data):
-            return (f"HTTP/2.0 {status} Error\n{headers}\n{{}}".encode(), f"HTTP {status}".encode())
+            return (
+                f"HTTP/2.0 {status} Error\n{headers}\n{{}}".encode()
+                if headers is not None
+                else b"",
+                f"HTTP {status}".encode()
+                if headers is not None
+                else f"API rate limit exceeded (HTTP {status})".encode(),
+            )
 
         return SimpleNamespace(communicate=communicate, returncode=1)
 
@@ -174,7 +192,7 @@ async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, header
         await api.read("user")
     assert api.traffic.counts["checks"] == 1
     if limited:
-        if "9000" in headers:
+        if headers and "9000" in headers:
             assert api.traffic.cooldown == 9000
         with pytest.raises(Deferred):
             await api.mutate("path", {})

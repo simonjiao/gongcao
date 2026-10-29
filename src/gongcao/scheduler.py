@@ -10,7 +10,7 @@ from .config import Config
 from .control import Controls
 from .discovery import Discovery
 from .events import LOG, Redactor, progress, task_event
-from .github import GitHub, background
+from .github import Deferred, GitHub, background
 from .model import Stage, State
 from .recovery import Recovery
 from .store import Store
@@ -22,6 +22,7 @@ class Scheduler:
         if not 1 <= concurrency <= 3:
             raise ValueError("Concurrency must be between 1 and 3")
         self.store, self.config, self.github = store, config, github
+        github.traffic.restore(store)
         self.semaphore = asyncio.Semaphore(concurrency)
         self.workflows: list[Workflow] = []
         self.concurrency = concurrency
@@ -74,7 +75,19 @@ class Scheduler:
         )
 
     async def advance(self, task_id: int, *, immediate: bool = True) -> None:
+        if time.time() < self.github.traffic.cooldown:
+            return
         task = self.store.task(task_id)
+        cooldown = self.store.artifact(task_id, "github-cooldown", "")
+        if cooldown and cooldown.get("recovery"):
+            if not (await Recovery(self.store, self.github).recover(task_id))["recovered"]:
+                return
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE artifacts SET valid=0 WHERE task_id=? AND kind='github-cooldown'",
+                    (task_id,),
+                )
+            task = self.store.task(task_id)
         wake = bool(
             self.store.db.execute(
                 "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason=''",
@@ -111,6 +124,9 @@ class Scheduler:
                 try:
                     self.store.sync(task_id, await self.github.task_snapshot(task))
                     await controls.poll(task_id, self.config, self.github, force=immediate)
+                except Deferred as exc:
+                    self.github.traffic.defer(self.store, task_id, exc)
+                    return
                 except Exception as exc:
                     if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
                         self.store.halt(
@@ -143,7 +159,11 @@ class Scheduler:
                 await workflow.run(task_id)
             finally:
                 self.workflows.remove(workflow)
-            if workflow.lease is None or not workflow.lease.acquired:
+            if (
+                workflow.lease is None
+                or not workflow.lease.acquired
+                or time.time() < self.github.traffic.cooldown
+            ):
                 return
             self.failed(task_id)
             if self.store.task(task_id)["state"] in {

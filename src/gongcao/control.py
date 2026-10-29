@@ -14,7 +14,7 @@ from typing import Any
 
 from .config import Config
 from .events import Redactor
-from .github import GitHub, background
+from .github import Deferred, GitHub, background
 from .model import VERSION_FIELDS, Stage, State
 from .store import Store
 
@@ -570,6 +570,8 @@ class Controls:
         failures = {}
         try:
             comments = list(await github.instructions(task))  # Requires complete pagination.
+        except Deferred:
+            raise
         except Exception as exc:
             comments = []
             failures = dict.fromkeys(watched, Redactor().text(str(exc)))
@@ -583,6 +585,8 @@ class Controls:
                     if "github:" + str(comment["id"]) != key:
                         raise ValueError("Comment ID did not match the direct read")
                     comments.append(comment)
+                except Deferred:
+                    raise
                 except Exception as exc:
                     failures[key] = Redactor().text(str(exc))
         operators = {name.casefold() for name in config.copilot_operators}
@@ -810,6 +814,8 @@ class Controls:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))
                 self.store.halt(task_id, State.RECONCILE, Redactor().text(str(exc)))
+            except Deferred:
+                raise
             except (OSError, RuntimeError) as exc:
                 failures = (
                     retry["failures"] + 1 if retry and retry["fingerprint"] == row["id"] else 1
