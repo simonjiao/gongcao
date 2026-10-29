@@ -50,6 +50,8 @@ class Traffic:
     failures: int = 0
     generation: int = 0
     cooldown_path: Path | None = None
+    reported_at: float = 0
+    reported_cooldown: float = 0
     recent: deque[float] = field(default_factory=deque)
     counts: Counter[str] = field(default_factory=Counter)
     snapshots: dict[tuple[str, int | None], tuple[float, dict[str, Any]]] = field(
@@ -231,7 +233,11 @@ class GitHub:
         from .events import LOG
 
         usage = self.traffic
-        if usage.counts:
+        if (
+            any(usage.counts[key] for key in ("background", "checks", "writes"))
+            or usage.cooldown != usage.reported_cooldown
+            or (usage.counts and time.monotonic() - usage.reported_at >= 300)
+        ):
             LOG.info(
                 "GitHub 周期请求：%s；后台预算=%s/小时；剩余=%s；下次后台请求/冷却=%.0f",
                 dict(usage.counts),
@@ -240,6 +246,8 @@ class GitHub:
                 usage.due(),
             )
             usage.counts.clear()
+            usage.reported_at = time.monotonic()
+            usage.reported_cooldown = usage.cooldown
 
     @cached_property
     def traffic(self) -> Traffic:

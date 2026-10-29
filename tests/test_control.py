@@ -60,7 +60,9 @@ class Comments(GitHub):
         raise RuntimeError("HTTP 404: Not Found (deletion or visibility unknown)")
 
 
-async def test_background_poll_budget_and_fresh_instruction_wakeup(store, task_id, comments):
+async def test_background_poll_budget_and_fresh_instruction_wakeup(
+    store, task_id, comments, repo, sha, snapshot, monkeypatch
+):
     config = Config(copilot_operators=["owner"])
     controls = Controls(store)
     controls.issue(task_id, "pause")
@@ -76,6 +78,48 @@ async def test_background_poll_budget_and_fresh_instruction_wakeup(store, task_i
     store.cancel(task_id)
     await controls.collect(task_id, config, comments, force=False)
     assert comments.reads == 2
+    clock = [2_000_000_000.0]
+    monkeypatch.setattr(
+        "gongcao.control.time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    )
+    monkeypatch.setattr("gongcao.github.time.time", lambda: clock[0])
+    ids = [store.register(snapshot["url"] + str(i), repo, sha, snapshot) for i in range(25)]
+    for _ in range(30):  # More Issues than one minute of globally staggered admissions.
+        for task in controls.polling_tasks():
+            await controls.collect(task["id"], config, comments, force=False)
+        clock[0] += 5
+    assert all(store.instruction_polls.get(i, 0) > 0 for i in ids)
+
+
+async def test_quality_completion_then_rate_limit_resumes_without_repeating_checks(
+    reviewing, store, task_id, fixture_github, copilot, monkeypatch
+):
+    original, limited = Controls.poll, []
+
+    async def poll(self, number, config, github, **kwargs):
+        plan = store.artifact(number, "quality-plan", config.policy_hash)
+        checks = plan and store.artifact(number, "quality-results", plan["plan_hash"])
+        task = store.task(number)
+        if checks and task["stage"] == Stage.REVIEW and task["revision_count"] and not limited:
+            limited.append(checks["run_id"])
+            github.traffic.cooldown = 2_000_000_000
+            raise Deferred("GitHub rate limit after quality completion")
+        return await original(self, number, config, github, **kwargs)
+
+    monkeypatch.setattr(Controls, "poll", poll)
+    scheduler = Scheduler(store, copilot, fixture_github)
+    await reviewing.run(task_id)
+    assert limited and store.task(task_id)["state"] == State.QUEUED
+    writes = len(fixture_github.writes)
+    await scheduler.advance(task_id, immediate=False)
+    assert len(fixture_github.writes) == writes
+    monkeypatch.setattr("gongcao.github.time.time", lambda: 2_000_000_001.0)
+    await scheduler.advance(task_id, immediate=False)
+    task = store.task(task_id)
+    plan = store.artifact(task_id, "quality-plan", copilot.policy_hash)
+    assert task["state"] == State.COMPLETED
+    assert store.artifact(task_id, "quality-results", plan["plan_hash"])["run_id"] == limited[0]
+    assert len(fixture_github.writes) == writes + 1  # Only the new review, no repeated publish.
 
 
 @pytest.mark.parametrize("written", [False, True])

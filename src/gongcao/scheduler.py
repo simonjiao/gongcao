@@ -229,7 +229,7 @@ class Scheduler:
                     if task_run.done():
                         task_run.result()
                         del pending[task_id]
-                for task in self.store.tasks():
+                for task in Controls(self.store).polling_tasks():
                     progress(self.store, task["id"])
                     if task["id"] not in pending:
                         pending[task["id"]] = asyncio.create_task(

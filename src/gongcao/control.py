@@ -524,6 +524,11 @@ class Controls:
             and time.time() >= github.traffic.due()
         )
 
+    def polling_tasks(self) -> list[dict[str, Any]]:
+        return sorted(
+            self.store.tasks(), key=lambda task: self.store.instruction_polls.get(task["id"], 0)
+        )
+
     async def collect(
         self, task_id: int, config: Config, github: GitHub, *, force: bool = True
     ) -> None:
@@ -853,7 +858,9 @@ class Controls:
     ) -> AsyncIterator[None]:
         async def receive() -> None:
             while True:
-                selected = [self.store.task(task_id)] if task_id is not None else self.store.tasks()
+                selected = (
+                    [self.store.task(task_id)] if task_id is not None else self.polling_tasks()
+                )
                 for task in selected:
                     try:
                         await self.collect(task["id"], config, github, force=False)

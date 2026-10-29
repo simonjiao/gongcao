@@ -48,7 +48,7 @@ def test_config_does_not_allow_granting_write_permissions(tmp_path):
     assert not Role.REVIEWER.writable
 
 
-async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
+async def test_github_adapter_calls_get_only_and_redacts(monkeypatch, caplog):
     calls = []
 
     async def read(*args):
@@ -92,6 +92,23 @@ async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
         background.reset(token)
     await asyncio.gather(api.read("user"), api.read("user"))
     assert len(calls) == 3  # Separate foreground checkpoints never share an older response.
+    caplog.set_level("INFO", logger="gongcao")
+    api.report()
+    caplog.clear()
+    clock = [1000.0]
+    monkeypatch.setattr("gongcao.github.time.monotonic", lambda: clock[0])
+    api.traffic.reported_at = clock[0]
+    for _ in range(12):
+        api.traffic.counts["saved"] += 1
+        api.report()
+        clock[0] += 5
+    assert not caplog.records
+    clock[0] += 300
+    api.report()
+    assert len(caplog.records) == 1 and "saved" in caplog.text
+    api.traffic.start(False)
+    api.report()
+    assert len(caplog.records) == 2  # Actual requests are reported immediately.
     release = asyncio.Event()
 
     async def snapshot(target):
