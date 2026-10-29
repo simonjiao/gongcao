@@ -352,7 +352,7 @@ class Controlled:
                 raise ValueError("Cross-repository PR pushes require manual handling")
             base_ref = snapshot["base_ref"]
         else:
-            metadata = await self.github.repository(snapshot["repository"])
+            metadata = await self.github.read(f"repos/{snapshot['repository']}")
             base_ref = metadata["default_branch"]
             base = await self.github.read(
                 f"repos/{snapshot['repository']}/git/ref/heads/{base_ref}"

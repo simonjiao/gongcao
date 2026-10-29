@@ -203,10 +203,6 @@ class GitHub:
     def pending(self) -> dict[tuple[int, str], asyncio.Task[str]]:
         return {}
 
-    @cached_property
-    def metadata(self) -> dict[str, tuple[float, dict[str, Any]]]:
-        return {}
-
     async def api(self, path: str) -> str:
         key = (self.traffic.generation, path)
 
@@ -230,12 +226,6 @@ class GitHub:
         finally:
             if self.pending.get(key) is task:
                 self.pending.pop(key, None)
-
-    async def repository(self, repo: str, *, fresh: bool = False) -> dict[str, Any]:
-        cached = self.metadata.get(repo)
-        if fresh or cached is None or time.monotonic() >= cached[0]:
-            self.metadata[repo] = (time.monotonic() + 60, await self.read(f"repos/{repo}"))
-        return self.metadata[repo][1]
 
     async def read(self, path: str) -> Any:
         return json.loads(response(await self.api(path))[1])

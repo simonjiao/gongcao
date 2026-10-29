@@ -25,7 +25,7 @@ class Recovery:
     async def default_base(self, task: dict[str, Any]) -> str:
         self.repo, _ = await repository(Path(task["repo_path"]), Target.parse(task["url"]))
         repo = task["snapshot"]["repository"]
-        metadata = await self.github.repository(repo, fresh=True)
+        metadata = await self.github.read(f"repos/{repo}")
         ref = await self.github.read(f"repos/{repo}/git/ref/heads/{metadata['default_branch']}")
         sha: str = ref["object"]["sha"]
         try:
