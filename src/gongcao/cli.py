@@ -91,6 +91,7 @@ async def logs(
 
 async def execute(args: argparse.Namespace, store: Store) -> int:
     github = GitHub()
+    github.traffic.restore(store)
     if args.command == "register":
         target = Target.parse(args.url)
         repo, sha = await repository(args.repo, target)

@@ -111,25 +111,32 @@ class Controlled:
     ) -> dict[str, Any]:
         task = await self.before(task, kind, verified=verified)
         key = self.identity(task, kind, object_id)
-        found = await observe()
         created = self.store.intent(task, key, kind, json.dumps(payload, sort_keys=True))
-        if found is not None:
-            self.store.operation_result(key, "succeeded", found)
-            return found
-        if not created:
-            raise UncertainWrite("Existing write intent is not confirmed remotely; refusing replay")
+        writing = False
         try:
+            found = await observe()
+            if found is not None:
+                self.store.operation_result(key, "succeeded", found)
+                return found
+            if not created:
+                raise UncertainWrite(
+                    "Existing write intent is not confirmed remotely; refusing replay"
+                )
             await self.before(task, kind, finish_operation=True)
+            writing = True
             await write()
         except Deferred:
             # This newly created intent has no accepted write. Older ambiguous
             # intents never reach here: they must reconcile above, without replay.
-            with self.store.db:
-                self.store.db.execute(
-                    "DELETE FROM operations WHERE id=? AND state='pending'", (key,)
-                )
+            if created:
+                with self.store.db:
+                    self.store.db.execute(
+                        "DELETE FROM operations WHERE id=? AND state='pending'", (key,)
+                    )
             raise
         except BaseException as exc:
+            if not writing:
+                raise
             self.store.operation_result(
                 key, "unknown", {"error": Redactor().text(f"{type(exc).__name__}: {exc}")}
             )

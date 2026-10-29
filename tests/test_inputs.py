@@ -199,6 +199,10 @@ async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, header
         assert api.traffic.counts["writes"] == 0
         now[0] = api.traffic.cooldown + 1
         api.traffic.start(False)  # Recovery admits a fresh request, without busy waiting.
+        api.traffic.cooldown = now[0] + 10000
+        with pytest.raises(Deferred):
+            api.traffic.observe(f"HTTP/2.0 {status} Error\nRetry-After: 1\n\n{{}}", True)
+        assert api.traffic.cooldown == now[0] + 10000
 
 
 async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):

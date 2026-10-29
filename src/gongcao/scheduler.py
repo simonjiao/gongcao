@@ -75,18 +75,27 @@ class Scheduler:
         )
 
     async def advance(self, task_id: int, *, immediate: bool = True) -> None:
+        try:
+            await self._advance(task_id, immediate=immediate)
+        except Deferred as exc:
+            self.github.traffic.defer(self.store, task_id, exc)
+
+    async def _advance(self, task_id: int, *, immediate: bool) -> None:
         if time.time() < self.github.traffic.cooldown:
             return
         task = self.store.task(task_id)
         cooldown = self.store.artifact(task_id, "github-cooldown", "")
         if cooldown and cooldown.get("recovery"):
-            if not (await Recovery(self.store, self.github).recover(task_id))["recovered"]:
+            result = await Recovery(self.store, self.github).recover(task_id)
+            if time.time() < self.github.traffic.cooldown:
                 return
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE artifacts SET valid=0 WHERE task_id=? AND kind='github-cooldown'",
                     (task_id,),
                 )
+            if not result["recovered"]:
+                return
             task = self.store.task(task_id)
         wake = bool(
             self.store.db.execute(

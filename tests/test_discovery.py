@@ -13,7 +13,7 @@ import pytest
 from gongcao.config import Config, DiscoveryConfig, Source
 from gongcao.control import Controls, InstructionChanged
 from gongcao.discovery import Discovery
-from gongcao.github import GitHub, command
+from gongcao.github import Deferred, GitHub, command
 from gongcao.leases import Lease
 from gongcao.model import Stage, State
 from gongcao.recovery import Recovery
@@ -89,6 +89,8 @@ def intake(store, repo, sha, snapshot):
 
         async def mutate(self, path, payload, *, method="POST"):
             self.writes.append(method)
+            if self.failure == "limited":
+                raise Deferred("HTTP 429: rejected")
             if self.failure == "absent":
                 raise ConnectionError("POST result unknown")
             if method == "POST":
@@ -154,7 +156,7 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
         reopened.close()
 
 
-@pytest.mark.parametrize("failure", ["lost", "absent", "interrupted"])
+@pytest.mark.parametrize("failure", ["lost", "absent", "interrupted", "limited"])
 async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, store, failure):
     intake.github.failure = failure
     if failure == "interrupted":
@@ -164,10 +166,10 @@ async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, s
         await intake.scan()
     assert bool(store.tasks()) == (failure == "lost")
     intake.github.failure = ""
-    restarted = Discovery(store, Config(), intake.github)
+    restarted = Discovery(store, intake.config if failure == "limited" else Config(), intake.github)
     async with restarted.active(once=True):
         assert bool(store.tasks()) == (failure != "absent")
-    assert intake.github.writes.count("POST") == 1
+    assert intake.github.writes.count("POST") == 1 + (failure == "limited")
     assert not store.db.execute("SELECT 1 FROM runs").fetchone()
     if failure == "absent":
         assert "refusing replay" in restarted.records()[0]["reason"]
@@ -201,21 +203,28 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
     assert "waiting_instruction" in intake.github.comments[0]["body"]
 
 
+@pytest.mark.parametrize("failure", ["absent", "limited"])
 async def test_progress_failure_is_durable_without_stopping_work_and_preserves_owner(
-    intake, store, monkeypatch
+    intake, store, monkeypatch, failure
 ):
     await intake.scan()
     task = store.tasks()[0]
-    intake.github.failure = "absent"
+    intake.github.failure = failure
     Controls(store).issue(task["id"], "pause")
     await intake.cycle(discover=False)
     row = intake.records()[0]
-    assert row["dirty"] and row["intent"] and row["reason"]
+    assert row["dirty"] and bool(row["intent"]) == (failure == "absent") and row["reason"]
     assert store.task(task["id"])["state"] == State.WAITING_INSTRUCTION
     writes = len(intake.github.writes)
     intake.github.failure = ""
     restarted = Discovery(store, Config(), intake.github)
+    if failure == "limited":
+        monkeypatch.setattr("gongcao.discovery.time.time", lambda: 2000000000.0)
     await restarted.cycle(discover=False)
+    if failure == "limited":
+        assert len(intake.github.writes) == writes + 1
+        assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
+        return
     assert len(intake.github.writes) == writes  # Unobserved PATCH is never blindly replayed.
     intake.github.comments[0]["body"] = row["intent"]
     restarted.retry.clear()

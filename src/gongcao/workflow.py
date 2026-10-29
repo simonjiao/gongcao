@@ -322,6 +322,9 @@ class Workflow:
                         await Controls(self.store).poll(task_id, self.config, self.github)
                     return await self.execute(task_id)
             return await self.execute(task_id)
+        except Deferred as exc:
+            self.github.traffic.defer(self.store, task_id, exc)
+            return []
         finally:
             from .discovery import Discovery
 

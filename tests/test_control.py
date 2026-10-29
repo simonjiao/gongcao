@@ -78,8 +78,9 @@ async def test_background_poll_budget_and_fresh_instruction_wakeup(store, task_i
     assert comments.reads == 2
 
 
+@pytest.mark.parametrize("written", [False, True])
 async def test_rate_limit_preserves_stage_and_resumes_after_restart(
-    store, task_id, fixture_github, policy, monkeypatch
+    store, task_id, fixture_github, policy, monkeypatch, written
 ):
     import time
 
@@ -89,11 +90,18 @@ async def test_rate_limit_preserves_stage_and_resumes_after_restart(
     async def step(self, task, **kwargs):
         calls.append(task["stage"])
         if len(calls) == 1:
+            if written:
+                store.intent(task, "limited", "review", "{}")
             self.github.traffic.cooldown = until
             raise Deferred("GitHub rate limit")
         store.halt(task_id, State.COMPLETED, "resumed")
 
     monkeypatch.setattr(Workflow, "step", step)
+
+    async def observe(self, task, op):
+        return {"confirmed": True}
+
+    monkeypatch.setattr("gongcao.recovery.Recovery.observe", observe)
     await Workflow(store, policy, fixture_github).run(task_id)
     assert store.task(task_id)["stage"] == stage and store.task(task_id)["state"] == State.QUEUED
     fixture_github.traffic.cooldown = 0
@@ -104,6 +112,7 @@ async def test_rate_limit_preserves_stage_and_resumes_after_restart(
     await scheduler.advance(task_id)
     assert calls == [stage, stage] and store.task(task_id)["state"] == State.COMPLETED
     assert store.db.execute("SELECT COUNT(*) FROM retries").fetchone()[0] == 0
+    assert all(op["state"] == "succeeded" for op in store.evidence(task_id)["operations"])
 
 
 @pytest.fixture

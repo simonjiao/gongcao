@@ -61,6 +61,11 @@ class Traffic:
 
     def defer(self, store: Store, task_id: int, exc: Deferred, *, recovery: bool = False) -> None:
         task = store.task(task_id)
+        recovery = recovery or bool(
+            store.db.execute(
+                "SELECT 1 FROM operations WHERE task_id=? AND state!='succeeded'", (task_id,)
+            ).fetchone()
+        )
         with store.db:
             store.db.execute(
                 "INSERT INTO artifacts(task_id,sha,kind,policy,data) "
@@ -122,6 +127,7 @@ class Traffic:
                 else parsedate_to_datetime(retry).timestamp()
             )
             self.cooldown = max(
+                self.cooldown,
                 deadline,
                 float(headers["x-ratelimit-reset"])
                 if headers.get("x-ratelimit-remaining") == "0" and "x-ratelimit-reset" in headers

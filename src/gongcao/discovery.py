@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from .config import Config, Source
 from .control import baseline
 from .events import Redactor, task_event
-from .github import GitHub, Target, background
+from .github import Deferred, GitHub, Target, background
 from .model import Stage, State
 from .processes import CleanupError
 from .recovery import Recovery
@@ -420,6 +420,8 @@ class Discovery:
                     and item["body"] == row["confirmed"]
                 ):
                     return item
+            except Deferred:
+                raise
             except Exception:
                 pass  # An anomalous direct read requires full uniqueness/ownership reconciliation.
             self.store.owned_comments.pop(row["url"], None)
@@ -484,6 +486,10 @@ class Discovery:
                 )
                 self.save(row["url"], comment_id=response["id"])
                 row["comment_id"] = response["id"]
+            except Deferred:
+                data["attempted"] = False
+                self.save(row["url"], data=json.dumps(data), intent="")
+                raise
             except Exception:
                 item = await self.owned(row)
                 if item is None:
@@ -703,6 +709,9 @@ class Discovery:
                     {"body": body},
                     method="PATCH",
                 )
+            except Deferred:
+                self.save(row["url"], intent="")
+                raise
             except Exception:
                 observed = await self.owned(row)
                 if observed is None or observed["body"] != body:
