@@ -19,6 +19,8 @@ class Store:
         self.db = sqlite3.connect(self.root / "gongcao.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.owners: dict[int, str] = {}
+        self.reported: dict[int, tuple[str, str, int | None]] = {}
+        self.last_activity = time.monotonic()
         try:
             with (self.root / "schema.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)

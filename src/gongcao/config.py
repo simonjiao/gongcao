@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,12 +71,27 @@ class Source:
     mode: str = "step"
 
 
+def repository_path(value: Any) -> Path:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("Repository path must be an absolute path")
+    path = Path(value).expanduser()
+    if (
+        not path.is_absolute()
+        or "//" in value
+        or any(part in {"", ".", ".."} for part in value.rstrip("/").split("/")[1:])
+        or any(part.is_symlink() for part in (path, *path.parents))
+    ):
+        raise ValueError("Repository path must be absolute without traversal or symlinks")
+    return path
+
+
 @dataclass(frozen=True)
 class DiscoveryConfig:
     enabled: bool = False
     interval_seconds: int = 60
     max_new_per_scan: int = 10
     sources: tuple[Source, ...] = ()
+    repo_root: Path | None = None
 
     @classmethod
     def load(cls, raw: Any) -> "DiscoveryConfig":
@@ -84,6 +100,7 @@ class DiscoveryConfig:
             "interval_seconds",
             "max_new_per_scan",
             "sources",
+            "repo_root",
         }:
             raise ValueError("Invalid discovery configuration")
         enabled, interval, maximum = (
@@ -103,16 +120,21 @@ class DiscoveryConfig:
         if not isinstance(sources, list):
             raise ValueError("discovery.sources must be a list")
         parsed: list[Source] = []
+        root = repository_path(raw["repo_root"]) if "repo_root" in raw else None
         for item in sources:
             if (
                 not isinstance(item, dict)
                 or item.keys() - {"repo", "path", "label", "mode"}
-                or not all(isinstance(item.get(key), str) for key in ("repo", "path"))
+                or not isinstance(item.get("repo"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", item["repo"])
+                or item["repo"].split("/")[-1] in {".", ".."}
             ):
-                raise ValueError("Each discovery source requires repo and absolute path")
+                raise ValueError("Each discovery source requires a valid owner/repo")
             target = Target.parse(f"https://github.com/{item['repo']}/issues/1")
+            if "path" not in item and root is None:
+                raise ValueError("Each discovery source requires path or discovery.repo_root")
             path, label, mode = (
-                Path(item["path"]).expanduser(),
+                repository_path(item.get("path", str(root / target.repository) if root else "")),
                 item.get("label", "agent-ready"),
                 item.get("mode", "step"),
             )
@@ -125,15 +147,18 @@ class DiscoveryConfig:
             ):
                 raise ValueError("Invalid discovery source path, label or mode")
             if any(
-                source.repo == target.repository
-                and (source.label == label or source.path.resolve() != path.resolve())
+                (
+                    source.repo == target.repository
+                    and (source.label == label or source.path != path)
+                )
+                or (source.repo != target.repository and source.path == path)
                 for source in parsed
             ):
                 raise ValueError("Duplicate discovery source or conflicting repository paths")
             parsed.append(Source(target.repository, path, label, mode))
         if enabled and not parsed:
             raise ValueError("Enabled discovery requires sources")
-        return cls(enabled, interval, maximum, tuple(parsed))
+        return cls(enabled, interval, maximum, tuple(parsed), root)
 
 
 @dataclass(frozen=True)

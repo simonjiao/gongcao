@@ -4,11 +4,12 @@ import asyncio
 import hashlib
 import math
 import time
+from pathlib import Path
 
 from .config import Config
 from .control import Controls
 from .discovery import Discovery
-from .events import Redactor
+from .events import LOG, Redactor, progress, task_event
 from .github import GitHub
 from .model import Stage, State
 from .recovery import Recovery
@@ -23,6 +24,8 @@ class Scheduler:
         self.store, self.config, self.github = store, config, github
         self.semaphore = asyncio.Semaphore(concurrency)
         self.workflows: list[Workflow] = []
+        self.concurrency = concurrency
+        self.config_path: Path | None = None
 
     def failed(self, task_id: int) -> None:
         task = self.store.task(task_id)
@@ -61,6 +64,13 @@ class Scheduler:
                         task["updated"],
                     ),
                 )
+        task_event(
+            self.store,
+            task_id,
+            "异常重试已暂停，等待人工处理"
+            if failures >= 3
+            else f"异常待重试：第 {failures} 次，已记录退避",
+        )
 
     async def advance(self, task_id: int) -> None:
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
@@ -129,8 +139,26 @@ class Scheduler:
                     "SELECT 1 FROM leases WHERE task_id=?", (task["id"],)
                 ).fetchone()
             ):
-                await recovery.recover(task["id"])
-        async with Discovery(self.store, self.config, self.github).active(once=once):
+                try:
+                    result = await recovery.recover(task["id"])
+                except (OSError, RuntimeError, ValueError) as exc:
+                    # Lease acquisition can fail before Recovery's internal catch. Preserve
+                    # existing leases/intents; never substitute a newly configured path.
+                    self.store.halt(
+                        task["id"],
+                        State.RECONCILE,
+                        Redactor().text(f"Recovery pending: {type(exc).__name__}: {exc}"),
+                    )
+                    result = {"recovered": False}
+                task_event(
+                    self.store,
+                    task["id"],
+                    "恢复完成" if result["recovered"] else "恢复待核对，保留原任务路径及现场",
+                )
+                progress(self.store, task["id"])
+        discovery = Discovery(self.store, self.config, self.github)
+        async with discovery.active(once=once):
+            discovery.overview(once=once, config_path=self.config_path, jobs=self.concurrency)
             await self.schedule(once=once, poll=poll)
 
     async def schedule(self, *, once: bool, poll: float) -> None:
@@ -143,12 +171,18 @@ class Scheduler:
                         task_run.result()
                         del pending[task_id]
                 for task in self.store.tasks():
+                    progress(self.store, task["id"])
                     if task["id"] not in pending:
                         pending[task["id"]] = asyncio.create_task(self.advance(task["id"]))
                 if once:
                     group = asyncio.gather(*pending.values())
                     await asyncio.shield(group)
                     return
+                if not self.workflows and time.monotonic() - self.store.last_activity >= 300:
+                    LOG.info(
+                        "空闲心跳：已登记任务 %s，等待任务或 GitHub 指令", len(self.store.tasks())
+                    )
+                    self.store.last_activity = time.monotonic()
                 await asyncio.sleep(poll)
         except BaseException:
             for workflow in self.workflows:

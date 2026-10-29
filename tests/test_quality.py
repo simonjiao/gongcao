@@ -239,12 +239,14 @@ print(json.dumps({'kind':'result','data':{
     "entry,status",
     [(["sh", "-c", "exit 1"], "failed"), (["missing-executable-79"], "blocked"), ([], "blocked")],
 )
-async def test_failure_and_missing_environment_are_distinct(store, task_id, entry, status):
+async def test_failure_and_missing_environment_are_distinct(store, task_id, entry, status, caplog):
+    caplog.set_level("INFO", logger="gongcao")
     quality = Quality(store, Config())
     quality.confirm(store.task(task_id), items(entry))
     result = await quality.run(store.task(task_id), include_e2e=True)
     assert verdict(result) == status
     assert result["items"][1]["status"] == status
+    assert ("失败 1" if status == "failed" else "未执行/缺环境 1") in caplog.text
 
 
 async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store, task_id, repo):

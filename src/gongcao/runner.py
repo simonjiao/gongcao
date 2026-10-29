@@ -67,7 +67,9 @@ class Runner:
             run_dir.mkdir(parents=True, mode=0o700)
             journal = Journal(self.store, run_id, self.config.max_log_bytes, Redactor())
             journal.emit(
-                "started", {"task_id": task_id, "role": role, "target_sha": task["target_sha"]}
+                "started",
+                {"task_id": task_id, "role": role, "target_sha": task["target_sha"]},
+                controller=True,
             )
             if task["snapshot"]["state"] != "open":
                 outcome = (
@@ -228,6 +230,7 @@ class Runner:
                             "duration_seconds": round(time.monotonic() - started, 3),
                             "state": self.store.runs(task_id)[-1]["state"],
                         },
+                        controller=True,
                     )
                 except (OSError, sqlite3.Error):
                     pass

@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import Config
 from .control import Controls, InstructionChanged, Paused, baseline
-from .events import Redactor
+from .events import Redactor, progress
 from .github import GitHub
 from .leases import Lease
 from .model import Role, Stage, State, same_version
@@ -315,6 +315,7 @@ class Workflow:
             from .discovery import Discovery
 
             await Discovery(self.store, self.config, self.github).handoff(task_id)
+            progress(self.store, task_id)
 
     async def execute(self, task_id: int) -> list[str]:
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
@@ -374,6 +375,7 @@ class Workflow:
                     await self.step(task)
                     await controls.poll(task_id, self.config, self.github)
                     controls.checkpoint(task_id)
+                    progress(self.store, task_id)
                     if self.store.task(task_id)["state"] != State.QUEUED:
                         break
                 else:

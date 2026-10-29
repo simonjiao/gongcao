@@ -1,11 +1,15 @@
 """Git operations are owned by the controller, never by agent credentials."""
 
+import ctypes
 import hashlib
 import json
+import os
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import Config, Source, repository_path
 from .github import Target, command
 from .model import Role
 
@@ -23,6 +27,82 @@ async def repository(path: Path, target: Target) -> tuple[Path, str]:
         raise ValueError("The local origin does not match the registered GitHub repository")
     sha = (await command("git", "rev-parse", "HEAD^{commit}", cwd=str(root))).strip()
     return root.resolve(), sha
+
+
+async def prepare_repository(source: Source) -> str:
+    """Under the discovery repository lock, publish only our own verified clone."""
+    path = repository_path(str(source.path))
+    target = Target(source.repo, "issues", 1)
+    if path.exists():
+        root, _ = await repository(path, target)
+        if root != path:
+            raise ValueError("Configured path is not the repository root")
+        return "已复用"
+    # Open each ancestor without following links, also when another process creates it.
+    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    temporary = ".gongcao-clone-" + uuid.uuid4().hex
+    owned = False
+    identity = None
+    try:
+        for component in path.parent.parts[1:]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        os.mkdir(temporary, mode=0o700, dir_fd=parent)
+        owned = True
+        identity = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+        # A pinned directory descriptor keeps clone/cleanup away from replaced ancestors.
+        pinned = Path(f"/proc/{os.getpid()}/fd/{parent}")
+        clone = pinned / temporary
+        await command(
+            "git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "clone",
+            "--",
+            f"https://github.com/{source.repo}.git",
+            str(clone),
+        )
+        await repository(clone, target)
+        repository_path(str(path))
+        if not os.path.samestat(os.stat(path.parent), os.fstat(parent)):
+            raise ValueError("Repository parent changed during clone")
+        # Linux renameat2 refuses even an empty directory installed by a competitor.
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        if rename(parent, temporary.encode(), parent, path.name.encode(), 1):
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), str(path))
+        owned = False
+        repository_path(str(path))
+        root, _ = await repository(path, target)
+        if root != path:
+            raise ValueError("Published repository path changed")
+        return "已克隆"
+    finally:
+        try:
+            if owned and identity is not None:
+                try:
+                    present = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    present = None
+                if present is not None and os.path.samestat(identity, present):
+                    shutil.rmtree(temporary, dir_fd=parent)
+        finally:
+            os.close(parent)
 
 
 async def worktree(repo: Path, path: Path, sha: str, role: Role, run_id: str) -> None:

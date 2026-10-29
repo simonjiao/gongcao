@@ -376,6 +376,18 @@ class Quality:
         }
         data["passed"] = verdict(data, include_e2e=include_e2e) == "passed"
         self.store.record(task, "quality-results", plan["plan_hash"], data)
+        from .events import task_event
+
+        counts = {
+            status: sum(r["status"] == status for r in results)
+            for status in ("passed", "failed", "blocked")
+        }
+        task_event(
+            self.store,
+            task["id"],
+            f"质量结果：通过 {counts['passed']}；失败 {counts['failed']}；"
+            f"未执行/缺环境 {counts['blocked']}",
+        )
         return data
 
 
