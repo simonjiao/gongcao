@@ -152,13 +152,14 @@ async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
     ):
         api = GitHub()
         api.traffic.reset = 2000.0
+        if until == 9000:
+            api.traffic.restore(store)
         raw = f"HTTP/2.0 {error[-3:]} Error\n{headers}\n{{}}" if headers else ""
         process.communicate.return_value = (raw.encode(), error.encode())
         with pytest.raises(Deferred if until else PermissionError):
             await api.read("user")
         assert api.traffic.cooldown == until and api.traffic.counts["checks"] == 1
     usage = api.traffic
-    usage.restore(store)
     restored = Traffic()
     restored.restore(store)
     assert restored.cooldown == usage.cooldown
