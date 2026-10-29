@@ -14,6 +14,7 @@ from typing import Any, TextIO
 from urllib.parse import urlencode
 
 from .config import Config, Source
+from .control import baseline
 from .events import Redactor
 from .github import GitHub, Target
 from .model import Stage, State
@@ -65,9 +66,26 @@ class Discovery:
         self.retry[key] = failures, time.monotonic() + min(300, 5 * 2 ** min(failures, 6))
         message = Redactor().text(f"{type(exc).__name__}: {exc}")
         LOG.warning("Discovery/status %s: %s", key, message)
-        self.save(key, reason=message)
+        self.save(key, dirty=1, reason=message)
+        row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
+        if row and row["task_id"]:
+            data = json.loads(row["data"])
+            digest = hashlib.sha256(self.render(dict(row)).encode()).hexdigest()
+            previous = data.get("status_retry", {})
+            failures = previous.get("failures", 0) + 1 if previous.get("digest") == digest else 1
+            data["status_retry"] = {
+                "digest": digest,
+                "failures": failures,
+                "next_at": time.time() + min(300, 5 * 2 ** min(failures, 6)),
+            }
+            self.save(key, data=json.dumps(data))
 
     def due(self, key: str) -> bool:
+        row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
+        if row and row["task_id"]:
+            retry = json.loads(row["data"]).get("status_retry", {})
+            if retry.get("digest") == hashlib.sha256(self.render(dict(row)).encode()).hexdigest():
+                return bool(retry["next_at"] <= time.time())
         return self.retry.get(key, (0, 0))[1] <= time.monotonic()
 
     @asynccontextmanager
@@ -362,28 +380,143 @@ class Discovery:
     def render(self, row: dict[str, Any]) -> str:
         task = self.store.task(row["task_id"])
         control = task["control"]
+        runs = self.store.runs(task["id"])
+        retry_available = bool(
+            runs and runs[-1]["details"].get("source", {}).get("baseline") == baseline(task)
+        )
         pull = (
             f"https://github.com/{task['snapshot']['repository']}/pull/{task['pr_number']}"
             if task["pr_number"]
             else "pending"
         )
         action = (
-            "Await trusted instruction / local gongcao control"
+            "Post a new authorized `/gongcao step` or `/gongcao auto` comment on this Issue"
             if task["state"] == State.WAITING_INSTRUCTION
+            else "Supply missing inputs, then post a new authorized `/gongcao retry` comment"
+            if task["state"] in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
+            and task["snapshot"].get("state") == "open"
+            and not task["cancel_requested"]
+            and retry_available
+            else "Reconciliation required; retry cannot bypass unverified provenance or cleanup"
+            if task["state"] in {State.RECONCILE, State.HUMAN}
             else "Await human merge"
             if task["stage"] == Stage.MERGEABLE
-            else task["reason"] or "Controller will advance within the configured policy"
+            else task["reason"][:2000] or "Controller will advance within the configured policy"
         )
         marker: str = json.loads(row["data"])["marker"]
-        return (
+        body = (
             marker + "\n**Gongcao**\n"
             f"Stage: `{task['stage']}` · State: `{task['state']}`\n"
             f"Mode: `{control['mode']}` · Until: `{control.get('target') or '-'}`\n"
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
-            f"\nReason: {task['reason'] or '-'}"
+            f"\nReason: {task['reason'][:2000] or '-'}"
         )
 
+        if runs:
+            run = runs[-1]
+            result = json.loads(run["result"]) if run["result"] else {}
+            body += (
+                f"\nRun: `{run['id']}` · session: `{run['state']}`"
+                f" · report: `{result.get('conclusion', 'unavailable')}`"
+                "\nA session ending does not complete the business stage or acceptance gates."
+            )
+            if result:
+                body += (
+                    "\nAgent report excerpts (full report retained locally): "
+                    + result["summary"][:4000]
+                )
+                body += "\nReported checks/basis: " + "; ".join(result["basis"])[:6000]
+                body += "\nRemaining / missing inputs: " + "; ".join(result["next_steps"])[:6000]
+            save = run["details"].get("save", {})
+            body += "\nRemote checkpoint: " + save.get("state", "not confirmed")
+            saved = next(
+                (
+                    r["details"]["save"]
+                    for r in reversed(runs)
+                    if r["details"].get("save", {}).get("state") == "confirmed"
+                    and r["details"]["save"]["target_sha"] == task["target_sha"]
+                    and r["details"]["save"]["baseline"] == baseline(task)
+                ),
+                None,
+            )
+            if saved:
+                url = f"https://github.com/{task['snapshot']['repository']}"
+                body += (
+                    f"\nSaved WIP: [{saved['branch']}]({url}/tree/{saved['branch']})"
+                    f" · [{saved['sha']}]({url}/commit/{saved['sha']})"
+                    f" · Run: `{saved['run_id']}` (last confirmed for this task version)"
+                    f"\nChanges: {saved['summary'][:4000]}"
+                )
+            if run["details"].get("save_error"):
+                body += "\nSave error: " + run["details"]["save_error"][:2000]
+            execution = run["details"].get("execution")
+            if execution:
+                body += (
+                    f"\nSDK confirmed: `{execution['model']}` / "
+                    f"`{execution['reasoning_effort']}` · source: {execution['source']}"
+                )
+            else:
+                requested = run["details"].get("requested_execution")
+                body += "\nActual model/effort: unconfirmed (historical values are not inferred)"
+                if requested:
+                    body += (
+                        f"; requested: `{requested['model']}` / `{requested['reasoning_effort']}`"
+                    )
+            source = run["details"].get("source")
+            if source:
+                body += (
+                    f"\nHost verified source: `{source['sha']}`; original target: "
+                    f"`{run['target_sha']}`. Sandbox .git is intentionally inaccessible."
+                )
+        quality = [
+            a["data"]
+            for a in self.store.evidence(task["id"])["artifacts"]
+            if a["kind"] == "quality-results" and a["valid"] and a["sha"] == task["target_sha"]
+        ]
+        if quality:
+            body += "\nController checks: " + "; ".join(
+                f"{item.get('category', 'check')}: "
+                + {"passed": "PASS", "failed": "FAIL", "blocked": "NOT_RUN"}.get(
+                    item.get("status"), "NOT_RUN"
+                )
+                for item in quality[-1].get("items", [])
+            )
+        else:
+            body += "\nController acceptance: NOT_RUN (no current-version check evidence)"
+        return Redactor().text(body)
+
+    async def handoff(self, task_id: int) -> None:
+        """Await the sole status publisher even while serve holds the discovery lock."""
+        for row in self.records():
+            if (
+                row["task_id"] == task_id
+                and (row["dirty"] or row["intent"])
+                and self.due(row["url"])
+            ):
+                try:
+                    await self.publish(row)
+                except Exception as exc:
+                    self.warning(row["url"], exc)
+
     async def publish(self, row: dict[str, Any]) -> None:
+        # Foreground handoff and the background ticker must share the same PATCH intent.
+        key = hashlib.sha256(row["url"].encode()).hexdigest()
+        with (self.store.root / f"status-{key}.lock").open("a") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+            current = self.store.db.execute(
+                "SELECT * FROM claims WHERE url=?", (row["url"],)
+            ).fetchone()
+            await self._publish(dict(current))
+            data = json.loads(current["data"])
+            if data.pop("status_retry", None) is not None:
+                self.save(row["url"], data=json.dumps(data))
+
+    async def _publish(self, row: dict[str, Any]) -> None:
         item = await self.owned(row)
         if item is None:
             raise ValueError("Claim comment is missing")

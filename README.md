@@ -42,7 +42,10 @@ Ruff 检查代码和格式，mypy 严格检查静态类型，pytest 执行行为
 
 先用 `gh auth login` 登录 GitHub。SDK 默认读取 `~/.codex/auth.json` 的模型认证，
 也支持 `OPENAI_API_KEY`。首次使用可先运行 `codex login`，或在 YAML 中配置 auth_file。
-Agent 不继承宿主 Codex 配置；可在 YAML 中显式指定可用的 model。
+Agent 不继承宿主 Codex 配置。项目默认 `model: gpt-6.1-sol`、
+`reasoning_effort: xhigh`，两项均可在 YAML 显式覆盖，并显式传给 SDK。
+启动时检查模型目录支持的强度，并核对 SDK 返回的实际模型/强度；不可用或发生路由回退时报错。
+每次 Run 保留配置来源和 SDK 确认值，GitHub 状态显示该次会话的证据；历史缺失值不推断、不追记。
 SDK 和随附 Codex 运行时已固定版本，无须 Node.js。
 
 ```bash
@@ -175,7 +178,10 @@ uv run gongcao control 1 --pause
 
 远端指令默认禁用。配置 `copilot.operators: [GITHUB_LOGIN]` 后，控制器只读取
 原 Issue 的顶层评论：`/gongcao step`、`/gongcao until review`（亦支持其余确定目标）、
-`/gongcao auto`、`/gongcao pause`。信任 API 返回的登录账户，不信任正文自报身份。
+`/gongcao auto`、`/gongcao pause`、`/gongcao retry`。信任 API 返回的登录账户，不信任正文自报身份。
+`retry` 用于同一版本的可恢复阻塞/失败：补齐原计划需要的材料后，新发一条仅含
+`/gongcao retry` 的评论。编辑旧评论不能授权；需求/SHA 改变、未知写入或清理不明须先对账。
+它继续尚未完成的阶段，创建新 SDK 会话，不重放已完成阶段，也不重置修订预算。
 标签使用独立分页读取；后台评论读取不申请 jobs 或 Agent 租约。运行中收到的指令先登记为
 pending，在下一安全点核验并应用；任务暂停时 serve 仍会读取评论并按授权唤醒。
 普通评论和 PR Review 不作控制指令；编辑旧评论不能重新授权，请发新评论。

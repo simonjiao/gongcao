@@ -13,7 +13,7 @@ from .config import Config
 from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import GitHub, Target, command
-from .model import VERSION_FIELDS, Role, Stage
+from .model import VERSION_FIELDS, Role, Stage, State
 from .recovery import Recovery
 from .sandbox import Sandbox
 from .store import Store
@@ -49,9 +49,10 @@ class Controlled:
         ):
             raise UncertainWrite("Remote target changed before a controlled write")
         current = self.store.task(expected["id"])
-        if not finish_operation:
+        if kind != "checkpoint" and not finish_operation:
             current = await self.instruction_checkpoint(expected)
-        self.store.guard(current)
+        guard = self.store.save_guard if kind == "checkpoint" else self.store.guard
+        guard(current)
         if any(run["state"] == "running" for run in self.store.runs(current["id"])):
             raise ValueError("An active agent cannot authorize a remote mutation")
         allowed = {
@@ -59,12 +60,19 @@ class Controlled:
             "archive": set(Stage) - {Stage.MERGED},
             "archive-link": set(Stage) - {Stage.MERGED},
             "push": {Stage.DEVELOPMENT, Stage.REVISION},
+            "checkpoint": {Stage.DEVELOPMENT, Stage.REVISION},
             "pull": {Stage.DEVELOPMENT, Stage.REVISION},
             "review": {Stage.REVIEW},
             "ready": {Stage.VALIDATION, Stage.MERGEABLE},
         }
         if current["stage"] not in allowed[kind] or latest["state"] != "open":
             raise ValueError("This stage does not authorize the requested GitHub mutation")
+        if kind == "checkpoint" and not current["pr_number"]:
+            if (
+                await Recovery(self.store, self.github).default_base(current)
+                != current["target_sha"]
+            ):
+                raise UncertainWrite("Issue baseline changed before saving output")
         repo, _ = await repository(Path(current["repo_path"]), target)
         if current["target_sha"] not in self.verified:
             key = "control-" + uuid.uuid4().hex
@@ -73,11 +81,12 @@ class Controlled:
             sandbox = Sandbox(workspace, self.store.root / "checks" / key, Role.DEVELOPER)
             sandbox.prepare(self.config, authentication=False)
             evidence = await sandbox.verify(repo)
-            self.store.record(current, "write-isolation", "", evidence)
+            if kind != "checkpoint":
+                self.store.record(current, "write-isolation", "", evidence)
             self.verified.add(current["target_sha"])
-        if not finish_operation:
+        if kind != "checkpoint" and not finish_operation:
             current = await self.instruction_checkpoint(expected)
-        return self.store.guard(current)
+        return guard(current)
 
     def identity(self, task: dict[str, Any], kind: str, object_id: str) -> str:
         return hashlib.sha256(
@@ -131,6 +140,175 @@ class Controlled:
         self.store.operation_result(key, "succeeded", found)
         return found
 
+    async def remote_head(self, task: dict[str, Any], branch: str) -> str | None:
+        rows = (
+            await command(
+                "git", "ls-remote", "origin", f"refs/heads/{branch}", cwd=task["repo_path"]
+            )
+        ).split()
+        return rows[0] if rows else None
+
+    async def push(
+        self,
+        task: dict[str, Any],
+        kind: str,
+        branch: str,
+        head: str,
+        expected_parent: str | None,
+        **metadata: Any,
+    ) -> dict[str, Any]:
+        payload = {"sha": head, "branch": branch} | metadata
+
+        async def observed() -> dict[str, Any] | None:
+            remote = await self.remote_head(task, branch)
+            if remote == head:
+                return payload
+            if remote is not None and remote != expected_parent:
+                raise UncertainWrite("Remote branch contains an unexpected commit")
+            return None
+
+        async def write() -> dict[str, Any]:
+            expected = await self.remote_head(task, branch)
+            if expected is not None and expected != expected_parent:
+                raise UncertainWrite("Remote branch moved before push")
+            if expected:
+                ancestor = (
+                    await command("git", "merge-base", expected, head, cwd=task["repo_path"])
+                ).strip()
+                if ancestor != expected:
+                    raise UncertainWrite("Publication must fast-forward the confirmed remote head")
+            guard = self.store.save_guard if kind == "checkpoint" else self.store.guard
+            guard(task)
+            await command(
+                "git",
+                "push",
+                "origin",
+                f"--force-with-lease=refs/heads/{branch}:{expected or ''}",
+                f"{head}:refs/heads/{branch}",
+                cwd=task["repo_path"],
+            )
+            return payload
+
+        return await self.perform(task, kind, branch, payload, observed, write)
+
+    async def commit(self, task: dict[str, Any], run: dict[str, Any]) -> str:
+        workspace = Path(run["worktree"]).resolve()
+        if not workspace.is_relative_to(self.store.root / "worktrees"):
+            raise ValueError("Development output is outside the allocated Worktree root")
+        source = run["details"].get("source", {})
+        parent = source.get("sha", task["target_sha"])
+        head = (await command("git", "rev-parse", "HEAD", cwd=str(workspace))).strip()
+        marker = f"Gongcao-Run: {run['id']}"
+        if head != parent:
+            lines = (
+                await command("git", "show", "-s", "--format=%P%n%B", head, cwd=str(workspace))
+            ).splitlines()
+            if lines[0] != parent or marker not in lines:
+                raise UncertainWrite("Worktree HEAD is not a confirmed controller commit")
+            if (await command("git", "status", "--porcelain", cwd=str(workspace))).strip():
+                raise UncertainWrite("Output changed after the controller commit")
+            return head
+        self.store.save_guard(task)
+        await command(
+            "git", "-c", "core.hooksPath=/dev/null", "add", "--all", "--", ".", cwd=str(workspace)
+        )
+        if not (
+            await command("git", "diff", "--cached", "--name-only", cwd=str(workspace))
+        ).strip():
+            return head
+        self.store.save_guard(task)
+        await command(
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "user.name=Gongcao",
+            "-c",
+            "user.email=gongcao@localhost",
+            "commit",
+            "-m",
+            f"Task output (controller checkpoint)\n\n{marker}\nGongcao-Task: {task['url']}"
+            f"\nGongcao-Base: {task['target_sha']}",
+            cwd=str(workspace),
+        )
+        return (await command("git", "rev-parse", "HEAD", cwd=str(workspace))).strip()
+
+    async def checkpoint(self, task: dict[str, Any], run: dict[str, Any]) -> None:
+        if not run["worktree"]:
+            return
+        task = await self.before(task, "checkpoint")
+        source = run["details"].get("source", {})
+        if source.get("baseline") != baseline(task) or run["target_sha"] != task["target_sha"]:
+            raise UncertainWrite("Run source no longer matches the task; preserving local output")
+        if run["role"] != Role.DEVELOPER or run["state"] in {State.RUNNING, State.RECONCILE}:
+            raise ValueError("Only settled Developer output can be saved")
+        pending = [
+            op
+            for op in self.store.evidence(task["id"])["operations"]
+            if op["state"] != "succeeded" and op["payload"].get("run_id") != run["id"]
+        ]
+        if pending:
+            raise UncertainWrite("Unconfirmed remote writes must be reconciled before saving")
+        head = await self.commit(task, run)
+        if head == source["sha"]:
+            self.store.run_details(run["id"], save={"state": "unchanged"})
+            return
+        slug = hashlib.sha256(task["url"].encode()).hexdigest()[:12]
+        branch = f"gongcao/save-{slug}-{run['id']}"
+        summary = await command("git", "diff", "--stat", source["sha"], head, cwd=task["repo_path"])
+        saved = {
+            "sha": head,
+            "branch": branch,
+            "run_id": run["id"],
+            "parent": source["sha"],
+            "target_sha": task["target_sha"],
+            "baseline": source["baseline"],
+            "summary": summary.strip(),
+        }
+        self.store.run_details(run["id"], save=saved | {"state": "pending"})
+        await self.push(
+            task,
+            "checkpoint",
+            branch,
+            head,
+            None,
+            **{k: v for k, v in saved.items() if k not in {"sha", "branch"}},
+        )
+        self.store.run_details(run["id"], save=saved | {"state": "confirmed"})
+
+    async def source(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Resolve preserved output without changing the task's reviewed target SHA."""
+        source: dict[str, Any] = {"sha": task["target_sha"], "baseline": baseline(task)}
+        for op in self.store.evidence(task["id"])["operations"]:
+            if op["kind"] != "checkpoint" or op["sha"] != task["target_sha"]:
+                continue
+            payload = op["payload"]
+            if payload["baseline"] != baseline(task):
+                raise UncertainWrite(
+                    "Saved output belongs to different requirements; reconcile first"
+                )
+            if op["state"] != "succeeded":
+                raise UncertainWrite("Saved output has not been confirmed remotely")
+            if payload["parent"] != source["sha"]:
+                raise UncertainWrite("Checkpoint history is not a continuous controller chain")
+            if await self.remote_head(task, payload["branch"]) != payload["sha"]:
+                raise UncertainWrite("Saved branch moved or disappeared; reconcile first")
+            lines = (
+                await command(
+                    "git", "show", "-s", "--format=%P%n%B", payload["sha"], cwd=task["repo_path"]
+                )
+            ).splitlines()
+            if lines[0] != source["sha"] or f"Gongcao-Run: {payload['run_id']}" not in lines:
+                raise UncertainWrite("Checkpoint commit provenance does not match its intent")
+            source |= {
+                "sha": payload["sha"],
+                "run_id": payload["run_id"],
+                "branch": payload["branch"],
+            }
+        return source
+
     async def publish(
         self, task: dict[str, Any], run: dict[str, Any]
     ) -> tuple[dict[str, Any], int]:
@@ -147,8 +325,16 @@ class Controlled:
             raise ValueError("Publishing requires a confirmed developer result for this target")
         run = valid[0]
         task = await self.before(task, "push")
+        source = await self.source(task)
+        expected = run["details"].get("source", {}).get("sha", task["target_sha"])
+        saved = run["details"].get("save", {})
+        if source["sha"] != expected and not (
+            saved.get("state") == "confirmed" and saved.get("sha") == source["sha"]
+        ):
+            raise UncertainWrite(
+                "Developer output does not continue the confirmed checkpoint chain"
+            )
         snapshot = task["snapshot"]
-        repo = Path(task["repo_path"])
         workspace = Path(run["worktree"]).resolve()
         if not workspace.is_relative_to(self.store.root / "worktrees"):
             raise ValueError("Development output is outside the allocated Worktree root")
@@ -166,60 +352,10 @@ class Controlled:
             )
             if base["object"]["sha"] != task["target_sha"]:
                 raise UncertainWrite("Issue baseline is no longer the remote default branch")
-        marker = f"Gongcao-Run: {run['id']}"
-        head = (await command("git", "rev-parse", "HEAD", cwd=str(workspace))).strip()
+        head = await self.commit(task, run)
         if head == task["target_sha"]:
-            await command(
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "add",
-                "--all",
-                "--",
-                ".",
-                cwd=str(workspace),
-            )
-            changed = await command("git", "diff", "--cached", "--name-only", cwd=str(workspace))
-            if not changed.strip():
-                raise ValueError("Developer produced no changes; no PR can be published")
-            await command(
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "user.name=Gongcao",
-                "-c",
-                "user.email=gongcao@localhost",
-                "commit",
-                "-m",
-                f"Implement registered task\n\n{marker}",
-                cwd=str(workspace),
-            )
-            head = (await command("git", "rev-parse", "HEAD", cwd=str(workspace))).strip()
-        else:
-            parents = (
-                await command("git", "show", "-s", "--format=%P%n%B", head, cwd=str(workspace))
-            ).splitlines()
-            if parents[0] != task["target_sha"] or marker not in parents:
-                raise UncertainWrite("Worktree HEAD is not a confirmed controller commit")
-
-        async def pushed() -> dict[str, Any] | None:
-            rows = (
-                await command("git", "ls-remote", "origin", f"refs/heads/{branch}", cwd=str(repo))
-            ).split()
-            if rows and rows[0] == head:
-                return {"sha": head, "branch": branch}
-            if rows and rows[0] != task["target_sha"]:
-                raise UncertainWrite("Remote branch contains an unexpected commit")
-            return None
-
-        async def push() -> dict[str, Any]:
-            await command("git", "push", "origin", f"{head}:refs/heads/{branch}", cwd=str(repo))
-            return {"sha": head}
-
-        await self.perform(task, "push", branch, {"sha": head, "branch": branch}, pushed, push)
+            raise ValueError("Developer produced no changes; no PR can be published")
+        await self.push(task, "push", branch, head, task["target_sha"])
         if task["pr_number"]:
             updated = await self.github.task_snapshot(task)
             if updated["head_sha"] != head or any(
@@ -261,7 +397,7 @@ class Controlled:
             return {"number": pulls[0]["number"]}
 
         async def create() -> dict[str, Any]:
-            if await pushed() is None:
+            if await self.remote_head(task, branch) != head:
                 raise UncertainWrite("Remote branch moved before PR creation")
             return await self.github.mutate(f"repos/{repository_name}/pulls", payload)
 

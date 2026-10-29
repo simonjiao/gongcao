@@ -1,4 +1,6 @@
-# 不指定 model 时使用 SDK 默认模型；不会继承宿主机的 Codex 配置。
+# 项目默认值显式传给 SDK；不会继承宿主 Codex 配置或静默降级。
+model: gpt-6.1-sol
+reasoning_effort: xhigh
 timeout_seconds: 900
 max_log_bytes: 2000000
 max_revisions: 3

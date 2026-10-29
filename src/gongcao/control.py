@@ -67,14 +67,24 @@ def rejection(
 ) -> str:
     """The same immutable command rules apply at receipt and again at consumption."""
     mode, target = data["mode"], data["target"]
-    if mode not in {"step", "until", "auto", "pause"} or (
+    if mode not in {"step", "until", "auto", "pause", "retry"} or (
         target not in TARGETS if mode == "until" else target is not None
     ):
         return "Invalid instruction or target"
+    if mode == "retry":
+        if (
+            task["state"] not in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
+            or task["cancel_requested"]
+            or task["snapshot"].get("state") != "open"
+            or data["feedback"]
+        ):
+            return "Retry requires a recoverable blocked/failed task; no edited requirements"
+        if data["created"] < int(task["control"].get("since", 0)):
+            return "Retry comment predates the current blockage"
     if (
         task["stage"] == Stage.MERGED
         or task["state"] == State.COMPLETED
-        or (task["state"] in UNSAFE and (mode != "pause" or data["feedback"]))
+        or (task["state"] in UNSAFE and mode != "retry" and (mode != "pause" or data["feedback"]))
     ):
         return "Task requires manual recovery or is terminal"
     if received and (
@@ -425,6 +435,8 @@ class Controls:
                 (task_id,),
             ):
                 data = json.loads(row["data"])
+                if data["mode"] == "retry":
+                    continue  # Async reconciliation owns retry acceptance under the task lease.
                 if data["actor"].casefold() in operators:
                     if not unverified or int(row["id"].split(":")[1]) > max(
                         int(key.split(":")[1]) for key in unverified
@@ -618,6 +630,7 @@ class Controls:
                     task,
                     {
                         "actor": actor,
+                        "policy": config.policy_hash,
                         "created": datetime.fromisoformat(
                             comment["created_at"].replace("Z", "+00:00")
                         ).timestamp(),
@@ -639,11 +652,161 @@ class Controls:
                     if len(words) not in {1, 2}
                     else rejection(task, data)
                 )
+                if data["mode"] == "retry":
+                    runs = self.store.runs(task_id)
+                    if runs and data["created"] < int(runs[-1]["ended"] or runs[-1]["started"]):
+                        reason = "Retry comment predates the current execution"
                 self.record(task_id, command_id, data, "rejected" if reason else "pending", reason)
+
+    def retry_barrier(self, task_id: int, command_id: str) -> bool:
+        task = self.store.task(task_id)
+        rows = self.db.execute(
+            "SELECT id FROM instructions WHERE task_id=? AND (status='pending' OR "
+            "(status='accepted' AND id=?))",
+            (task_id, task["control"].get("command_id")),
+        )
+        return any(
+            row["id"].startswith("github:")
+            and int(row["id"].split(":")[1]) > int(command_id.split(":")[1])
+            for row in rows
+        )
+
+    async def retry_pending(self, task_id: int, config: Config, github: GitHub) -> None:
+        owner = self.store.owners.get(task_id)
+        if not owner:
+            return
+        rows = self.db.execute(
+            "SELECT id,data FROM instructions WHERE task_id=? AND status='pending' AND reason='' "
+            "AND json_extract(data,'$.mode')='retry' ORDER BY CAST(substr(id,8) AS INTEGER) DESC",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            task = self.store.task(task_id)
+            data = json.loads(row["data"])
+            if self.retry_barrier(task_id, row["id"]):
+                return
+            retry = self.db.execute("SELECT * FROM retries WHERE task_id=?", (task_id,)).fetchone()
+            if retry and retry["fingerprint"] == row["id"] and retry["next_at"] > time.time():
+                return
+            reason = rejection(task, data, received=data)
+            if data["actor"].casefold() not in {a.casefold() for a in config.copilot_operators}:
+                reason = "Operator is not authorized"
+            changed_policy = task["control"].get("policy") not in {None, config.policy_hash}
+            policy = self.store.artifact(task_id, "policy", "") or {}
+            if changed_policy and (
+                data.get("policy") != config.policy_hash
+                or policy.get("roles_hash") != config.roles_hash
+            ):
+                reason = "Role policy changed or unverified; reconcile and renew authorization"
+            if reason:
+                with self.transaction():
+                    self.mark(task_id, row["id"], "rejected", reason)
+                continue
+            from .recovery import Recovery
+            from .remote import Controlled, UncertainWrite
+
+            recovery = Recovery(self.store, github)
+            try:
+                await recovery.sync(task)
+                runs = self.store.runs(task_id)
+                if runs and runs[-1]["details"].get("source", {}).get("baseline") != baseline(task):
+                    raise ValueError(
+                        "Previous execution belongs to unverified/changed requirements"
+                    )
+                if baseline(self.store.task(task_id)) != data["baseline"]:
+                    raise ValueError(
+                        "Requirements/SHA changed; renew authorization after reconciliation"
+                    )
+                await recovery.reconcile(task_id, owner)
+                remote = Controlled(self.store, config, github)
+                if task["stage"] in {Stage.DEVELOPMENT, Stage.REVISION}:
+                    runs = self.store.runs(task_id)
+                    if runs and runs[-1]["role"] == "developer":
+                        await remote.checkpoint(self.store.task(task_id), runs[-1])
+                    await remote.source(self.store.task(task_id))
+                # Re-read the immutable receipt after all network/OS checks, before reset.
+                await asyncio.create_task(self.collect(task_id, config, github), context=Context())
+                with self.transaction():
+                    self.fence(task_id)
+                    receipt = self.db.execute(
+                        "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
+                        (task_id, row["id"]),
+                    ).fetchone()
+                    if (
+                        receipt["status"] != "pending"
+                        or receipt["reason"]
+                        or self.retry_barrier(task_id, row["id"])
+                    ):
+                        return
+                    current = self.store.task(task_id)
+                    if baseline(current) != data["baseline"] or current["stage"] != data["stage"]:
+                        raise ValueError("Task changed during retry reconciliation")
+                    reason = rejection(current, data, received=data)
+                    if reason:
+                        self.mark(task_id, row["id"], "rejected", reason)
+                        return
+                    old = current["control"]
+                    self.db.execute(
+                        "UPDATE instructions SET status='superseded',reason=? WHERE task_id=? "
+                        "AND status='pending' AND id LIKE 'github:%' "
+                        "AND CAST(substr(id,8) AS INTEGER)<?",
+                        ("Verified newer retry", task_id, int(row["id"].split(":")[1])),
+                    )
+                    self.mark(task_id, row["id"], "accepted", "")
+                    if old.get("command_id"):
+                        self.mark(
+                            task_id, old["command_id"], "superseded", "Fresh retry authorization"
+                        )
+                    self.save(
+                        task_id,
+                        old
+                        | {
+                            "mode": old["mode"]
+                            if old["mode"] in {"step", "auto", "until"}
+                            else "step",
+                            "command_id": row["id"],
+                            "spent": False,
+                            "pause_requested": False,
+                            "pause_reason": "",
+                            "since": data["created"],
+                            "policy": config.policy_hash,
+                        },
+                    )
+                    recovery.reset_retry(task_id, task["target_sha"])
+                    if changed_policy:
+                        self.store.record(
+                            self.store.task(task_id),
+                            "policy",
+                            "",
+                            {
+                                "hash": config.policy_hash,
+                                "roles_hash": config.roles_hash,
+                            },
+                        )
+            except (UncertainWrite, InstructionChanged, ValueError) as exc:
+                with self.transaction():
+                    self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))
+                self.store.halt(task_id, State.RECONCILE, Redactor().text(str(exc)))
+            except (OSError, RuntimeError) as exc:
+                failures = (
+                    retry["failures"] + 1 if retry and retry["fingerprint"] == row["id"] else 1
+                )
+                message = "Retry verification unavailable: " + Redactor().text(str(exc))
+                with self.transaction():
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO retries VALUES(?,?,?,?)",
+                        (task_id, failures, row["id"], time.time() + 5 * 2**failures),
+                    )
+                    if failures >= 3:
+                        self.mark(task_id, row["id"], "rejected", message)
+                        message += "; restore access and post a new /gongcao retry"
+                self.store.halt(task_id, State.HUMAN, message)
+            return
 
     async def poll(self, task_id: int, config: Config, github: GitHub) -> None:
         # Transport tasks inherit no Agent lease/process observer and take no jobs slot.
         await asyncio.create_task(self.collect(task_id, config, github), context=Context())
+        await self.retry_pending(task_id, config, github)
         self.apply_pending(task_id, config)
         if self.owns_checkpoint(task_id):
             self.checkpoint(task_id)

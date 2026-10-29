@@ -341,7 +341,7 @@ def test_pr1_schema_upgrade_preserves_history_and_restarts(
     db.close()
     for _ in range(2):
         upgraded = Store(root)
-        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 5
         assert upgraded.task(1)["reason"] == "history"
         assert upgraded.runs(1)[0]["thread_id"] == "old-thread"
         assert upgraded.runs(1)[0]["state"] == run_state

@@ -73,6 +73,16 @@ class Workflow:
         cached = self.cached_run(task, role)
         if cached is not None:
             return cached
+        if role == Role.DEVELOPER:
+            prior = self.store.runs(task["id"])
+            if (
+                prior
+                and prior[-1]["role"] == Role.DEVELOPER
+                and prior[-1]["target_sha"] == task["target_sha"]
+                and prior[-1]["details"].get("save", {}).get("state")
+                not in {"confirmed", "unchanged"}
+            ):
+                await self.remote.checkpoint(task, prior[-1])
         if task["state"] != State.QUEUED:
             self.store.transition(
                 self.safe(task), Stage(task["stage"]), State.QUEUED, "Agent dependencies satisfied"
@@ -91,6 +101,34 @@ class Workflow:
         }:
             return None
         return self.cached_run(current, role)
+
+    async def save_output(self, task_id: int) -> None:
+        task = self.store.task(task_id)
+        runs = self.store.runs(task_id)
+        if (
+            task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION}
+            or task["state"] in {State.RUNNING, State.RECONCILE, State.CANCELLED}
+            or task["cancel_requested"]
+            or not runs
+        ):
+            return
+        run = runs[-1]
+        if (
+            run["role"] != Role.DEVELOPER
+            or run["state"] == State.RUNNING
+            or run["details"].get("save", {}).get("state") in {"confirmed", "unchanged"}
+        ):
+            return
+        try:
+            await self.remote.checkpoint(task, run)
+        except Exception as exc:
+            message = Redactor().text(str(exc))
+            self.store.run_details(run["id"], save_error=message)
+            self.store.halt(
+                task_id,
+                State.RECONCILE if isinstance(exc, UncertainWrite) else State.HUMAN,
+                task["reason"] + "; Output not saved: " + message,
+            )
 
     def revision(self, task: dict[str, Any], findings: dict[str, Any]) -> None:
         task = self.safe(task, complete=True)
@@ -266,12 +304,17 @@ class Workflow:
             )
 
     async def run(self, task_id: int) -> list[str]:
-        if self.watch_instructions:
-            async with Controls(self.store).listen(self.config, self.github, task_id):
-                if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
-                    await Controls(self.store).poll(task_id, self.config, self.github)
-                return await self.execute(task_id)
-        return await self.execute(task_id)
+        try:
+            if self.watch_instructions:
+                async with Controls(self.store).listen(self.config, self.github, task_id):
+                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                        await Controls(self.store).poll(task_id, self.config, self.github)
+                    return await self.execute(task_id)
+            return await self.execute(task_id)
+        finally:
+            from .discovery import Discovery
+
+            await Discovery(self.store, self.config, self.github).handoff(task_id)
 
     async def execute(self, task_id: int) -> list[str]:
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
@@ -319,7 +362,15 @@ class Workflow:
                         )
                         task = self.store.task(task_id)
                     if not policy or policy["hash"] != self.config.policy_hash:
-                        self.store.record(task, "policy", "", {"hash": self.config.policy_hash})
+                        self.store.record(
+                            task,
+                            "policy",
+                            "",
+                            {
+                                "hash": self.config.policy_hash,
+                                "roles_hash": self.config.roles_hash,
+                            },
+                        )
                     await self.step(task)
                     await controls.poll(task_id, self.config, self.github)
                     controls.checkpoint(task_id)
@@ -354,4 +405,6 @@ class Workflow:
                     )
                 )
                 self.store.halt(task_id, state, Redactor().text(f"{type(exc).__name__}: {exc}"))
+            finally:
+                await self.save_output(task_id)
             return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]
