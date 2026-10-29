@@ -518,15 +518,9 @@ class Controls:
                     for old in unverified:
                         self.mark(task_id, old, "superseded", f"Replaced by verified {key}")
 
-    def due(self, task_id: int, config: Config, github: GitHub) -> bool:
-        task = self.store.task(task_id)
-        return bool(
-            config.copilot_operators
-            and task["snapshot"].get("kind") == "issues"
-            and task["state"] not in {State.COMPLETED, State.CANCELLED}
-            and not task["cancel_requested"]
-            and task["stage"] != Stage.MERGED
-            and time.monotonic() >= self.store.instruction_polls.get(task_id, 0)
+    def due(self, task_id: int, github: GitHub) -> bool:
+        return (
+            time.monotonic() >= self.store.instruction_polls.get(task_id, 0)
             and time.time() >= github.traffic.due()
         )
 
@@ -541,7 +535,16 @@ class Controls:
                     break
                 except BlockingIOError:
                     await asyncio.sleep(0.05)
-            if not force and not self.due(task_id, config, github):
+            task = self.store.task(task_id)
+            if (
+                not config.copilot_operators
+                or task["snapshot"].get("kind") != "issues"
+                or task["state"] in {State.COMPLETED, State.CANCELLED}
+                or task["cancel_requested"]
+                or task["stage"] == Stage.MERGED
+            ):
+                return
+            if not force and not self.due(task_id, github):
                 github.traffic.counts["saved"] += 1
                 return
             self.store.instruction_polls[task_id] = time.monotonic() + 60
@@ -555,14 +558,6 @@ class Controls:
 
     async def _collect(self, task_id: int, config: Config, github: GitHub) -> None:
         task = self.store.task(task_id)
-        if (
-            not config.copilot_operators
-            or task["snapshot"].get("kind") != "issues"
-            or task["state"] in {State.COMPLETED, State.CANCELLED}
-            or task["cancel_requested"]
-            or task["stage"] == Stage.MERGED
-        ):
-            return
         watched = {
             row["id"]: row["status"]
             for row in self.db.execute(

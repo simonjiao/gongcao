@@ -96,7 +96,8 @@ class Scheduler:
                 if not immediate:
                     await controls.collect(task_id, self.config, self.github, force=False)
                     if not self.store.db.execute(
-                        "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason=''",
+                        "SELECT 1 FROM instructions WHERE task_id=? "
+                        "AND status='pending' AND reason=''",
                         (task_id,),
                     ).fetchone():
                         return
