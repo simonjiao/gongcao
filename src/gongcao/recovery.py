@@ -19,17 +19,20 @@ from .workspace import repository
 class Recovery:
     def __init__(self, store: Store, github: GitHub):
         self.store, self.github = store, github
+        self.base_sha: str | None = None
+        self.repo: Path | None = None
 
     async def default_base(self, task: dict[str, Any]) -> str:
-        await repository(Path(task["repo_path"]), Target.parse(task["url"]))
+        self.repo, _ = await repository(Path(task["repo_path"]), Target.parse(task["url"]))
         repo = task["snapshot"]["repository"]
-        metadata = await self.github.read(f"repos/{repo}")
+        metadata = await self.github.repository(repo)
         ref = await self.github.read(f"repos/{repo}/git/ref/heads/{metadata['default_branch']}")
         sha: str = ref["object"]["sha"]
         try:
             await command("git", "cat-file", "-e", f"{sha}^{{commit}}", cwd=task["repo_path"])
         except RuntimeError:
             await command("git", "fetch", "origin", sha, cwd=task["repo_path"])
+        self.base_sha = sha
         return sha
 
     async def sync(self, task: dict[str, Any]) -> dict[str, Any]:

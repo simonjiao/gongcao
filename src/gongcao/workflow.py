@@ -60,10 +60,16 @@ class Workflow:
         return rows[-1] if rows else None
 
     async def agent(
-        self, task: dict[str, Any], role: Role, evidence: dict[str, Any] | None = None
+        self,
+        task: dict[str, Any],
+        role: Role,
+        evidence: dict[str, Any] | None = None,
+        *,
+        instructions_verified: bool = False,
     ) -> dict[str, Any] | None:
         controls = Controls(self.store)
-        await controls.poll(task["id"], self.config, self.github)
+        if not instructions_verified:
+            await controls.poll(task["id"], self.config, self.github)
         if not controls.revalidate(task["id"], self.config):
             return None
         current = self.store.task(task["id"])
@@ -151,11 +157,11 @@ class Workflow:
             revision=True,
         )
 
-    async def step(self, task: dict[str, Any]) -> None:
+    async def step(self, task: dict[str, Any], *, instructions_verified: bool = False) -> None:
         stage = Stage(task["stage"])
         checks: dict[str, Any] | None = None
         if stage == Stage.ANALYSIS:
-            run = await self.agent(task, Role.ANALYST)
+            run = await self.agent(task, Role.ANALYST, instructions_verified=instructions_verified)
             current = self.store.task(task["id"])
             if run and current["pr_number"]:
                 self.store.transition(
@@ -171,7 +177,9 @@ class Workflow:
                 if stage == Stage.REVISION
                 else None
             )
-            run = await self.agent(task, Role.DEVELOPER, findings)
+            run = await self.agent(
+                task, Role.DEVELOPER, findings, instructions_verified=instructions_verified
+            )
             if run is None:
                 return
             current = self.store.task(task["id"])
@@ -210,7 +218,7 @@ class Workflow:
                 return
             current = await self.confirm(task)
             result = json.loads(run["result"])
-            await self.remote.review(current, result, run["id"])
+            await self.remote.review(current, result, run["id"], verified=current["snapshot"])
             current = await self.confirm(task)
             if self.cached_run(current, Role.REVIEWER) is None:
                 raise UncertainWrite("Review evidence became invalid during publication")
@@ -267,7 +275,7 @@ class Workflow:
                 return
             if result["conclusion"] != "ready":
                 return
-            await self.remote.ready(current)
+            await self.remote.ready(current, verified=current["snapshot"])
             current = await self.confirm(task)
             if self.cached_run(current, Role.VALIDATOR) is None:
                 raise UncertainWrite("Validation evidence became invalid during readiness update")
@@ -372,8 +380,9 @@ class Workflow:
                                 "roles_hash": self.config.roles_hash,
                             },
                         )
-                    await self.step(task)
-                    await controls.poll(task_id, self.config, self.github)
+                    await self.step(task, instructions_verified=True)
+                    if task["stage"] != Stage.ANALYSIS:
+                        await controls.poll(task_id, self.config, self.github)
                     controls.checkpoint(task_id)
                     progress(self.store, task_id)
                     if self.store.task(task_id)["state"] != State.QUEUED:

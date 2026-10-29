@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 
@@ -45,8 +46,10 @@ def intake(store, repo, sha, snapshot):
             self.rows[3]["labels"] = [{"name": "agent-ready-extra"}]
             self.comments, self.writes, self.failure = [], [], ""
             self.sha = sha
+            self.calls = Counter()
 
         async def read(self, path):
+            self.calls["read"] += 1
             if path == "user":
                 return {"login": "owner"}
             if "/comments/" in path:
@@ -66,6 +69,7 @@ def intake(store, repo, sha, snapshot):
             return deepcopy(self.rows[target.number])
 
         async def pages(self, path, field=None):
+            self.calls["pages"] += 1
             if self.failure in {"403", "429"}:
                 raise PermissionError("HTTP " + self.failure)
             if "/labels" in path:
@@ -98,6 +102,19 @@ def intake(store, repo, sha, snapshot):
 
     config = replace(Config(), discovery=DiscoveryConfig(True, 60, 1, (Source(name, repo),)))
     return Discovery(store, config, API())
+
+
+async def test_confirmed_status_uses_detail_only_without_redundant_patch(intake, store):
+    await intake.scan()
+    intake.github.calls.clear()
+    writes = len(intake.github.writes)
+    await intake.publish(intake.records()[0])
+    assert intake.github.calls == {"read": 1}
+    assert len(intake.github.writes) == writes
+    Controls(store).issue(store.tasks()[0]["id"], "pause")
+    await intake.publish(intake.records()[0])
+    assert intake.github.calls == {"read": 3}
+    assert intake.github.writes[writes:] == ["PATCH"]
 
 
 async def test_filter_dedupe_backlog_status_and_cross_state_lock(

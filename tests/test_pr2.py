@@ -88,6 +88,9 @@ class FixtureGitHub(GitHub):
         return []
 
     async def mutate(self, path, payload):
+        if path == "graphql":
+            self.pull["draft"] = False
+            return {"data": {}}
         self.writes.append((path, payload))
         if path.endswith("/reviews"):
             self.reviews.append(payload | {"id": len(self.reviews) + 1})
@@ -96,6 +99,7 @@ class FixtureGitHub(GitHub):
             "url": "https://github.com/example/demo/pull/9",
             "kind": "pull",
             "number": 9,
+            "node_id": "PR_fixture",
             "body": payload["body"],
             "base_ref": "main",
             "base_sha": self.sha,
@@ -270,7 +274,7 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
 ):
     controlled = Controlled(store, policy, GitHub())
 
-    async def before(task, kind, *, finish_operation=False):
+    async def before(task, kind, *, finish_operation=False, verified=None):
         return task
 
     monkeypatch.setattr(controlled, "before", before)
@@ -381,8 +385,8 @@ async def test_refresh_never_relabels_old_evidence_or_overwrites_merged(
     operation = "review" if change == "head_after_review" else "ready"
     original = getattr(workflow.remote, operation)
 
-    async def changed(*args):
-        await original(*args)
+    async def changed(*args, **kwargs):
+        await original(*args, **kwargs)
         if change == "merged":
             fixture_github.pull.update(merged=True, state="closed")
         elif change == "base_after_ready":
@@ -421,11 +425,16 @@ async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
 
     async def raw(*args):
         calls.append(args)
-        return '{"items":[{"id":1}]}\n {"items":[{"id":2}]}'
+        return (
+            'HTTP/2.0 200 OK\nLink: <next>; rel="next"\n\n{"items":[{"id":1}]}'
+            if args[-1] == "path"
+            else '{"items":[{"id":2}]}'
+        )
 
     monkeypatch.setattr("gongcao.github.command", raw)
     assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
     assert "--slurp" not in calls[0]
+    assert len(calls) == 2
 
 
 async def test_quality_redacts_before_tail_and_stream_boundaries(store, task_id, planned_quality):

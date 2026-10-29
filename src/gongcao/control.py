@@ -14,7 +14,7 @@ from typing import Any
 
 from .config import Config
 from .events import Redactor
-from .github import GitHub
+from .github import GitHub, background
 from .model import VERSION_FIELDS, Stage, State
 from .store import Store
 
@@ -518,7 +518,21 @@ class Controls:
                     for old in unverified:
                         self.mark(task_id, old, "superseded", f"Replaced by verified {key}")
 
-    async def collect(self, task_id: int, config: Config, github: GitHub) -> None:
+    def due(self, task_id: int, config: Config, github: GitHub) -> bool:
+        task = self.store.task(task_id)
+        return bool(
+            config.copilot_operators
+            and task["snapshot"].get("kind") == "issues"
+            and task["state"] not in {State.COMPLETED, State.CANCELLED}
+            and not task["cancel_requested"]
+            and task["stage"] != Stage.MERGED
+            and time.monotonic() >= self.store.instruction_polls.get(task_id, 0)
+            and time.time() >= github.traffic.due()
+        )
+
+    async def collect(
+        self, task_id: int, config: Config, github: GitHub, *, force: bool = True
+    ) -> None:
         # Serialize transport snapshots across foreground/background collectors and stores.
         with (self.store.root / f"instructions-{task_id}.lock").open("a") as lock:
             while True:
@@ -527,14 +541,25 @@ class Controls:
                     break
                 except BlockingIOError:
                     await asyncio.sleep(0.05)
-            await self._collect(task_id, config, github)
+            if not force and not self.due(task_id, config, github):
+                github.traffic.counts["saved"] += 1
+                return
+            self.store.instruction_polls[task_id] = time.monotonic() + 60
+            token = background.set(not force)
+            try:
+                await self._collect(task_id, config, github)
+            finally:
+                background.reset(token)
+                if not force:
+                    github.traffic.spacing = time.time() + 3600 / github.traffic.budget
 
     async def _collect(self, task_id: int, config: Config, github: GitHub) -> None:
         task = self.store.task(task_id)
         if (
             not config.copilot_operators
             or task["snapshot"].get("kind") != "issues"
-            or task["state"] == State.COMPLETED
+            or task["state"] in {State.COMPLETED, State.CANCELLED}
+            or task["cancel_requested"]
             or task["stage"] == Stage.MERGED
         ):
             return
@@ -806,9 +831,13 @@ class Controls:
                 self.store.halt(task_id, State.HUMAN, message)
             return
 
-    async def poll(self, task_id: int, config: Config, github: GitHub) -> None:
+    async def poll(
+        self, task_id: int, config: Config, github: GitHub, *, force: bool = True
+    ) -> None:
         # Transport tasks inherit no Agent lease/process observer and take no jobs slot.
-        await asyncio.create_task(self.collect(task_id, config, github), context=Context())
+        await asyncio.create_task(
+            self.collect(task_id, config, github, force=force), context=Context()
+        )
         await self.retry_pending(task_id, config, github)
         self.apply_pending(task_id, config)
         if self.owns_checkpoint(task_id):
@@ -826,7 +855,7 @@ class Controls:
                 selected = [self.store.task(task_id)] if task_id is not None else self.store.tasks()
                 for task in selected:
                     try:
-                        await self.collect(task["id"], config, github)
+                        await self.collect(task["id"], config, github, force=False)
                     except Exception:
                         pass  # Foreground polling reports errors; background reads retry later.
                 await asyncio.sleep(5)

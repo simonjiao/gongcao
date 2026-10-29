@@ -1,12 +1,14 @@
 import argparse
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from beartype.roar import BeartypeCallHintParamViolation
 
 from gongcao.cli import execute, parser
 from gongcao.config import Config
-from gongcao.github import GitHub, Target
+from gongcao.github import Deferred, GitHub, Target, Traffic, background
 from gongcao.model import Role
 
 
@@ -101,6 +103,67 @@ async def test_github_read_retry_is_bounded_and_never_retries_denied_access(
     with pytest.raises(PermissionError if permission else ConnectionError):
         await GitHub().read("user")
     assert calls == (1 if permission else 3)
+
+
+@pytest.mark.parametrize(
+    "status,headers,limited",
+    [
+        (401, "", False),
+        (403, "", False),
+        (403, "X-RateLimit-Remaining: 0\n", True),
+        (403, "Retry-After: 45\n", True),
+        (429, "Retry-After: 45\n", True),
+    ],
+)
+async def test_rate_limit_headers_count_and_cooldown(monkeypatch, status, headers, limited):
+    now = [1000.0]
+    monkeypatch.setattr("gongcao.github.time.time", lambda: now[0])
+
+    async def launch(*args, **kwargs):
+        async def communicate(data):
+            return (f"HTTP/2.0 {status} Error\n{headers}\n{{}}".encode(), f"HTTP {status}".encode())
+
+        return SimpleNamespace(communicate=communicate, returncode=1)
+
+    monkeypatch.setattr("gongcao.github.launch", launch)
+    monkeypatch.setattr("gongcao.github.completed", lambda process: None)
+    api = GitHub()
+    with pytest.raises(Deferred if limited else PermissionError):
+        await api.read("user")
+    assert api.traffic.counts["checks"] == 1
+    if limited:
+        with pytest.raises(Deferred):
+            await api.mutate("path", {})
+        assert api.traffic.counts["writes"] == 0
+        now[0] = api.traffic.cooldown + 1
+        api.traffic.start(False)  # Recovery admits a fresh request, without busy waiting.
+
+
+async def test_background_reserve_budget_and_inflight_reads(monkeypatch):
+    api = GitHub()
+    calls = []
+
+    async def read(*args):
+        calls.append(args)
+        await asyncio.sleep(0)
+        return "{}"
+
+    monkeypatch.setattr("gongcao.github.command", read)
+    token = background.set(True)
+    try:
+        await asyncio.gather(api.read("user"), api.read("user"))
+        assert len(calls) == 1 and api.traffic.counts["saved"] == 1
+        usage = Traffic(budget=1, remaining=999, limit=5000, reset=2000000000.0)
+        with pytest.raises(Deferred):
+            usage.start(False)
+        usage.remaining = 4000
+        usage.start(False)
+        with pytest.raises(Deferred):
+            usage.start(False)
+    finally:
+        background.reset(token)
+    await asyncio.gather(api.read("user"), api.read("user"))
+    assert len(calls) == 3  # Separate foreground checkpoints never share an older response.
 
 
 async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):

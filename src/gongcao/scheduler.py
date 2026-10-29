@@ -10,7 +10,7 @@ from .config import Config
 from .control import Controls
 from .discovery import Discovery
 from .events import LOG, Redactor, progress, task_event
-from .github import GitHub
+from .github import GitHub, background
 from .model import Stage, State
 from .recovery import Recovery
 from .store import Store
@@ -26,6 +26,7 @@ class Scheduler:
         self.workflows: list[Workflow] = []
         self.concurrency = concurrency
         self.config_path: Path | None = None
+        self.next_check: dict[int, float] = {}
 
     def failed(self, task_id: int) -> None:
         task = self.store.task(task_id)
@@ -72,17 +73,34 @@ class Scheduler:
             else f"异常待重试：第 {failures} 次，已记录退避",
         )
 
-    async def advance(self, task_id: int) -> None:
+    async def advance(self, task_id: int, *, immediate: bool = True) -> None:
+        task = self.store.task(task_id)
+        wake = bool(
+            self.store.db.execute(
+                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason=''",
+                (task_id,),
+            ).fetchone()
+        )
+        if wake:
+            immediate = True  # A newly collected permission gets a fresh safety check now.
+        if not immediate and task["state"] != State.QUEUED:
+            if time.monotonic() < self.next_check.get(task_id, 0):
+                return
+            self.next_check[task_id] = time.monotonic() + 60
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             if self.config.copilot_operators:
+                controls = Controls(self.store)
+                if not immediate and not controls.due(task_id, self.config, self.github):
+                    return
                 task = self.store.task(task_id)
                 if self.store.db.execute(
                     "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
                 ).fetchone():
                     return
+                token = background.set(not immediate)
                 try:
                     self.store.sync(task_id, await self.github.task_snapshot(task))
-                    await Controls(self.store).poll(task_id, self.config, self.github)
+                    await controls.poll(task_id, self.config, self.github, force=immediate)
                 except Exception as exc:
                     if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
                         self.store.halt(
@@ -91,6 +109,8 @@ class Scheduler:
                             Redactor().text(f"Instruction poll failed: {exc}"),
                         )
                     return
+                finally:
+                    background.reset(token)
             if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
                 return
         async with self.semaphore:
@@ -173,11 +193,15 @@ class Scheduler:
                 for task in self.store.tasks():
                     progress(self.store, task["id"])
                     if task["id"] not in pending:
-                        pending[task["id"]] = asyncio.create_task(self.advance(task["id"]))
+                        pending[task["id"]] = asyncio.create_task(
+                            self.advance(task["id"], immediate=once)
+                        )
                 if once:
                     group = asyncio.gather(*pending.values())
                     await asyncio.shield(group)
+                    self.github.report()
                     return
+                self.github.report()
                 if not self.workflows and time.monotonic() - self.store.last_activity >= 300:
                     LOG.info(
                         "空闲心跳：已登记任务 %s，等待任务或 GitHub 指令", len(self.store.tasks())

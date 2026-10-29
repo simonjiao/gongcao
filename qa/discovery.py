@@ -144,6 +144,14 @@ async def exercise(run: Run, github: GitHub) -> None:
         await asyncio.wait_for(asyncio.shield(serving), 30)
     before = signature(inspect(run))
     require(await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed")
+    cycles = [
+        line
+        for command in run.root.glob("command-*.json")
+        for line in json.loads(command.read_text())["stderr"].splitlines()
+        if "GitHub 周期请求：" in line
+    ]
+    require(bool(cycles), "Missing controller GitHub request accounting")
+    run.archive("github-traffic", {"cycles": cycles})
     store = Store(run.root / "state")
     try:
         records = [dict(row) for row in store.db.execute("SELECT * FROM claims ORDER BY url")]

@@ -40,10 +40,16 @@ class Controlled:
         return current
 
     async def before(
-        self, expected: dict[str, Any], kind: str, *, finish_operation: bool = False
+        self,
+        expected: dict[str, Any],
+        kind: str,
+        *,
+        finish_operation: bool = False,
+        verified: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         target = Target.parse(expected["url"])
-        latest = await Recovery(self.store, self.github).sync(expected)
+        recovery = Recovery(self.store, self.github)
+        latest = verified if verified is not None else await recovery.sync(expected)
         if latest.get("head_sha", expected["target_sha"]) != expected["target_sha"] or any(
             latest.get(key) != expected["snapshot"].get(key) for key in VERSION_FIELDS
         ):
@@ -68,12 +74,11 @@ class Controlled:
         if current["stage"] not in allowed[kind] or latest["state"] != "open":
             raise ValueError("This stage does not authorize the requested GitHub mutation")
         if kind == "checkpoint" and not current["pr_number"]:
-            if (
-                await Recovery(self.store, self.github).default_base(current)
-                != current["target_sha"]
-            ):
+            if (recovery.base_sha or await recovery.default_base(current)) != current["target_sha"]:
                 raise UncertainWrite("Issue baseline changed before saving output")
-        repo, _ = await repository(Path(current["repo_path"]), target)
+        repo = recovery.repo
+        if repo is None:
+            repo, _ = await repository(Path(current["repo_path"]), target)
         if current["target_sha"] not in self.verified:
             key = "control-" + uuid.uuid4().hex
             workspace = self.store.root / "worktrees" / key
@@ -101,8 +106,10 @@ class Controlled:
         payload: dict[str, Any],
         observe: Callable[[], Awaitable[dict[str, Any] | None]],
         write: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        verified: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        task = await self.before(task, kind)
+        task = await self.before(task, kind, verified=verified)
         key = self.identity(task, kind, object_id)
         created = self.store.intent(task, key, kind, json.dumps(payload, sort_keys=True))
         found = await observe()
@@ -345,7 +352,7 @@ class Controlled:
                 raise ValueError("Cross-repository PR pushes require manual handling")
             base_ref = snapshot["base_ref"]
         else:
-            metadata = await self.github.read(f"repos/{snapshot['repository']}")
+            metadata = await self.github.repository(snapshot["repository"])
             base_ref = metadata["default_branch"]
             base = await self.github.read(
                 f"repos/{snapshot['repository']}/git/ref/heads/{base_ref}"
@@ -412,7 +419,14 @@ class Controlled:
             raise UncertainWrite("PR head moved before confirmation")
         return updated, result["number"]
 
-    async def review(self, task: dict[str, Any], result: dict[str, Any], run_id: str) -> None:
+    async def review(
+        self,
+        task: dict[str, Any],
+        result: dict[str, Any],
+        run_id: str,
+        *,
+        verified: dict[str, Any] | None = None,
+    ) -> None:
         number = task["pr_number"]
         endpoint = f"repos/{task['snapshot']['repository']}/pulls/{number}/reviews"
         object_id = f"{number}:{run_id}"
@@ -439,9 +453,9 @@ class Controlled:
         async def create() -> dict[str, Any]:
             return await self.github.mutate(endpoint, payload)
 
-        await self.perform(task, "review", object_id, payload, existing, create)
+        await self.perform(task, "review", object_id, payload, existing, create, verified=verified)
 
-    async def ready(self, task: dict[str, Any]) -> None:
+    async def ready(self, task: dict[str, Any], *, verified: dict[str, Any] | None = None) -> None:
         async def observed() -> dict[str, Any] | None:
             snapshot = await self.github.task_snapshot(task)
             if snapshot["head_sha"] != task["target_sha"] or any(
@@ -451,16 +465,22 @@ class Controlled:
             return {"ready": True} if not snapshot["draft"] else None
 
         async def write() -> dict[str, Any]:
-            await command(
-                "gh",
-                "pr",
-                "ready",
-                str(task["pr_number"]),
-                "--repo",
-                task["snapshot"]["repository"],
+            await self.github.mutate(
+                "graphql",
+                {
+                    "query": "mutation($id:ID!){markPullRequestReadyForReview("
+                    "input:{pullRequestId:$id}){clientMutationId}}",
+                    "variables": {"id": task["snapshot"]["node_id"]},
+                },
             )
             return {"ready": True}
 
         await self.perform(
-            task, "ready", str(task["pr_number"]), {"sha": task["target_sha"]}, observed, write
+            task,
+            "ready",
+            str(task["pr_number"]),
+            {"sha": task["target_sha"]},
+            observed,
+            write,
+            verified=verified,
         )

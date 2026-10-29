@@ -30,6 +30,7 @@ class Comments(GitHub):
         self.sequence = 0
         self.listing_error = None
         self.listing_missing = False
+        self.reads = 0
 
     def post(self, body, *, actor="owner", at=None):
         stamp = (datetime.now(UTC) if at is None else datetime.fromtimestamp(at, UTC)).isoformat()
@@ -45,6 +46,7 @@ class Comments(GitHub):
         return comment
 
     async def instructions(self, task):
+        self.reads += 1
         assert observer.get() is None
         if self.listing_error:
             raise self.listing_error
@@ -56,6 +58,24 @@ class Comments(GitHub):
             if comment["id"] == int(path.rsplit("/", 1)[1]):
                 return comment
         raise RuntimeError("HTTP 404: Not Found (deletion or visibility unknown)")
+
+
+async def test_background_poll_budget_and_fresh_instruction_wakeup(store, task_id, comments):
+    config = Config(copilot_operators=["owner"])
+    controls = Controls(store)
+    controls.issue(task_id, "pause")
+    await asyncio.gather(
+        *(Controls(store).collect(task_id, config, comments, force=False) for _ in range(3))
+    )
+    for _ in range(12):
+        await controls.collect(task_id, config, comments, force=False)
+    assert comments.reads == 1
+    comments.post("/gongcao step")
+    await controls.poll(task_id, config, comments)  # Explicit safety points bypass the timer.
+    assert comments.reads == 2 and store.task(task_id)["state"] == State.QUEUED
+    store.cancel(task_id)
+    await controls.collect(task_id, config, comments, force=False)
+    assert comments.reads == 2
 
 
 @pytest.fixture
@@ -309,7 +329,9 @@ async def test_trusted_commands_bind_baseline_deduplicate_and_invalidate_feedbac
     store, sha, snapshot, repo, monkeypatch, comments
 ):
     clock = [100.0]
-    monkeypatch.setattr("gongcao.control.time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(
+        "gongcao.control.time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    )
     task_id = store.register(snapshot["url"], repo, sha, snapshot)
     controls = Controls(store)
     controls.issue(task_id, "pause")
@@ -646,8 +668,8 @@ async def test_until_current_review_pauses_after_review_write_without_advancing(
     workflow = reviewing
     original = workflow.remote.review
 
-    async def reviewed(task, result, run_id):
-        await original(task, result, run_id)
+    async def reviewed(task, result, run_id, **kwargs):
+        await original(task, result, run_id, **kwargs)
         comments.post("/gongcao until review")
         await asyncio.create_task(
             Controls(store).collect(task_id, workflow.config, fixture_github), context=Context()
