@@ -50,13 +50,8 @@ class Controlled:
         target = Target.parse(expected["url"])
         recovery = Recovery(self.store, self.github)
         latest = verified if verified is not None else await recovery.sync(expected)
+        expected = self.delivery_version(expected, kind)
         current = self.store.task(expected["id"])
-        if (
-            kind in {"push", "pull"}
-            and self.store.development_output(current)
-            and self.store.development_output(expected)
-        ):
-            expected = current
         if latest.get("head_sha", expected["target_sha"]) != expected["target_sha"] or any(
             latest.get(key) != expected["snapshot"].get(key) for key in VERSION_FIELDS
         ):
@@ -104,6 +99,16 @@ class Controlled:
             f"{task['url']}:{kind}:{task['target_sha']}:{object_id}".encode()
         ).hexdigest()
 
+    def delivery_version(self, expected: dict[str, Any], kind: str) -> dict[str, Any]:
+        current = self.store.task(expected["id"])
+        if (
+            kind in {"push", "pull"}
+            and self.store.development_output(expected)
+            and self.store.development_output(current)
+        ):
+            return current
+        return expected
+
     def write_guard(self, expected: dict[str, Any], kind: str) -> dict[str, Any]:
         if kind == "checkpoint":
             return self.store.save_guard(expected)
@@ -111,14 +116,7 @@ class Controlled:
         controls.apply_pending(expected["id"], self.config)
         if not controls.revalidate(expected["id"], self.config):
             raise Paused("Paused before sending a controlled write")
-        current = self.store.task(expected["id"])
-        if (
-            kind in {"push", "pull"}
-            and self.store.development_output(expected)
-            and self.store.development_output(current)
-        ):
-            expected = current
-        return self.store.guard(expected)
+        return self.store.guard(self.delivery_version(expected, kind))
 
     async def perform(
         self,

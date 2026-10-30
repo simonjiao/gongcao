@@ -11,6 +11,8 @@ An already started Developer may finish and deliver its original output through
 the existing controller commit, branch and draft PR path. The task then pauses at
 Review with an explicit requirements-changed reason, including in automatic mode.
 A new instruction is required before reassessing the latest request at PR head.
+The Review transition and mandatory pause commit atomically. Recovery adopting
+an already created PR retains the pause, including for implicit automatic mode.
 Changes before Developer startup still invalidate the original authorization.
 
 Delivery still requires an open task, current lease, verified OS isolation,

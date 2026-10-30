@@ -154,7 +154,7 @@ def fixture_github(tmp_path, repo, sha, snapshot, monkeypatch):
     github = FixtureGitHub(snapshot, sha, bare)
 
     async def routed(*args, **kwargs):
-        if args[:2] in {("git", "push"), ("git", "ls-remote")}:
+        if args[:2] in {("git", "push"), ("git", "ls-remote"), ("git", "fetch")}:
             args = (*args[:2], str(bare), *args[3:])
         if args[:3] == ("gh", "pr", "ready"):
             github.pull["draft"] = False
@@ -162,6 +162,7 @@ def fixture_github(tmp_path, repo, sha, snapshot, monkeypatch):
         return await command(*args, **kwargs)
 
     monkeypatch.setattr("gongcao.remote.command", routed)
+    monkeypatch.setattr("gongcao.recovery.command", routed)
     install_worker(monkeypatch, WORKER)
     return github
 
@@ -399,6 +400,56 @@ async def test_changed_request_delivers_original_work_then_waits_for_current_rev
         for _ in range(2):
             await Workflow(restarted, policy, fixture_github).run(task_id)
         assert len(restarted.runs(task_id)) == 2
+    assert len(fixture_github.writes) == 1
+
+
+@pytest.mark.parametrize("crash", ["after_pull", "after_transition"])
+async def test_changed_request_review_barrier_survives_delivery_interruption(
+    store, task_id, fixture_github, policy, monkeypatch, crash
+):
+    from gongcao.recovery import Recovery
+
+    class Interruption(BaseException):
+        pass
+
+    snapshot, publish, transition = (
+        fixture_github.task_snapshot,
+        Controlled.publish,
+        store.transition,
+    )
+
+    async def changed(task):
+        runs = store.runs(task_id)
+        if runs and runs[-1]["role"] == Role.DEVELOPER:
+            fixture_github.issue["body"] = "Changed request during implicit automatic execution"
+        return await snapshot(task)
+
+    async def delivered(self, *args, **kwargs):
+        result = await publish(self, *args, **kwargs)
+        if crash == "after_pull":
+            raise Interruption
+        return result
+
+    def transitioned(*args, **kwargs):
+        transition(*args, **kwargs)
+        if crash == "after_transition" and kwargs.get("pause_reason"):
+            raise Interruption
+
+    monkeypatch.setattr(fixture_github, "task_snapshot", changed)
+    monkeypatch.setattr(Controlled, "publish", delivered)
+    monkeypatch.setattr(store, "transition", transitioned)
+    assert not store.task(task_id)["control"]["explicit"]
+    with pytest.raises(Interruption):
+        await Workflow(store, policy, fixture_github).run(task_id)
+    assert fixture_github.pull["draft"] and len(fixture_github.writes) == 1
+    with closing(Store(store.root)) as restarted:
+        recovered = await Recovery(restarted, fixture_github).recover(task_id)
+        assert recovered["recovered"], recovered
+        assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION
+        assert "requirements changed" in restarted.task(task_id)["reason"].lower()
+        await Workflow(restarted, policy, fixture_github).run(task_id)
+        assert [r["role"] for r in restarted.runs(task_id)] == ["analyst", "developer"]
+        assert restarted.task(task_id)["pr_number"] == 9
     assert len(fixture_github.writes) == 1
 
 

@@ -203,12 +203,12 @@ class Workflow:
                 "Controller commit and PR confirmed on GitHub",
                 snapshot=snapshot,
                 pr_number=number,
+                pause_reason=(
+                    "Requirements changed; draft PR awaits current-request review"
+                    if changed
+                    else None
+                ),
             )
-            if changed:
-                Controls(self.store).issue(task["id"], "pause", safe=True)
-                Controls(self.store).invalidate(
-                    task["id"], "Requirements changed; draft PR awaits current-request review"
-                )
             return
         if stage == Stage.REVIEW:
             if self.cached_run(task, Role.ANALYST) is None:

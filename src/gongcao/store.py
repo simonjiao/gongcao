@@ -345,7 +345,17 @@ class Store:
             if (version_changed and not delivery) or lifecycle_changed:
                 from .control import Controls
 
-                Controls(self).invalidate(task_id, "GitHub version changed; renew instruction")
+                runs = self.runs(task_id)
+                changed_delivery = bool(
+                    task["pr_number"] and runs and runs[-1]["details"].get("delivery_changed")
+                )
+                Controls(self).invalidate(
+                    task_id,
+                    "Requirements changed; draft PR awaits current-request review"
+                    if changed_delivery
+                    else "GitHub version changed; renew instruction",
+                    required_pause=changed_delivery,
+                )
 
     def begin_run(
         self,
@@ -581,6 +591,7 @@ class Store:
         pr_number: int | None = None,
         revision: bool = False,
         invalidate: bool = False,
+        pause_reason: str | None = None,
     ) -> None:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -615,6 +626,8 @@ class Store:
             Controls(self).checkpoint(
                 task["id"], previous_stage=None if invalidate else task["stage"]
             )
+            if pause_reason:
+                Controls(self).invalidate(task["id"], pause_reason, required_pause=True)
 
     def artifact(self, task_id: int, kind: str, policy: str) -> dict[str, Any] | None:
         task = self.task(task_id)
