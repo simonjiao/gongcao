@@ -25,7 +25,12 @@ def test_dashboard_uses_local_activity_and_bounded_redacted_logs(
         for number in range(160):
             logging.getLogger("gongcao").info("[%s] github_pat_secret123\x1b[2J", number)
     journal = Journal(store, run_id, 4096, Redactor())
-    journal.emit("tool", {"prompt": "private prompt must stay private"})
+    journal.emit(
+        "sdk_event", {"method": "item/started", "payload": {"prompt": "private prompt" * 40}}
+    )
+    journal.emit("sdk_event", {"method": "unknown", "payload": {"method": "item/completed"}})
+    with terminal_logging(view):
+        logging.getLogger("gongcao").info("after SDK event")
     for number in range(2, 10):
         other = snapshot | {"url": snapshot["url"][:-1] + str(number), "number": number}
         other_id = store.register(other["url"], repo, sha, other)
@@ -36,9 +41,15 @@ def test_dashboard_uses_local_activity_and_bounded_redacted_logs(
     text = stream.getvalue()
     assert "example/demo #1" in text and "执行 2" in text and "最近事件" in text
     assert "时长未记录；暂无新事件（无 Agent Run）" in text
+    assert "[example/demo #1 / 任务1] Agent 工作项开始" in text
+    assert "工作项结束" not in text and text.index("工作项开始") < text.index("after SDK event")
     assert "private prompt" not in text and "secret123" not in text and "\x1b" not in text
     assert "[159]" in text and "[0]" not in text and len(view.records) == 150
     assert "等待 7" in text and "另有 3 项" in text
+    stream.seek(0)
+    stream.truncate()
+    console.print(view.render(100, 18))
+    assert stream.getvalue().count("Agent 工作项开始") == 1
     narrow = io.StringIO()
     Console(file=narrow, width=46, height=12).print(view.render(46, 12))
     assert "另有 6 项" in narrow.getvalue() and "demo #1" in narrow.getvalue()

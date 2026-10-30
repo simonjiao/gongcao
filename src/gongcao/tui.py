@@ -3,9 +3,10 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
-from collections import deque
+from bisect import insort
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
@@ -19,18 +20,54 @@ from .events import STAGES, STATES, Redactor, terminal_logging
 from .model import State
 from .store import Store
 
+ACTIVITY = {
+    "turn/started": "Agent 本轮处理开始",
+    "turn/plan/updated": "Agent 执行计划更新",
+    "item/started": "Agent 工作项开始",
+    "item/completed": "Agent 工作项结束",
+    "turn/completed": "Agent 本轮处理结束",
+}
+
 
 class Dashboard(logging.Handler):
     def __init__(self, store: Store):
         super().__init__()
         self.store = store
-        self.records: deque[str] = deque(maxlen=150)
+        self.records: list[tuple[float, str]] = []
+        self.event_id = store.db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(self.format(record)[:2000])
+        insort(self.records, (record.created, self.format(record)[:2000]), key=lambda r: r[0])
+        del self.records[:-150]
 
     def render(self, width: int, height: int) -> Layout:
         tasks = self.store.tasks()
+        by_id = {task["id"]: task for task in tasks}
+        rows = self.store.db.execute(
+            "SELECT e.id,e.at,e.kind,substr(e.summary,1,80) AS header,r.task_id "
+            "FROM events e JOIN runs r ON r.id=e.run_id WHERE e.id>? ORDER BY e.id DESC LIMIT 150",
+            (self.event_id,),
+        ).fetchall()
+        for row in reversed(rows):
+            self.event_id = row["id"]
+            # Journal stores a truncated Python repr; read only its leading method field.
+            method = re.match(r"\{'method': '([^']+)',", row["header"])
+            activity = ACTIVITY.get(method[1]) if method and row["kind"] == "sdk_event" else None
+            if activity is None:
+                continue
+            task = by_id[row["task_id"]]
+            snapshot = task["snapshot"]
+            record = logging.LogRecord(
+                "gongcao",
+                logging.INFO,
+                "",
+                0,
+                f"[{snapshot['repository']} #{snapshot['number']} / 任务{task['id']}] {activity}",
+                (),
+                None,
+            )
+            record.created = row["at"]
+            self.emit(record)
         runs = {
             row["task_id"]: row
             for row in self.store.db.execute(
@@ -71,7 +108,7 @@ class Dashboard(logging.Handler):
         if len(tasks) > limit:
             lines.append(f"另有 {len(tasks) - limit} 项；详情见 gongcao status / inspect")
         overview_height = min(height - 3, len(lines) + 2)
-        recent = list(self.records)[-max(1, height - overview_height - 2) :]
+        recent = [text for _, text in self.records[-max(1, height - overview_height - 2) :]]
         layout = Layout()
         layout.split_column(
             Layout(
@@ -130,5 +167,5 @@ async def serve_display(store: Store, *, enabled: bool) -> AsyncIterator[None]:
                         await refresh_task
         finally:
             # Keep recent diagnostics visible after leaving the alternate screen, including errors.
-            for record in view.records:
+            for _, record in view.records:
                 console.print(Text(record), soft_wrap=True)
