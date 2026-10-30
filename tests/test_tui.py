@@ -30,13 +30,15 @@ def test_dashboard_uses_local_activity_and_bounded_redacted_logs(
         other = snapshot | {"url": snapshot["url"][:-1] + str(number), "number": number}
         other_id = store.register(other["url"], repo, sha, other)
         store.halt(other_id, State.WAITING_INSTRUCTION, "Paused")
+    store.halt(other_id, State.RUNNING, "Executing validation plan")
     store.db.execute("PRAGMA query_only=ON")
     console.print(view.render(100, 18))
     text = stream.getvalue()
-    assert "example/demo #1" in text and "执行 1" in text and "最近事件" in text
+    assert "example/demo #1" in text and "执行 2" in text and "最近事件" in text
+    assert "时长未记录；暂无新事件（无 Agent Run）" in text
     assert "private prompt" not in text and "secret123" not in text and "\x1b" not in text
     assert "[159]" in text and "[0]" not in text and len(view.records) == 150
-    assert "等待 8" in text and "另有 3 项" in text
+    assert "等待 7" in text and "另有 3 项" in text
     narrow = io.StringIO()
     Console(file=narrow, width=46, height=12).print(view.render(46, 12))
     assert "另有 6 项" in narrow.getvalue() and "demo #1" in narrow.getvalue()

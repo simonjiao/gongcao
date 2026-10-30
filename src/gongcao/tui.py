@@ -65,6 +65,8 @@ class Dashboard(logging.Handler):
                     if run["activity"] is not None
                     else "  暂无新事件"
                 )
+            elif task["state"] == State.RUNNING:
+                line += "  时长未记录；暂无新事件（无 Agent Run）"
             lines.append(line)
         if len(tasks) > limit:
             lines.append(f"另有 {len(tasks) - limit} 项；详情见 gongcao status / inspect")
