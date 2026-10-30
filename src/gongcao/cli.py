@@ -264,13 +264,13 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         loop.add_signal_handler(signal.SIGTERM, current.cancel)
         try:
             if args.command == "serve":
-                from .events import terminal_logging
+                from .tui import serve_display
 
                 config = Config.load(args.config)
                 jobs = args.jobs if args.jobs is not None else config.scheduler_jobs
                 scheduler = Scheduler(store, config, github, jobs)
                 scheduler.config_path = args.config.resolve() if args.config else None
-                with terminal_logging():
+                async with serve_display(store, enabled=not args.once and not args.no_tui):
                     await scheduler.serve(once=args.once, poll=args.poll)
                 output(store.tasks())
                 return 0
@@ -328,6 +328,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--jobs", type=int, choices=(1, 2, 3), help="Parallel tasks (YAML or 1)")
     serve.add_argument("--poll", type=float, default=5.0)
     serve.add_argument("--once", action="store_true")
+    serve.add_argument("--no-tui", action="store_true", help="Use plain stderr logs in a terminal")
     for name in (
         "sync",
         "status",
