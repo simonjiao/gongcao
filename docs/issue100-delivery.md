@@ -20,16 +20,24 @@ confirmed process cleanup and controller commit provenance. Pause/cancellation
 and branch conflicts stop publication. Stale WIP stays local when the original
 checkpoint authority no longer matches; existing unknown writes remain reserved.
 There is no schema migration, new workflow engine or compatibility layer.
+Recovery still verifies the original report, Worktree and context hash for a
+completed run eligible for delivery, even after its acceptance evidence expires.
+Interrupted, unfinished sessions keep the existing fresh-session recovery path.
 
 Read-only preflight completes before marking a write as dispatched. A newly
 created, provably unsent intent is removed on failure. An existing intent is never
 removed this way. After dispatch, failed acknowledgement/readback retains an
 unknown intent until a read-only observation confirms the result; retries cannot
 replay an unconfirmed write. A rate limiter's explicit rejection remains unsent.
+An OS-confirmed failed exec raises `NotStarted` with the original error as its
+cause; only this pre-start failure can cancel a newly created write intent.
+Failures after a process starts remain subject to remote readback reconciliation.
 
 Offline regression uses `test_pr2.py` for both metadata refresh windows, three
 request-edit windows, delivery safety and write/restart boundaries. Existing
 checkpoint/control tests distinguish cancellation/pause before and after send.
+The after-PR interruption case rejects altered context before safely adopting the
+existing PR; the readback-limit case shares the existing ambiguous-write test.
 `test_control_cli.py` runs native CLI processes and persistent `serve`, real bare
 Git and production OS sandboxes; only GitHub/model protocols are substituted.
 The QA comment fixture now also changes the Issue timestamp on status updates.

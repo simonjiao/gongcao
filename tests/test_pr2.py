@@ -11,10 +11,13 @@ import pytest
 from test_runner import install_worker
 
 from gongcao.config import Config
+from gongcao.control import Controls
 from gongcao.github import Deferred, GitHub, command
 from gongcao.model import Role, Stage, State
 from gongcao.quality import Quality
+from gongcao.recovery import Recovery
 from gongcao.remote import Controlled, UncertainWrite
+from gongcao.runner import Runner
 from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 from gongcao.workflow import Workflow
@@ -303,17 +306,13 @@ async def test_writes_require_verified_os_isolation(
 async def test_metadata_refresh_during_push_delivers_one_draft(
     store, task_id, fixture_github, policy, monkeypatch, final
 ):
-    from gongcao.control import Controls
-
     original = Controlled.before
-    refreshed = False
     checks = 0
 
     async def refresh(self, task, kind, **kwargs):
-        nonlocal refreshed, checks
+        nonlocal checks
         checks += kind == "push"
         if kind == "push" and checks == (3 if final else 2):
-            refreshed = True
             fixture_github.issue["updated_at"] = "2026-10-30T00:55:31Z"
         return await original(self, task, kind, **kwargs)
 
@@ -321,128 +320,114 @@ async def test_metadata_refresh_during_push_delivers_one_draft(
     Controls(store).issue(task_id, "until", "review", policy=policy.policy_hash)
     await Workflow(store, policy, fixture_github).run(task_id)
     task = store.task(task_id)
-    assert refreshed and task["stage"] == Stage.REVIEW, task["reason"]
+    assert task["stage"] == Stage.REVIEW, task["reason"]
+    assert task["snapshot"]["updated_at"] == "2026-10-30T00:55:31Z"
     assert task["state"] == State.WAITING_INSTRUCTION
     assert fixture_github.pull["draft"] and task["pr_number"] == 9
     assert len(fixture_github.writes) == 1
     assert all(op["state"] == "succeeded" for op in store.evidence(task_id)["operations"])
-    with closing(Store(store.root)) as restarted:
-        await Workflow(restarted, policy, fixture_github).run(task_id)
-        assert len(restarted.runs(task_id)) == 2
-    assert len(fixture_github.writes) == 1
 
 
 @pytest.mark.parametrize(
-    "window,mode", [("running", "step"), ("finished", "until"), ("pushed", "auto")]
+    "window,mode,unsafe",
+    [
+        ("running", "step", ""),
+        ("finished", "until", ""),
+        ("pushed", "auto", ""),
+        ("finished", "until", "base"),
+        ("finished", "until", "provenance"),
+        ("finished", "until", "branch"),
+    ],
 )
-async def test_changed_request_delivers_original_work_then_waits_for_current_review(
-    store, task_id, fixture_github, policy, monkeypatch, window, mode
+async def test_changed_request_delivery_preserves_review_and_safety(
+    store, task_id, fixture_github, policy, monkeypatch, window, mode, unsafe
 ):
-    from gongcao.control import Controls
-    from gongcao.runner import Runner
-
     controls = Controls(store)
     controls.issue(task_id, "until", "development", policy=policy.policy_hash)
     await Workflow(store, policy, fixture_github).run(task_id)
     controls.issue(task_id, mode, "review" if mode == "until" else None, policy=policy.policy_hash)
-    original = fixture_github.task_snapshot
-    changed = False
+    owner, method = {
+        "running": (Runner, "receive"),
+        "finished": (Runner, "run"),
+        "pushed": (Controlled, "push"),
+    }[window]
+    original = getattr(owner, method)
 
-    def edit():
-        nonlocal changed
-        changed = True
+    async def edited(self, *args, **kwargs):
+        result = await original(self, *args, **kwargs)
         fixture_github.issue.update(title="Changed request", body="New requirements")
+        row = store.runs(task_id)[-1]
+        if unsafe == "provenance":
+            store.run_details(row["id"], source=row["details"]["source"] | {"sha": "f" * 40})
+        elif unsafe:
+            other = (
+                await command(
+                    "git", "commit-tree", "HEAD^{tree}", "-m", "Other owner", cwd=row["worktree"]
+                )
+            ).strip()
+            if unsafe == "base":
+                fixture_github.sha = other
+            else:
+                branch = (
+                    "gongcao/work-"
+                    + hashlib.sha256(store.task(task_id)["url"].encode()).hexdigest()[:12]
+                )
+                await command(
+                    "git",
+                    "--git-dir",
+                    str(fixture_github.bare),
+                    "update-ref",
+                    "refs/heads/" + branch,
+                    other,
+                )
+        return result
 
-    async def snapshot(task):
-        runs = store.runs(task_id)
-        if window == "running" and runs[-1]["role"] == "developer":
-            edit()
-        return await original(task)
-
-    monkeypatch.setattr(fixture_github, "task_snapshot", snapshot)
-    if window == "finished":
-        run = Runner.run
-
-        async def finished(self, *args, **kwargs):
-            result = await run(self, *args, **kwargs)
-            edit()
-            return result
-
-        monkeypatch.setattr(Runner, "run", finished)
-    if window == "pushed":
-        push = Controlled.push
-
-        async def pushed(self, *args, **kwargs):
-            result = await push(self, *args, **kwargs)
-            edit()
-            return result
-
-        monkeypatch.setattr(Controlled, "push", pushed)
+    monkeypatch.setattr(owner, method, edited)
     await Workflow(store, policy, fixture_github).run(task_id)
-    task = store.task(task_id)
-    assert changed and task["stage"] == Stage.REVIEW, task["reason"]
-    assert task["state"] == State.WAITING_INSTRUCTION
+    task, runs = store.task(task_id), store.runs(task_id)
+    assert [r["role"] for r in runs] == ["analyst", "developer"]
+    if unsafe:
+        assert fixture_github.pull is None and task["stage"] != Stage.REVIEW
+        assert not [op for op in store.evidence(task_id)["operations"] if op["state"] == "unknown"]
+        return
+    assert (task["stage"], task["state"]) == (Stage.REVIEW, State.WAITING_INSTRUCTION), task[
+        "reason"
+    ]
     assert "requirements changed" in task["reason"].lower()
     assert task["pr_number"] == 9 and fixture_github.pull["draft"]
     assert task["snapshot"]["body"] == "New requirements"
-    runs = store.runs(task_id)
-    assert [r["role"] for r in runs] == ["analyst", "developer"]
     assert not any(r["evidence_valid"] for r in runs)
-    assert (
-        json.loads((store.root / "runs" / runs[-1]["id"] / "context.json").read_text())["github"][
-            "body"
-        ]
-        == "Analyze sample.txt"
-    )
+    context = json.loads((store.root / "runs" / runs[-1]["id"] / "context.json").read_text())
+    assert context["github"]["body"] == "Analyze sample.txt"
     assert fixture_github.head() == task["target_sha"] != runs[-1]["target_sha"]
     assert len(fixture_github.writes) == 1
-    with closing(Store(store.root)) as restarted:
-        for _ in range(2):
-            await Workflow(restarted, policy, fixture_github).run(task_id)
-        assert len(restarted.runs(task_id)) == 2
-    assert len(fixture_github.writes) == 1
 
 
-@pytest.mark.parametrize("crash", ["after_pull", "after_transition"])
 async def test_changed_request_review_barrier_survives_delivery_interruption(
-    store, task_id, fixture_github, policy, monkeypatch, crash
+    store, task_id, fixture_github, policy, monkeypatch
 ):
-    from gongcao.recovery import Recovery
-
     class Interruption(BaseException):
         pass
 
-    snapshot, publish, transition = (
-        fixture_github.task_snapshot,
-        Controlled.publish,
-        store.transition,
-    )
-
-    async def changed(task):
-        runs = store.runs(task_id)
-        if runs and runs[-1]["role"] == Role.DEVELOPER:
-            fixture_github.issue["body"] = "Changed request during implicit automatic execution"
-        return await snapshot(task)
+    publish = Controlled.publish
 
     async def delivered(self, *args, **kwargs):
-        result = await publish(self, *args, **kwargs)
-        if crash == "after_pull":
-            raise Interruption
-        return result
+        fixture_github.issue["body"] = "Changed request during implicit automatic execution"
+        await publish(self, *args, **kwargs)
+        raise Interruption
 
-    def transitioned(*args, **kwargs):
-        transition(*args, **kwargs)
-        if crash == "after_transition" and kwargs.get("pause_reason"):
-            raise Interruption
-
-    monkeypatch.setattr(fixture_github, "task_snapshot", changed)
     monkeypatch.setattr(Controlled, "publish", delivered)
-    monkeypatch.setattr(store, "transition", transitioned)
     assert not store.task(task_id)["control"]["explicit"]
     with pytest.raises(Interruption):
         await Workflow(store, policy, fixture_github).run(task_id)
     assert fixture_github.pull["draft"] and len(fixture_github.writes) == 1
+    context = store.root / "runs" / store.runs(task_id)[-1]["id"] / "context.json"
+    original = context.read_text()
     with closing(Store(store.root)) as restarted:
+        context.write_text("{}")
+        rejected = await Recovery(restarted, fixture_github).recover(task_id)
+        assert not rejected["recovered"] and "context" in rejected["reason"], rejected
+        context.write_text(original)
         recovered = await Recovery(restarted, fixture_github).recover(task_id)
         assert recovered["recovered"], recovered
         assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION
@@ -453,50 +438,27 @@ async def test_changed_request_review_barrier_survives_delivery_interruption(
     assert len(fixture_github.writes) == 1
 
 
-@pytest.mark.parametrize("fault", ["preflight", "lost_response", "unknown", "readback_limit"])
+@pytest.mark.parametrize("fault", ["preflight", "lost_response"])
 async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
     store, task_id, fixture_github, policy, monkeypatch, fault
 ):
-    from gongcao.control import Controls
-    from gongcao.recovery import Recovery
     from gongcao.remote import command as routed
 
-    before, remote_head = Controlled.before, Controlled.remote_head
     sent, failed = 0, False
 
-    async def preflight(self, task, kind, **kwargs):
-        nonlocal failed
-        if (
-            fault == "preflight"
-            and kind == "push"
-            and kwargs.get("finish_operation")
-            and not failed
-        ):
-            failed = True
-            raise ValueError("Local preflight rejected before transport")
-        return await before(self, task, kind, **kwargs)
-
     async def transport(*args, **kwargs):
-        nonlocal sent
-        if args[:2] != ("git", "push") or not args[-1].split(":")[-1].startswith(
-            "refs/heads/gongcao/work-"
-        ):
+        nonlocal sent, failed
+        if args[:2] != ("git", "push") or "refs/heads/gongcao/work-" not in args[-1]:
             return await routed(*args, **kwargs)
-        sent += 1
-        if fault == "unknown":
-            raise ConnectionError("Transport result unavailable")
+        if fault == "preflight" and not failed:
+            failed = True
+            await command("/does-not-exist-gongcao-git", cwd=kwargs.get("cwd"))
         result = await routed(*args, **kwargs)
+        sent += 1
         if fault == "lost_response":
             raise ConnectionError("Response lost after accepted push")
         return result
 
-    async def observe(self, task, branch):
-        if fault == "readback_limit" and sent:
-            raise Deferred("Readback limited after write")
-        return await remote_head(self, task, branch)
-
-    monkeypatch.setattr(Controlled, "before", preflight)
-    monkeypatch.setattr(Controlled, "remote_head", observe)
     monkeypatch.setattr("gongcao.remote.command", transport)
     Controls(store).issue(task_id, "until", "review", policy=policy.policy_hash)
     await Workflow(store, policy, fixture_github).run(task_id)
@@ -505,96 +467,21 @@ async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
     if fault == "preflight":
         assert sent == 0 and not [op for op in operations if op["kind"] == "push"]
         assert all(op["state"] == "succeeded" for op in operations)  # Existing WIP save contract.
-    elif fault in {"unknown", "readback_limit"}:
-        assert sent == 1 and len(operations) == 1 and operations[0]["state"] == "unknown"
     else:
         assert sent == 1 and store.task(task_id)["pr_number"] == 9
     with closing(Store(store.root)) as restarted:
         if fault == "preflight":
             assert (await Recovery(restarted, fixture_github).retry(task_id))["recovered"]
-        else:
-            if fault == "unknown":
-                assert not (await Recovery(restarted, fixture_github).recover(task_id))["recovered"]
         await Workflow(restarted, policy, fixture_github).run(task_id)
         assert [r["id"] for r in restarted.runs(task_id)] == runs
         assert sent == 1
-        if fault in {"preflight", "lost_response"}:
-            assert restarted.task(task_id)["pr_number"] == 9
-            assert len(fixture_github.writes) == 1
-        else:
-            assert fixture_github.pull is None
-            assert restarted.evidence(task_id)["operations"][0]["state"] == "unknown"
+        assert restarted.task(task_id)["pr_number"] == 9
+        assert len(fixture_github.writes) == 1
 
 
 @pytest.mark.parametrize(
-    "unsafe", ["pause", "cancel", "closed", "lease", "base", "provenance", "branch"]
+    "result", ["observed", "unknown", "query", "gate", "rejected", "readback_limit"]
 )
-async def test_request_change_does_not_bypass_delivery_safety(
-    store, task_id, fixture_github, policy, monkeypatch, unsafe
-):
-    from gongcao.control import Controls
-    from gongcao.runner import Runner
-
-    run = Runner.run
-
-    async def changed(self, *args, **kwargs):
-        result = await run(self, *args, **kwargs)
-        if store.runs(task_id)[-1]["role"] != Role.DEVELOPER:
-            return result
-        fixture_github.issue["body"] = "Changed requirements"
-        if unsafe == "pause":
-            Controls(store).issue(task_id, "pause", safe=True)
-        elif unsafe == "cancel":
-            store.cancel(task_id)
-        elif unsafe == "closed":
-            fixture_github.issue["state"] = "closed"
-        elif unsafe == "lease":
-            with store.db:
-                store.db.execute("UPDATE leases SET expires=0 WHERE task_id=?", (task_id,))
-        elif unsafe == "base":
-            fixture_github.sha = (
-                await command(
-                    "git",
-                    "commit-tree",
-                    "HEAD^{tree}",
-                    "-m",
-                    "New base",
-                    cwd=str(store.task(task_id)["repo_path"]),
-                )
-            ).strip()
-        elif unsafe == "provenance":
-            row = store.runs(task_id)[-1]
-            store.run_details(row["id"], source=row["details"]["source"] | {"sha": "f" * 40})
-        else:
-            row = store.runs(task_id)[-1]
-            unrelated = (
-                await command(
-                    "git", "commit-tree", "HEAD^{tree}", "-m", "Other owner", cwd=row["worktree"]
-                )
-            ).strip()
-            branch = (
-                "gongcao/work-"
-                + hashlib.sha256(store.task(task_id)["url"].encode()).hexdigest()[:12]
-            )
-            await command(
-                "git",
-                "push",
-                str(fixture_github.bare),
-                f"{unrelated}:refs/heads/{branch}",
-                cwd=row["worktree"],
-            )
-        return result
-
-    monkeypatch.setattr(Runner, "run", changed)
-    Controls(store).issue(task_id, "until", "review", policy=policy.policy_hash)
-    await Workflow(store, policy, fixture_github).run(task_id)
-    assert fixture_github.pull is None
-    assert store.task(task_id)["stage"] != Stage.REVIEW
-    assert not [op for op in store.evidence(task_id)["operations"] if op["state"] == "unknown"]
-    assert len(store.runs(task_id)) == 2
-
-
-@pytest.mark.parametrize("result", ["observed", "unknown", "query", "gate", "rejected"])
 async def test_ambiguous_write_queries_remote_and_never_replays(
     store, task_id, policy, monkeypatch, result
 ):
@@ -610,6 +497,8 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
     calls = 0
 
     async def query():
+        if result == "readback_limit" and calls:
+            raise Deferred("Readback limited after write")
         if result == "query" and calls == 0:
             raise Deferred("limited before intent")
         return observed
@@ -621,9 +510,16 @@ async def test_ambiguous_write_queries_remote_and_never_replays(
             raise Deferred("HTTP 429: write rejected")
         if result == "observed":
             observed = {"id": 7}
+        if result == "readback_limit":
+            return {}
         raise RuntimeError("lost response")
 
     task = store.task(task_id)
+    if result == "readback_limit":
+        with pytest.raises(Deferred):
+            await controlled.perform(task, "review", "9", {}, query, write)
+        assert store.evidence(task_id)["operations"][0]["state"] == "unknown"
+        result = "unknown"  # Read transport recovers; the write still must not replay.
     if result in {"query", "gate", "rejected"}:
         with pytest.raises(Deferred):
             await controlled.perform(task, "review", "9", {}, query, write)

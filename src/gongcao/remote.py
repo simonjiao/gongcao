@@ -14,6 +14,7 @@ from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage, State
+from .processes import NotStarted
 from .recovery import Recovery
 from .sandbox import Sandbox
 from .store import Store
@@ -150,8 +151,8 @@ class Controlled:
             writing = True
             try:
                 await write()
-            except Deferred:
-                writing = False  # The transport explicitly rejected this write.
+            except (Deferred, NotStarted):
+                writing = False  # Explicit rejection or OS-confirmed failure to start.
                 raise
             found = await observe()
             if found is None:

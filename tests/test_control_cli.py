@@ -116,6 +116,15 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         assert "requirements changed" in published["reason"].lower()
         assert published["snapshot"]["body"] == "Updated requirements during delivery"
         assert not any(r["evidence_valid"] for r in published["runs"])
+        cli("control", number, "--step", "--config", str(config))
+        drive(Stage.ANALYSIS)
+        cli("control", number, "--until", "review", "--config", str(config))
+        reviewed = drive(Stage.REVIEW)
+        assert [r["role"] for r in reviewed["runs"]] == ["analyst", "developer", "analyst"]
+        assert reviewed["pr_number"] == published["pr_number"]
+        assert reviewed["target_sha"] == published["target_sha"] and reviewed["snapshot"]["draft"]
+        assert all(op["state"] == "succeeded" for op in reviewed["evidence"]["operations"])
+        return
     cli("control", number, "--until", "validation", "--config", str(config))
     reviewed = drive(Stage.VALIDATION)
     assert [r["role"] for r in reviewed["runs"]] == ["analyst", "developer", "analyst", "reviewer"]
