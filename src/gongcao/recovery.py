@@ -169,8 +169,15 @@ class Recovery:
                 )
         await repository(Path(task["repo_path"]), Target.parse(task["url"]))
         runs = self.store.runs(task_id)
+        delivery = self.store.development_output(task)
         for run in runs:
-            if run["state"] == State.COMPLETED and run["evidence_valid"]:
+            delivering = (
+                delivery is not None
+                and delivery["id"] == run["id"]
+                and run["state"] == State.COMPLETED
+            )
+            verify = run["evidence_valid"] or delivering
+            if run["state"] == State.COMPLETED and verify:
                 try:
                     report = AgentResult.model_validate_json(run["result"] or "{}")
                     valid = report.target_sha == run["target_sha"] and report.conclusion in {
@@ -180,23 +187,28 @@ class Recovery:
                 except ValueError:
                     valid = False
                 if not valid:
+                    if delivering:
+                        raise ValueError("Delivery requires a valid original Developer report")
                     with self.store.db:
                         self.store.db.execute(
                             "UPDATE runs SET evidence_valid=0 WHERE id=?", (run["id"],)
                         )
                     run["evidence_valid"] = 0
+                    verify = False
             if run["state"] == State.RUNNING and run["owner_token"] is None:
                 raise ValueError(
                     "Legacy active run has no process identity; cannot confirm cleanup"
                 )
             workspace = run["worktree"]
+            if delivering and (not workspace or not run["context_hash"]):
+                raise ValueError("Delivery run is missing its Worktree or context proof")
             if workspace and not Path(workspace).resolve().is_relative_to(
                 self.store.root / "worktrees"
             ):
                 raise ValueError("Run workspace is outside the allocated root")
-            if workspace and run["evidence_valid"] and not Path(workspace).is_dir():
+            if workspace and verify and not Path(workspace).is_dir():
                 raise ValueError("Allocated run workspace is missing; manual inspection required")
-            if workspace and run["evidence_valid"]:
+            if workspace and verify:
                 head = (await command("git", "rev-parse", "HEAD", cwd=workspace)).strip()
                 parent = run["details"].get("source", {}).get("sha", run["target_sha"])
                 if head != parent:
@@ -211,7 +223,7 @@ class Recovery:
                         raise ValueError(
                             "Worktree HEAD is not the recorded target or controller commit"
                         )
-            if run["context_hash"] and run["evidence_valid"]:
+            if run["context_hash"] and verify:
                 path = self.store.root / "runs" / run["id"] / "context.json"
                 digest = hashlib.sha256(
                     json.dumps(json.loads(path.read_text()), sort_keys=True).encode()

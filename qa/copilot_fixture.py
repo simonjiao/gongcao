@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -120,6 +121,7 @@ class OfflineGitHub(GitHub):
             self.data["pull"]["draft"] = False
             result: dict[str, Any] = {"data": {}}
         elif "/comments" in path:
+            self.data["issue"]["updated_at"] = datetime.now(UTC).isoformat()
             rows = self.data.setdefault("status_comments", [])
             if method == "POST":
                 result = {
@@ -136,6 +138,8 @@ class OfflineGitHub(GitHub):
             result = payload | {"id": len(self.data["reviews"]) + 1, "state": "COMMENTED"}
             self.data["reviews"].append(result)
         else:
+            if self.data.get("edit_request_on_pull"):
+                self.data["issue"].update(body="Updated requirements during delivery")
             self.data["pull"] = self.data["issue"] | {
                 "url": "https://github.com/example/demo/pull/9",
                 "kind": "pull",

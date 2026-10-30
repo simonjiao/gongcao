@@ -304,20 +304,28 @@ class Controls:
                 self.checkpoint(task_id)
             return True
 
-    def invalidate(self, task_id: int, reason: str) -> None:
+    def invalidate(self, task_id: int, reason: str, *, required_pause: bool = False) -> None:
         """Called within the snapshot/policy transaction; uncertain work keeps its state."""
         with self.transaction():
             task = self.store.task(task_id)
             control = task["control"]
+            if not control and required_pause:
+                self.initialize(task_id, mode="pause")
+                control = self.store.task(task_id)["control"]
             if not control:
                 return  # Migrated manual tasks retain their historical auto behavior.
-            explicit = control.get("explicit", False)
-            if explicit and (command_id := control.get("command_id")):
+            explicit = control.get("explicit", False) or required_pause
+            if (
+                explicit
+                and (command_id := control.get("command_id"))
+                and not (required_pause and control.get("spent"))
+            ):
                 self.mark(task_id, command_id, "stale", reason)
             self.save(
                 task_id,
                 control
                 | {
+                    "explicit": explicit,
                     "pause_requested": explicit,
                     "spent": explicit,
                     "since": time.time(),

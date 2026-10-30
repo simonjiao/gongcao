@@ -19,7 +19,7 @@ from gongcao.github import Deferred, GitHub
 from gongcao.github import command as git_command
 from gongcao.leases import Lease, identity, session_alive
 from gongcao.model import AgentResult, Role, Stage, State
-from gongcao.processes import CleanupError, launch, stop
+from gongcao.processes import CleanupError, NotStarted, launch, stop
 from gongcao.recovery import Recovery, diagnose
 from gongcao.remote import Controlled
 from gongcao.runner import Runner
@@ -123,8 +123,9 @@ async def test_heartbeat_renews_and_late_results_require_the_original_owner(stor
 
 async def test_pending_spawn_blocks_fresh_execution_but_failed_exec_is_settled(store, task_id):
     async with Lease(store, task_id) as lease:
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(NotStarted) as failure:
             await launch("/does-not-exist-gongcao")
+        assert isinstance(failure.value.__cause__, FileNotFoundError)
         assert store.db.execute("SELECT state FROM processes").fetchone()[0] == "stopped"
         lease.intent("bwrap")
     async with Lease(store, task_id) as again:

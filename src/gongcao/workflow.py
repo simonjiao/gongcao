@@ -47,6 +47,10 @@ class Workflow:
         return self.store.guard(current)
 
     def cached_run(self, task: dict[str, Any], role: Role) -> dict[str, Any] | None:
+        if role == Role.DEVELOPER:
+            delivery = self.store.development_output(task)
+            if delivery and delivery["state"] == State.COMPLETED:
+                return delivery
         rows = [
             run
             for run in self.store.runs(task["id"])
@@ -124,6 +128,7 @@ class Workflow:
             run["role"] != Role.DEVELOPER
             or run["state"] == State.RUNNING
             or run["details"].get("save", {}).get("state") in {"confirmed", "unchanged"}
+            or run["details"].get("source", {}).get("baseline") != baseline(task)
         ):
             return
         try:
@@ -189,6 +194,8 @@ class Workflow:
             snapshot, number = await self.remote.publish(current, run)
             if snapshot.get("head_sha") is None or snapshot["state"] != "open":
                 raise UncertainWrite("Published PR is not open at a confirmed head")
+            current = self.store.task(task["id"])
+            changed = self.store.runs(task["id"])[-1]["details"].get("delivery_changed")
             self.store.transition(
                 self.safe(current, complete=True),
                 Stage.REVIEW,
@@ -196,6 +203,11 @@ class Workflow:
                 "Controller commit and PR confirmed on GitHub",
                 snapshot=snapshot,
                 pr_number=number,
+                pause_reason=(
+                    "Requirements changed; draft PR awaits current-request review"
+                    if changed
+                    else None
+                ),
             )
             return
         if stage == Stage.REVIEW:

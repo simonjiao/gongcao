@@ -32,6 +32,10 @@ def completed(process: asyncio.subprocess.Process) -> None:
         current.stopped(process.pid)
 
 
+class NotStarted(OSError):
+    """The OS rejected process creation; the command never executed."""
+
+
 async def launch(
     *args: str, cwd: str | None = None, stdin: int | None = None, limit: int = 65536
 ) -> asyncio.subprocess.Process:
@@ -52,12 +56,12 @@ async def launch(
             start_new_session=True,
             limit=limit,
         )
-    except OSError:
+    except OSError as exc:
         # asyncio/Popen settles a failed exec before raising OSError. A hard crash
         # or cancellation before attachment leaves the durable pending intent intact.
         if current:
             current.aborted(key)
-        raise
+        raise NotStarted(str(exc)) from exc
     if current:
         try:
             current.attached(key, process.pid)

@@ -14,6 +14,7 @@ from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
 from .model import VERSION_FIELDS, Role, Stage, State
+from .processes import NotStarted
 from .recovery import Recovery
 from .sandbox import Sandbox
 from .store import Store
@@ -50,11 +51,12 @@ class Controlled:
         target = Target.parse(expected["url"])
         recovery = Recovery(self.store, self.github)
         latest = verified if verified is not None else await recovery.sync(expected)
+        expected = self.delivery_version(expected, kind)
+        current = self.store.task(expected["id"])
         if latest.get("head_sha", expected["target_sha"]) != expected["target_sha"] or any(
             latest.get(key) != expected["snapshot"].get(key) for key in VERSION_FIELDS
         ):
             raise UncertainWrite("Remote target changed before a controlled write")
-        current = self.store.task(expected["id"])
         if kind != "checkpoint" and not finish_operation:
             current = await self.instruction_checkpoint(expected)
         guard = self.store.save_guard if kind == "checkpoint" else self.store.guard
@@ -73,7 +75,7 @@ class Controlled:
         }
         if current["stage"] not in allowed[kind] or latest["state"] != "open":
             raise ValueError("This stage does not authorize the requested GitHub mutation")
-        if kind == "checkpoint" and not current["pr_number"]:
+        if kind in {"checkpoint", "push", "pull"} and not current["pr_number"]:
             if (recovery.base_sha or await recovery.default_base(current)) != current["target_sha"]:
                 raise UncertainWrite("Issue baseline changed before saving output")
         repo = recovery.repo
@@ -98,6 +100,25 @@ class Controlled:
             f"{task['url']}:{kind}:{task['target_sha']}:{object_id}".encode()
         ).hexdigest()
 
+    def delivery_version(self, expected: dict[str, Any], kind: str) -> dict[str, Any]:
+        current = self.store.task(expected["id"])
+        if (
+            kind in {"push", "pull"}
+            and self.store.development_output(expected)
+            and self.store.development_output(current)
+        ):
+            return current
+        return expected
+
+    def write_guard(self, expected: dict[str, Any], kind: str) -> dict[str, Any]:
+        if kind == "checkpoint":
+            return self.store.save_guard(expected)
+        controls = Controls(self.store)
+        controls.apply_pending(expected["id"], self.config)
+        if not controls.revalidate(expected["id"], self.config):
+            raise Paused("Paused before sending a controlled write")
+        return self.store.guard(self.delivery_version(expected, kind))
+
     async def perform(
         self,
         task: dict[str, Any],
@@ -108,6 +129,7 @@ class Controlled:
         write: Callable[[], Awaitable[dict[str, Any]]],
         *,
         verified: dict[str, Any] | None = None,
+        preflight: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         task = await self.before(task, kind, verified=verified)
         key = self.identity(task, kind, object_id)
@@ -122,13 +144,25 @@ class Controlled:
                 raise UncertainWrite(
                     "Existing write intent is not confirmed remotely; refusing replay"
                 )
-            await self.before(task, kind, finish_operation=True)
+            task = await self.before(task, kind, finish_operation=True)
+            if preflight is not None:
+                await preflight(task)
+            task = self.write_guard(task, kind)
             writing = True
-            await write()
+            try:
+                await write()
+            except (Deferred, NotStarted):
+                writing = False  # Explicit rejection or OS-confirmed failure to start.
+                raise
+            found = await observe()
+            if found is None:
+                raise UncertainWrite("Write returned but remote state did not confirm its result")
         except Deferred:
             # This newly created intent has no accepted write. Older ambiguous
             # intents never reach here: they must reconcile above, without replay.
-            if created:
+            if writing:
+                self.store.operation_result(key, "unknown", None)
+            elif created:
                 with self.store.db:
                     self.store.db.execute(
                         "DELETE FROM operations WHERE id=? AND state='pending'", (key,)
@@ -136,6 +170,11 @@ class Controlled:
             raise
         except BaseException as exc:
             if not writing:
+                if created:
+                    with self.store.db:
+                        self.store.db.execute(
+                            "DELETE FROM operations WHERE id=? AND state='pending'", (key,)
+                        )
                 raise
             self.store.operation_result(
                 key, "unknown", {"error": Redactor().text(f"{type(exc).__name__}: {exc}")}
@@ -159,10 +198,6 @@ class Controlled:
             if current_task is not None and current_task.cancelling():
                 raise asyncio.CancelledError from None
             return found
-        found = await observe()
-        if found is None:
-            self.store.operation_result(key, "unknown", None)
-            raise UncertainWrite("Write returned but remote state did not confirm its result")
         self.store.operation_result(key, "succeeded", found)
         return found
 
@@ -193,18 +228,21 @@ class Controlled:
                 raise UncertainWrite("Remote branch contains an unexpected commit")
             return None
 
-        async def write() -> dict[str, Any]:
-            expected = await self.remote_head(task, branch)
+        expected: str | None = None
+
+        async def preflight(current: dict[str, Any]) -> None:
+            nonlocal expected
+            expected = await self.remote_head(current, branch)
             if expected is not None and expected != expected_parent:
                 raise UncertainWrite("Remote branch moved before push")
             if expected:
                 ancestor = (
-                    await command("git", "merge-base", expected, head, cwd=task["repo_path"])
+                    await command("git", "merge-base", expected, head, cwd=current["repo_path"])
                 ).strip()
                 if ancestor != expected:
                     raise UncertainWrite("Publication must fast-forward the confirmed remote head")
-            guard = self.store.save_guard if kind == "checkpoint" else self.store.guard
-            guard(task)
+
+        async def write() -> dict[str, Any]:
             await command(
                 "git",
                 "push",
@@ -215,7 +253,7 @@ class Controlled:
             )
             return payload
 
-        return await self.perform(task, kind, branch, payload, observed, write)
+        return await self.perform(task, kind, branch, payload, observed, write, preflight=preflight)
 
     async def commit(self, task: dict[str, Any], run: dict[str, Any]) -> str:
         workspace = Path(run["worktree"]).resolve()
@@ -344,14 +382,20 @@ class Controlled:
             if row["id"] == run["id"]
             and row["role"] == Role.DEVELOPER
             and row["state"] == "completed"
-            and row["evidence_valid"]
+            and (row["evidence_valid"] or self.store.development_output(task))
             and row["target_sha"] == task["target_sha"]
         ]
-        if not valid or json.loads(valid[0]["result"])["conclusion"] != "ready":
+        if not valid or any(
+            json.loads(valid[0]["result"]).get(key) != value
+            for key, value in (("conclusion", "ready"), ("target_sha", task["target_sha"]))
+        ):
             raise ValueError("Publishing requires a confirmed developer result for this target")
         run = valid[0]
         task = await self.before(task, "push")
-        source = await self.source(task)
+        original = task | {
+            "snapshot": run["details"].get("source", {}).get("request", task["snapshot"])
+        }
+        source = await self.source(original)
         expected = run["details"].get("source", {}).get("sha", task["target_sha"])
         saved = run["details"].get("save", {})
         if source["sha"] != expected and not (
@@ -386,9 +430,15 @@ class Controlled:
             updated = await self.github.task_snapshot(task)
             if updated["head_sha"] != head or any(
                 updated.get(key) != snapshot.get(key)
-                for key in ("title", "body", "base_sha", "base_ref", "base_repository")
+                for key in VERSION_FIELDS
+                if key not in {"title", "body"}
             ):
                 raise UncertainWrite("Published PR head moved before confirmation")
+            self.store.sync(
+                task["id"],
+                self.store.task(task["id"])["snapshot"]
+                | {key: updated.get(key) for key in ("title", "body", "state")},
+            )
             return updated, task["pr_number"]
         repository_name = snapshot["repository"]
         key = self.identity(task, "pull", branch)
@@ -397,7 +447,7 @@ class Controlled:
             "head": branch,
             "base": base_ref,
             "draft": True,
-            "title": snapshot["title"],
+            "title": original["snapshot"]["title"],
             "body": f"Implements {task['url']}\n\n{tag}",
         }
 
@@ -422,20 +472,33 @@ class Controlled:
                 raise UncertainWrite("Existing PR version differs from the publication intent")
             return {"number": pulls[0]["number"]}
 
-        async def create() -> dict[str, Any]:
-            if await self.remote_head(task, branch) != head:
+        async def preflight(current: dict[str, Any]) -> None:
+            if await self.remote_head(current, branch) != head:
                 raise UncertainWrite("Remote branch moved before PR creation")
+
+        async def create() -> dict[str, Any]:
             return await self.github.mutate(f"repos/{repository_name}/pulls", payload)
 
-        result = await self.perform(task, "pull", branch, payload, existing, create)
+        result = await self.perform(
+            task, "pull", branch, payload, existing, create, preflight=preflight
+        )
         temporary = task | {"pr_number": result["number"]}
         updated = await self.github.task_snapshot(temporary)
         if (
             updated["head_sha"] != head
             or updated["base_sha"] != task["target_sha"]
-            or any(updated.get(key) != snapshot.get(key) for key in ("title", "body"))
+            or updated["base_ref"] != base_ref
+            or updated["head_ref"] != branch
+            or updated["base_repository"] != repository_name
+            or updated["head_repository"] != repository_name
+            or not updated["draft"]
         ):
             raise UncertainWrite("PR head moved before confirmation")
+        self.store.sync(
+            task["id"],
+            self.store.task(task["id"])["snapshot"]
+            | {key: updated.get(key) for key in ("title", "body", "state")},
+        )
         return updated, result["number"]
 
     async def review(

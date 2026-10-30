@@ -365,8 +365,7 @@ async def test_cancel_after_checkpoint_intent_retains_commit_without_pushing(
     assert saved["state"] == "pending"
     assert (await command("git", "rev-parse", "HEAD", cwd=run["worktree"])).strip() == saved["sha"]
     operations = store.evidence(task_id)["operations"]
-    assert len(operations) == 1
-    assert operations[0]["state"] == ("pending" if arrival == "before_write" else "unknown")
+    assert operations == []  # Both cancellations happen before the Git write transport.
     assert Path(run["worktree"], "sample.txt").read_text() == "partial work\n"
     assert fixture_github.pull is None
     assert not await command(
