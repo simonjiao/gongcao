@@ -41,9 +41,9 @@ class TerminalFormatter(logging.Formatter):
 
 
 @contextmanager
-def terminal_logging() -> Iterator[None]:
+def terminal_logging(handler: logging.Handler | None = None) -> Iterator[None]:
     logger = logging.getLogger("gongcao")
-    handler = logging.StreamHandler()
+    handler = handler if handler is not None else logging.StreamHandler()
     handler.setFormatter(
         TerminalFormatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     )
