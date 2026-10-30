@@ -49,8 +49,7 @@ class Workflow:
     def cached_run(self, task: dict[str, Any], role: Role) -> dict[str, Any] | None:
         if role == Role.DEVELOPER:
             delivery = self.store.development_output(task)
-            if delivery and delivery["state"] == State.COMPLETED:
-                return delivery
+            return delivery if delivery and delivery["state"] == State.COMPLETED else None
         rows = [
             run
             for run in self.store.runs(task["id"])

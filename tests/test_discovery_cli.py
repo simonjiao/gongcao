@@ -123,6 +123,10 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
         assert json.loads(fixture.read_text())["writes"] == writes
     data = json.loads(fixture.read_text())
     assert data.get("clones", 0) == (0 if continuous else 1)
-    assert len(data["status_comments"]) == len(issues) and not data.get("pull")
+    claims = [c for c in data["status_comments"] if "<!-- gongcao:" in c["body"]]
+    progress = [c for c in data["status_comments"] if "<!-- gongcao-progress:" in c["body"]]
+    assert len(claims) == len(progress) == len(issues) and not data.get("pull")
+    assert all("claim pending confirmation" in c["body"] for c in claims)
+    assert all(w["method"] == "POST" for w in data["writes"])
     assert all(t["control"]["source"] == "discovery" and not t["runtime"]["lease"] for t in after)
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True) == head

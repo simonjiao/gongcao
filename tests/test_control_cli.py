@@ -30,6 +30,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
                 "reviews": [],
                 "writes": [],
                 "edit_request_on_pull": edit_request,
+                "blocked_delivery": edit_request,
             }
         )
     )
@@ -113,6 +114,9 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
     assert published["pr_number"] == 9 and published["target_sha"] != sha
     assert [r["role"] for r in published["runs"]] == ["analyst", "developer"]
     if edit_request:
+        report = json.loads(published["runs"][-1]["result"])
+        assert report["conclusion"] == "blocked" and report["delivery_complete"] is True
+        assert "NOT_RUN: missing acceptance package" in published["snapshot"]["pull_body"]
         assert "requirements changed" in published["reason"].lower()
         assert published["snapshot"]["body"] == "Updated requirements during delivery"
         assert not any(r["evidence_valid"] for r in published["runs"])
@@ -124,6 +128,9 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         assert reviewed["pr_number"] == published["pr_number"]
         assert reviewed["target_sha"] == published["target_sha"] and reviewed["snapshot"]["draft"]
         assert all(op["state"] == "succeeded" for op in reviewed["evidence"]["operations"])
+        before = fixture.read_text()
+        cli("serve", "--once", "--config", str(config))
+        assert fixture.read_text() == before
         return
     cli("control", number, "--until", "validation", "--config", str(config))
     reviewed = drive(Stage.VALIDATION)

@@ -337,12 +337,22 @@ async def test_metadata_refresh_during_push_delivers_one_draft(
         ("finished", "until", "base"),
         ("finished", "until", "provenance"),
         ("finished", "until", "branch"),
+        ("finished_blocked", "until", ""),
     ],
 )
 async def test_changed_request_delivery_preserves_review_and_safety(
     store, task_id, fixture_github, policy, monkeypatch, window, mode, unsafe
 ):
     controls = Controls(store)
+    if window == "finished_blocked":
+        install_worker(
+            monkeypatch,
+            WORKER.replace(
+                "'conclusion':conclusion",
+                "'conclusion':'blocked' if role=='developer' else conclusion,"
+                "'delivery_complete':True if role=='developer' else None",
+            ),
+        )
     controls.issue(task_id, "until", "development", policy=policy.policy_hash)
     await Workflow(store, policy, fixture_github).run(task_id)
     controls.issue(task_id, mode, "review" if mode == "until" else None, policy=policy.policy_hash)
@@ -350,7 +360,7 @@ async def test_changed_request_delivery_preserves_review_and_safety(
         "running": (Runner, "receive"),
         "finished": (Runner, "run"),
         "pushed": (Controlled, "push"),
-    }[window]
+    }[window.replace("_blocked", "")]
     original = getattr(owner, method)
 
     async def edited(self, *args, **kwargs):
@@ -438,12 +448,21 @@ async def test_changed_request_review_barrier_survives_delivery_interruption(
     assert len(fixture_github.writes) == 1
 
 
-@pytest.mark.parametrize("fault", ["preflight", "lost_response"])
+@pytest.mark.parametrize("fault", ["preflight", "lost_response", "acceptance_blocked"])
 async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
     store, task_id, fixture_github, policy, monkeypatch, fault
 ):
     from gongcao.remote import command as routed
 
+    if fault == "acceptance_blocked":
+        install_worker(
+            monkeypatch,
+            WORKER.replace(
+                "'conclusion':conclusion",
+                "'conclusion':'blocked' if role=='developer' else conclusion,"
+                "'delivery_complete':True if role=='developer' else None",
+            ).replace("'Check controller gates'", "'NOT_RUN: missing acceptance package'"),
+        )
     sent, failed = 0, False
 
     async def transport(*args, **kwargs):
@@ -477,6 +496,61 @@ async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
         assert sent == 1
         assert restarted.task(task_id)["pr_number"] == 9
         assert len(fixture_github.writes) == 1
+        if fault == "acceptance_blocked":
+            report = json.loads(restarted.runs(task_id)[-1]["result"])
+            assert report["conclusion"] == "blocked" and report["delivery_complete"] is True
+            assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION
+            assert all(
+                text in fixture_github.pull["body"]
+                for text in (
+                    "NOT_RUN",
+                    "missing acceptance package",
+                    runs[-1],
+                    "Agent report",
+                    "Controller",
+                )
+            )
+            install_worker(
+                monkeypatch,
+                WORKER.replace(
+                    "plan = propose(data) if role=='analyst' else []",
+                    "plan = propose(data) if role=='analyst' else []\n"
+                    "for item in plan:\n"
+                    "    if item['category']=='internal': "
+                    "item.update(entry=[],reason='Missing acceptance package')",
+                ),
+            )
+            Controls(restarted).issue(task_id, "until", "validation", policy=policy.policy_hash)
+            await Workflow(restarted, policy, fixture_github).run(task_id)
+            assert restarted.task(task_id)["state"] == State.WAITING_ENVIRONMENT
+            assert (
+                restarted.task(task_id)["stage"] != Stage.MERGEABLE and fixture_github.pull["draft"]
+            )
+
+
+@pytest.mark.parametrize(
+    "conclusion,complete",
+    [("blocked", None), ("blocked", False), ("failed", True), ("ready", False)],
+)
+async def test_incomplete_developer_report_cannot_deliver(
+    store, task_id, fixture_github, policy, monkeypatch, conclusion, complete
+):
+    field = (
+        ""
+        if complete is None
+        else f"'delivery_complete':{complete} if role=='developer' else None,"
+    )
+    install_worker(
+        monkeypatch,
+        WORKER.replace(
+            "'conclusion':conclusion",
+            f"{field}'conclusion':'{conclusion}' if role=='developer' else conclusion",
+        ),
+    )
+    await Workflow(store, policy, fixture_github).run(task_id)
+    assert store.runs(task_id)[-1]["role"] == Role.DEVELOPER
+    assert store.task(task_id)["state"] == State.HUMAN
+    assert fixture_github.pull is None and fixture_github.writes == []
 
 
 @pytest.mark.parametrize(

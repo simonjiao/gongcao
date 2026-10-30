@@ -116,7 +116,7 @@ class OfflineGitHub(GitHub):
     async def mutate(
         self, path: str, payload: dict[str, Any], *, method: str = "POST"
     ) -> dict[str, Any]:
-        self.data["writes"].append({"path": path, "payload": payload})
+        self.data["writes"].append({"path": path, "payload": payload, "method": method})
         if path == "graphql":
             self.data["pull"]["draft"] = False
             result: dict[str, Any] = {"data": {}}
@@ -201,6 +201,12 @@ def main() -> None:
     def argv(self: Sandbox, *payload: str) -> list[str]:
         if payload[1:3] == ("-m", "gongcao.worker"):
             worker = ("import time; time.sleep(3)\n" if fixture.data.get("slow") else "") + WORKER
+            if fixture.data.get("blocked_delivery"):
+                worker = worker.replace(
+                    "'conclusion':'ready'",
+                    "'conclusion':'blocked' if data['role']=='developer' else 'ready',"
+                    "'delivery_complete':True if data['role']=='developer' else None",
+                ).replace("'Check gates'", "'NOT_RUN: missing acceptance package'")
             payload = (sys.executable, "-c", worker)
         return original_argv(self, *payload)
 

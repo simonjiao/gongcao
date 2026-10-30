@@ -14,11 +14,11 @@ from typing import Any, TextIO
 from urllib.parse import urlencode
 
 from .config import Config, Source
-from .control import baseline
+from .control import Controls, baseline
 from .events import Redactor, task_event
 from .github import Deferred, GitHub, Target, background
 from .model import Stage, State
-from .processes import CleanupError
+from .processes import CleanupError, NotStarted
 from .recovery import Recovery
 from .store import Store
 from .workspace import clone_prefix, prepare_repository
@@ -73,22 +73,22 @@ class Discovery:
         self.save(key, dirty=1, reason=message)
         row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
         if row and row["task_id"]:
-            data = json.loads(row["data"])
-            digest = hashlib.sha256(self.render(dict(row)).encode()).hexdigest()
-            previous = data.get("status_retry", {})
-            failures = previous.get("failures", 0) + 1 if previous.get("digest") == digest else 1
-            data["status_retry"] = {
-                "digest": digest,
-                "failures": failures,
-                "next_at": time.time() + min(300, 5 * 2 ** min(failures, 6)),
-            }
-            self.save(key, data=json.dumps(data))
+
+            def failed(data: dict[str, Any]) -> None:
+                previous = data.get("status_retry", {})
+                failures = previous.get("failures", 0) + 1
+                data["status_retry"] = {
+                    "failures": failures,
+                    "next_at": time.time() + min(300, 5 * 2 ** min(failures, 6)),
+                }
+
+            self.store.claim_data(key, failed)
 
     def due(self, key: str) -> bool:
         row = self.store.db.execute("SELECT * FROM claims WHERE url=?", (key,)).fetchone()
         if row and row["task_id"]:
             retry = json.loads(row["data"]).get("status_retry", {})
-            if retry.get("digest") == hashlib.sha256(self.render(dict(row)).encode()).hexdigest():
+            if retry:
                 return bool(retry["next_at"] <= time.time())
         return self.retry.get(key, (0, 0))[1] <= time.monotonic()
 
@@ -542,10 +542,10 @@ class Discovery:
                 source.mode,
             )
 
-    def render(self, row: dict[str, Any]) -> str:
-        task = self.store.task(row["task_id"])
+    def render(self, row: dict[str, Any], event: dict[str, Any] | None = None) -> str:
+        task = event["task"] if event else self.store.task(row["task_id"])
         control = task["control"]
-        runs = self.store.runs(task["id"])
+        runs = event["runs"] if event else self.store.runs(task["id"])
         retry_available = bool(
             runs and runs[-1]["details"].get("source", {}).get("baseline") == baseline(task)
         )
@@ -568,9 +568,13 @@ class Discovery:
             if task["stage"] == Stage.MERGEABLE
             else task["reason"][:2000] or "Controller will advance within the configured policy"
         )
-        marker: str = json.loads(row["data"])["marker"]
+        marker = (
+            f"<!-- gongcao-progress:{event['id']} -->"
+            if event
+            else json.loads(row["data"])["marker"]
+        )
         body = (
-            marker + "\n**Gongcao**\n"
+            marker + f"\n**Gongcao** · Task `{task['id']}`\n"
             f"Stage: `{task['stage']}` · State: `{task['state']}`\n"
             f"Mode: `{control['mode']}` · Until: `{control.get('target') or '-'}`\n"
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
@@ -635,7 +639,7 @@ class Discovery:
                 )
         quality = [
             a["data"]
-            for a in self.store.evidence(task["id"])["artifacts"]
+            for a in (event["artifacts"] if event else self.store.evidence(task["id"])["artifacts"])
             if a["kind"] == "quality-results" and a["valid"] and a["sha"] == task["target_sha"]
         ]
         if quality:
@@ -671,7 +675,7 @@ class Discovery:
             background.reset(token)
 
     async def _publish_locked(self, row: dict[str, Any]) -> None:
-        # Foreground handoff and the background ticker must share the same PATCH intent.
+        # Foreground handoff and the background ticker share one persistent event queue.
         key = hashlib.sha256(row["url"].encode()).hexdigest()
         with (self.store.root / f"status-{key}.lock").open("a") as lock:
             while True:
@@ -684,9 +688,7 @@ class Discovery:
                 "SELECT * FROM claims WHERE url=?", (row["url"],)
             ).fetchone()
             await self._publish(dict(current))
-            data = json.loads(current["data"])
-            if data.pop("status_retry", None) is not None:
-                self.save(row["url"], data=json.dumps(data))
+            self.store.claim_data(row["url"], lambda data: data.pop("status_retry", None))
 
     async def _publish(self, row: dict[str, Any]) -> None:
         item = await self.owned(row)
@@ -699,30 +701,92 @@ class Discovery:
             row.update(confirmed=item["body"], intent="")
         if item["body"] != row["confirmed"]:
             raise ValueError("Owned status comment was edited outside the recorded intent")
-        body = self.render(row)
-        if item["body"] != body:
-            self.save(row["url"], intent=body)
-            row["intent"] = body
-            target = Target.parse(row["url"])
-            try:
-                await self.github.mutate(
-                    f"repos/{target.repository}/issues/comments/{item['id']}",
-                    {"body": body},
-                    method="PATCH",
+        while True:
+            with Controls(self.store).transaction():
+                data = json.loads(
+                    self.store.db.execute(
+                        "SELECT data FROM claims WHERE url=?", (row["url"],)
+                    ).fetchone()[0]
                 )
-            except Deferred:
-                self.save(row["url"], intent="")
-                raise
-            except Exception:
-                observed = await self.owned(row)
-                if observed is None or observed["body"] != body:
+                queue = data.get("progress", [])
+                if not queue:
+                    self.store.db.execute(
+                        "UPDATE claims SET dirty=0,reason='' WHERE url=?", (row["url"],)
+                    )
+                    return
+            event = queue[0]
+            body = event.get("body") or self.render(row, event)
+
+            async def observe(
+                event: dict[str, Any] = event, body: str = body, actor: str = data["actor"]
+            ) -> dict[str, Any] | None:
+                matches = [
+                    c
+                    for c in await self.github.instructions({"url": row["url"]})
+                    if f"<!-- gongcao-progress:{event['id']} -->" in (c.get("body") or "")
+                ]
+                if len(matches) > 1 or (
+                    matches
+                    and (
+                        matches[0]["body"] != body
+                        or matches[0]["user"]["login"].lower() != actor
+                        or matches[0]["user"].get("id") != item["user"].get("id")
+                        or (
+                            event.get("comment_id") is not None
+                            and matches[0]["id"] != event["comment_id"]
+                        )
+                    )
+                ):
+                    raise ValueError("Progress POST ownership/content is not uniquely confirmed")
+                return matches[0] if matches else None
+
+            observed = await observe()
+            if observed is None:
+                if event["attempted"]:
+                    raise ValueError("Unconfirmed progress POST; refusing replay")
+
+                def attempt(current: dict[str, Any], body: str = body) -> None:
+                    current["progress"][0].update(body=body, attempted=True)
+
+                self.store.claim_data(row["url"], attempt)
+                target = Target.parse(row["url"])
+                try:
+                    response = await self.github.mutate(
+                        f"repos/{target.repository}/issues/{target.number}/comments", {"body": body}
+                    )
+                    event["comment_id"] = response["id"]
+
+                    def received(current: dict[str, Any], comment_id: int = response["id"]) -> None:
+                        current["progress"][0]["comment_id"] = comment_id
+
+                    self.store.claim_data(row["url"], received)
+                except (Deferred, NotStarted):
+                    self.store.claim_data(
+                        row["url"], lambda d: d["progress"][0].update(attempted=False)
+                    )
                     raise
-            else:
-                observed = await self.owned(row | {"intent": "", "confirmed": body})
-            if observed is None or observed["body"] != body:
-                raise ValueError("Status PATCH was not confirmed")
-            self.save(row["url"], confirmed=body, intent="", reason="")
-        self.save(row["url"], dirty=int(self.render(row) != body))
+                except Exception:
+                    observed = await observe()
+                    if observed is None:
+                        raise
+                else:
+                    observed = await observe()
+                if observed is None:
+                    raise ValueError("Progress POST was not confirmed; refusing replay")
+
+            assert observed is not None
+
+            def confirm(
+                current: dict[str, Any],
+                event_id: str = event["id"],
+                comment_id: int = observed["id"],
+            ) -> None:
+                if current["progress"][0]["id"] != event_id:
+                    raise ValueError("Progress queue changed before confirmation")
+                current["progress"].pop(0)
+                current["progress_last"] = {"event_id": event_id, "comment_id": comment_id}
+
+            self.store.claim_data(row["url"], confirm)
 
     async def refresh(self, task_id: int) -> None:
         """Publish only this task's dirty status; an active serve owns its own refresh."""

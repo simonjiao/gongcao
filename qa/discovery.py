@@ -207,6 +207,7 @@ def verify(data: dict[str, Any], actor: str) -> None:
         require(
             row["task_id"] and not row["intent"] and not row["dirty"], "Claim/status is unconfirmed"
         )
+        require(not json.loads(row["data"]).get("progress"), "Progress queue is unconfirmed")
         require(
             comment["id"] == row["comment_id"]
             and comment["user"]["login"] == actor
@@ -221,7 +222,8 @@ async def cleanup_extras(run: Run, github: GitHub) -> None:
     try:
         require(
             not store.db.execute(
-                "SELECT 1 FROM claims WHERE intent!='' OR (task_id IS NULL AND confirmed='')"
+                "SELECT 1 FROM claims WHERE intent!='' OR (task_id IS NULL AND confirmed='') "
+                "OR COALESCE(json_array_length(data,'$.progress'),0)>0"
             ).fetchone(),
             "Discovery writes need reconciliation before cleanup",
         )
@@ -287,6 +289,10 @@ async def reconcile_claims(run: Run, github: GitHub) -> None:
                 raise Unconfirmed("Claim write remains unconfirmed; refusing cleanup")
             publisher.save(
                 row["url"], comment_id=item["id"], confirmed=expected, intent="", reason=""
+            )
+            require(
+                not json.loads(row["data"]).get("progress"),
+                "Progress needs reconciliation before cleanup",
             )
             confirmed.append({"url": row["url"], "comment_id": item["id"], "body": expected})
         run.archive("discovery-claim-reconciliation", confirmed)
