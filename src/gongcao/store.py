@@ -156,6 +156,8 @@ class Store:
         task, runs = self.task(task_id), self.runs(task_id)
         settled = [r for r in runs if r["ended"] and r["role"] != Role.ANALYST]
         saves = [r for r in runs if r["details"].get("save", {}).get("state") == "confirmed"]
+        saved = saves[-1]["details"]["save"]["sha"] if saves else None
+        unchanged = bool(runs and runs[-1]["details"].get("save", {}).get("state") == "unchanged")
         artifacts = [
             a
             for a in self.evidence(task_id)["artifacts"]
@@ -165,8 +167,9 @@ class Store:
         ]
         facts = {
             "run": settled[-1]["id"] if settled else None,
-            "save": saves[-1]["details"]["save"]["sha"] if saves else None,
+            "save": [saved, unchanged] if saved or unchanged else None,
             "pull": [task["pr_number"], task["target_sha"]] if task["pr_number"] else None,
+            "stage": task["stage"] if task["pr_number"] else None,
             "checks": artifacts[-1]["id"] if artifacts else None,
             "block": [task["stage"], task["state"], task["reason"]]
             if task["state"]
@@ -179,6 +182,9 @@ class Store:
             }
             else None,
         }
+        from .control import baseline
+
+        facts["request"] = baseline(task) if any(facts.values()) else None
 
         def enqueue(data: dict[str, Any]) -> None:
             if facts == data.get("progress_facts", dict.fromkeys(facts)):
@@ -191,7 +197,7 @@ class Store:
                     "task": task,
                     "runs": ([saves[-1]] if saves and (not runs or saves[-1] != runs[-1]) else [])
                     + runs[-1:],
-                    "artifacts": artifacts[-1:],
+                    "artifacts": list({a["kind"]: a for a in artifacts}.values()),
                 }
             )
             self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))

@@ -45,10 +45,9 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
         return await old_read(path)
 
     async def mutate(path, payload, *, method="POST"):
-        if method == "PATCH":
-            item = next(c for c in comments if c["id"] == int(path.rsplit("/", 1)[1]))
-            item.update(payload)
-            return deepcopy(item)
+        if path.endswith("/comments"):
+            assert method == "POST"
+            return deepcopy(post(payload["body"]))
         return await old_mutate(path, payload)
 
     monkeypatch.setattr(fixture_github, "read", read)
@@ -109,7 +108,16 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
     assert store.task(task_id)["state"] in {State.HUMAN, State.FAILED, State.RECONCILE}, store.task(
         task_id
     )["reason"]
-    return config, fixture_github, post, status, step
+    return (
+        config,
+        fixture_github,
+        post,
+        lambda: next(
+            (c for c in reversed(comments) if c["body"].startswith("<!-- gongcao-progress:")),
+            status,
+        ),
+        step,
+    )
 
 
 async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_at_review(
@@ -124,8 +132,8 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
     assert store.task(task_id)["target_sha"] == first["target_sha"]
     assert not store.task(task_id)["control"]["spent"]
     assert store.evidence(task_id)["instructions"][-1]["status"] == "accepted"
-    assert saved["sha"] in status["body"] and "NOT_RUN" in status["body"]
-    assert "/gongcao retry" in status["body"] and "original/r1" in status["body"]
+    assert saved["sha"] in status()["body"] and "NOT_RUN" in status()["body"]
+    assert "/gongcao retry" in status()["body"] and "original/r1" in status()["body"]
     assert store.task(task_id)["status_sync"]["dirty"] == 0
     retry = post("/gongcao retry")
     restarted = Store(store.root)
@@ -208,12 +216,12 @@ async def test_save_failure_no_change_and_lost_response_do_not_duplicate_commits
     operations = store.evidence(task_id)["operations"]
     if save["state"] == "unchanged":
         assert not operations
-        assert "Remote checkpoint: unchanged" in status["body"]
+        assert "Remote checkpoint: unchanged" in status()["body"]
     elif save["state"] == "pending":
         assert store.task(task_id)["state"] == State.RECONCILE
         assert not (await Recovery(store, github).recover(task_id))["recovered"]
         assert len(store.evidence(task_id)["operations"]) == 1
-        assert "Saved WIP:" not in status["body"]
+        assert "Saved WIP:" not in status()["body"]
     else:
         assert save["state"] == "confirmed" and len(operations) == 1
         async with Lease(store, task_id) as lease:
@@ -388,24 +396,24 @@ async def test_retry_without_changes_keeps_confirmed_checkpoint_link(
     assert current["details"]["source"]["sha"] == saved["sha"]
     assert current["details"]["save"]["state"] == "unchanged"
     assert len(store.evidence(task_id)["operations"]) == 1
-    assert "Remote checkpoint: unchanged" in status["body"]
-    assert f"/commit/{saved['sha']}" in status["body"]
-    assert f"/tree/{saved['branch']}" in status["body"]
-    assert saved["run_id"] in status["body"] and "/gongcao retry" in status["body"]
+    assert "Remote checkpoint: unchanged" in status()["body"]
+    assert f"/commit/{saved['sha']}" in status()["body"]
+    assert f"/tree/{saved['branch']}" in status()["body"]
+    assert saved["run_id"] in status()["body"] and "/gongcao retry" in status()["body"]
 
     # An unconfirmed new save must not be presented as remotely saved.
     store.run_details(current["id"], save={"state": "pending", "sha": "f" * 40})
     discovery = Discovery(store, config, github)
     await discovery.handoff(task_id)
-    assert "Remote checkpoint: pending" in status["body"]
-    assert f"/commit/{saved['sha']}" in status["body"]
-    assert "/commit/" + "f" * 40 not in status["body"]
+    assert "Remote checkpoint: pending" in discovery.render(discovery.records()[0])
+    assert f"/commit/{saved['sha']}" in status()["body"]
+    assert "/commit/" + "f" * 40 not in status()["body"]
 
     # Changed requirements invalidate the old checkpoint's relevance to this task version.
     task = store.task(task_id)
     store.sync(task_id, task["snapshot"] | {"body": "Changed requirements"})
     await discovery.handoff(task_id)
-    assert "Saved WIP:" not in status["body"]
+    assert "Saved WIP:" not in status()["body"]
 
 
 async def test_older_retry_cannot_clear_newer_unverified_pause(
@@ -418,7 +426,7 @@ async def test_older_retry_cannot_clear_newer_unverified_pause(
     original = github.read
 
     async def instructions(task):
-        return deepcopy([status, step, older])
+        return deepcopy([status(), step, older])
 
     async def read(path):
         if path.endswith("/" + str(newer["id"])):
@@ -471,9 +479,9 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
         store.db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), run["id"]))
         store.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))
     publisher = Discovery(store, config, github)
-    await publisher.handoff(task_id)
-    assert len(status["body"]) < 60_000
-    assert "Saved WIP:" in status["body"] and "/gongcao retry" in status["body"]
+    body = publisher.render(publisher.records()[0])
+    assert len(body) < 60_000
+    assert "Saved WIP:" in body and "/gongcao retry" in body
     calls = 0
 
     async def unavailable(*args, **kwargs):
@@ -516,7 +524,7 @@ async def test_fresh_retry_adopts_execution_changes_but_preserves_history(
         assert new["details"]["execution"]["model"] == "configured-model"
         assert new["details"]["execution"]["reasoning_effort"] == "high"
         assert new["details"]["source"]["sha"] == old["details"]["save"]["sha"]
-        assert "configured-model" in status["body"]
+        assert "configured-model" in status()["body"]
     retained = next(r for r in store.runs(task_id) if r["id"] == old["id"])
     assert retained["details"]["execution"] == old_execution
 

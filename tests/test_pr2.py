@@ -461,7 +461,9 @@ async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
                 "'conclusion':conclusion",
                 "'conclusion':'blocked' if role=='developer' else conclusion,"
                 "'delivery_complete':True if role=='developer' else None",
-            ).replace("'Check controller gates'", "'NOT_RUN: missing acceptance package'"),
+            )
+            .replace("'Check controller gates'", "'NOT_RUN: missing acceptance package'")
+            .replace("'basis':['sample.txt must be complete']", "'basis':['x'*100000]"),
         )
     sent, failed = 0, False
 
@@ -497,6 +499,7 @@ async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
         assert restarted.task(task_id)["pr_number"] == 9
         assert len(fixture_github.writes) == 1
         if fault == "acceptance_blocked":
+            assert len(fixture_github.pull["body"]) < 60000
             report = json.loads(restarted.runs(task_id)[-1]["result"])
             assert report["conclusion"] == "blocked" and report["delivery_complete"] is True
             assert restarted.task(task_id)["state"] == State.WAITING_INSTRUCTION

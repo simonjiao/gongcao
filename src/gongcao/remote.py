@@ -463,8 +463,9 @@ class Controlled:
                 f"Checkpoint: {saved.get('state', 'not recorded')}.\n"
                 f"Agent report (self-reported, not controller acceptance): "
                 f"`{report['conclusion']}`; delivery_complete={report.get('delivery_complete')}.\n"
-                f"{report['summary']}\nReported checks/basis: {'; '.join(report['basis'])}\n"
-                f"Remaining / missing inputs: {'; '.join(report['next_steps'])}\n"
+                f"{report['summary']}\nReported checks/basis: {'; '.join(report['basis'])[:6000]}\n"
+                f"Remaining / missing inputs: {'; '.join(report['next_steps'])[:6000]}\n"
+                "Report excerpts only; full report retained locally.\n"
                 "Controller checks at this PR head: NOT_RUN. Review / quality / real acceptance "
                 "remain pending; missing inputs do not satisfy their gates. No merge or release."
             ),

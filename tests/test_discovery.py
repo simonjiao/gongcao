@@ -381,6 +381,25 @@ async def test_merged_fact_wins_over_new_default_base_without_operators(intake, 
             "UPDATE tasks SET pr_number=9,stage=?,state=? WHERE id=?",
             (Stage.MERGEABLE, state, task["id"]),
         )
+    # Validation and the final stage must retain the actual current-SHA check results.
+    with store.db:
+        store.db.execute(
+            "UPDATE tasks SET stage=?,state=? WHERE id=?",
+            (Stage.VALIDATION, State.WAITING_DEPENDENCY, task["id"]),
+        )
+    store.record(
+        store.task(task["id"]),
+        "quality-results",
+        "test",
+        {"items": [{"category": "internal", "status": "passed"}]},
+    )
+    store.record(store.task(task["id"]), "validation", "test", {})
+    store.transition(store.task(task["id"]), Stage.MERGEABLE, State.COMPLETED, "Await human merge")
+    await intake.handoff(task["id"])
+    assert "`mergeable`" in intake.github.comments[-1]["body"]
+    assert "Controller checks: internal: PASS" in intake.github.comments[-1]["body"]
+    with store.db:
+        store.db.execute("UPDATE tasks SET state=? WHERE id=?", (state, task["id"]))
     intake.github.rows[9] = intake.github.rows[1] | {
         "merged": True,
         "state": "closed",
