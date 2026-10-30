@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .model import VERSION_FIELDS, Role, Stage, State
+from .model import VERSION_FIELDS, Role, Stage, State, same_version
 
 
 class Store:
@@ -259,6 +259,40 @@ class Store:
             raise ValueError("Task is already registered against a different local repository")
         return int(row[0])
 
+    def development_output(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """Original development authority permits delivery, never latest-request acceptance."""
+        from .control import baseline
+
+        runs = self.runs(task["id"])
+        if task["stage"] not in {Stage.DEVELOPMENT, Stage.REVISION} or not runs:
+            return None
+        run = runs[-1]
+        source = run["details"].get("source", {})
+        request = source.get("request")
+        if (
+            run["role"] != Role.DEVELOPER
+            or run["target_sha"] != task["target_sha"]
+            or not request
+            or source.get("policy") != task["control"].get("policy")
+        ):
+            return None
+        original = task | {
+            "snapshot": task["snapshot"] | {key: request.get(key) for key in ("title", "body")}
+        }
+        if baseline(original) != source.get("baseline"):
+            return None  # SHA, branch, PR metadata and operator feedback remain version-bound.
+        if run["state"] == State.RUNNING:
+            return run
+        report = json.loads(run["result"] or "{}")
+        if (
+            run["state"] == State.COMPLETED
+            and report.get("conclusion") == "ready"
+            and report.get("target_sha") == task["target_sha"]
+            and (run["evidence_valid"] or run["details"].get("delivery_changed"))
+        ):
+            return run
+        return None
+
     def sync(self, task_id: int, snapshot: dict[str, Any]) -> None:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -268,11 +302,19 @@ class Store:
                 snapshot.get(key) != task["snapshot"].get(key) for key in VERSION_FIELDS
             )
             lifecycle_changed = snapshot.get("state") != task["snapshot"].get("state")
+            delivery = self.development_output(task | {"snapshot": snapshot, "target_sha": sha})
             stage, state, reason = task["stage"], task["state"], task["reason"]
             if version_changed or lifecycle_changed:
                 self.db.execute("UPDATE runs SET evidence_valid=0 WHERE task_id=?", (task_id,))
                 self.db.execute("UPDATE artifacts SET valid=0 WHERE task_id=?", (task_id,))
-            if version_changed:
+            if version_changed and delivery and not lifecycle_changed:
+                self.db.execute(
+                    "UPDATE runs SET details=json_set(details,'$.delivery_changed',json('true')) "
+                    "WHERE id=?",
+                    (delivery["id"],),
+                )
+                reason = "Requirements changed; deliver original output for current-request review"
+            elif version_changed:
                 stage = Stage.ANALYSIS
                 active = self.db.execute(
                     "SELECT 1 FROM runs WHERE task_id=? AND state=?", (task_id, State.RUNNING)
@@ -300,7 +342,7 @@ class Store:
                 "WHERE id=?",
                 (stage, state, reason, json.dumps(snapshot), sha, time.time(), task_id),
             )
-            if version_changed or lifecycle_changed:
+            if (version_changed and not delivery) or lifecycle_changed:
                 from .control import Controls
 
                 Controls(self).invalidate(task_id, "GitHub version changed; renew instruction")
@@ -446,9 +488,19 @@ class Store:
                 reason, result = "Execution lease lost; late result rejected", None
                 self.db.execute("UPDATE runs SET evidence_valid=0 WHERE id=?", (run_id,))
             elif task["target_sha"] != run["target_sha"] or not run["evidence_valid"]:
-                stage = Stage(task["stage"])
-                task_state = State.RECONCILE
-                reason = "Target changed during execution; result cannot advance the stage"
+                delivery = self.development_output(task)
+                if (
+                    delivery
+                    and run_state == State.COMPLETED
+                    and result
+                    and json.loads(result).get("conclusion") == "ready"
+                ):
+                    stage, task_state = Stage(task["stage"]), State.WAITING_DEPENDENCY
+                    reason = "Requirements changed; original output awaits draft PR delivery"
+                else:
+                    stage = Stage(task["stage"])
+                    task_state = State.RECONCILE
+                    reason = "Target changed during execution; result cannot advance the stage"
             self.db.execute(
                 "UPDATE runs SET state=?,result=?,error=?,ended=?,"
                 "evidence_valid=CASE WHEN ? THEN evidence_valid ELSE 0 END "
@@ -514,7 +566,7 @@ class Store:
             State.HUMAN,
         }:
             raise ValueError("Task is cancelled or needs manual handling")
-        if any(task[key] != expected[key] for key in ("target_sha", "snapshot", "stage")):
+        if not same_version(expected, task):
             raise ValueError("Task changed; evidence cannot be applied")
         return task
 

@@ -8,12 +8,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from gongcao.model import Stage, State
 from qa.ledger import write_json
 
 
+@pytest.mark.parametrize("edit_request", [False, True])
 def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
-    tmp_path, repo, sha, snapshot, auth_file
+    tmp_path, repo, sha, snapshot, auth_file, edit_request
 ):
     bare = tmp_path / "remote.git"
     subprocess.run(["git", "clone", "--bare", "-q", str(repo), str(bare)], check=True)
@@ -26,6 +29,7 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
                 "bare": str(bare),
                 "reviews": [],
                 "writes": [],
+                "edit_request_on_pull": edit_request,
             }
         )
     )
@@ -107,6 +111,11 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
         for row in published["evidence"]["instructions"]
     )
     assert published["pr_number"] == 9 and published["target_sha"] != sha
+    assert [r["role"] for r in published["runs"]] == ["analyst", "developer"]
+    if edit_request:
+        assert "requirements changed" in published["reason"].lower()
+        assert published["snapshot"]["body"] == "Updated requirements during delivery"
+        assert not any(r["evidence_valid"] for r in published["runs"])
     cli("control", number, "--until", "validation", "--config", str(config))
     reviewed = drive(Stage.VALIDATION)
     assert [r["role"] for r in reviewed["runs"]] == ["analyst", "developer", "analyst", "reviewer"]

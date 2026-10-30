@@ -90,6 +90,8 @@ class Runner:
                 if role == Role.DEVELOPER
                 else {"sha": task["target_sha"], "baseline": controls_baseline(task)}
             )
+            if role == Role.DEVELOPER:
+                source |= {"request": task["snapshot"], "policy": task["control"].get("policy")}
             self.store.run_details(run_id, source=source)
             self.store.run_details(run_id, requested_execution=self.config.execution)
             await worktree(repo, workspace, source["sha"], role, run_id)

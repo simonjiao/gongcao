@@ -470,7 +470,12 @@ async def test_lost_lease_cannot_accept_feedback(store, task_id, replacement):
             )
 
 
-async def test_journaled_operation_settles_before_pause(store, task_id, fixture_github, policy):
+@pytest.mark.parametrize("arrival", ["before_send", "after_send"])
+async def test_journaled_operation_settles_before_pause(
+    store, task_id, fixture_github, policy, arrival
+):
+    from gongcao.control import Paused
+
     store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "fixture")
     remote = Controlled(store, policy, fixture_github)
     written = False
@@ -478,19 +483,28 @@ async def test_journaled_operation_settles_before_pause(store, task_id, fixture_
     async def observe():
         if written:
             return {"confirmed": True}
-        Controls(store).issue(task_id, "pause")
+        if arrival == "before_send":
+            Controls(store).issue(task_id, "pause")
         return None
 
     async def write():
         nonlocal written
         written = True
+        if arrival == "after_send":
+            Controls(store).issue(task_id, "pause")
         return {}
 
     async with Lease(store, task_id):
-        assert await remote.perform(store.task(task_id), "push", "fixture", {}, observe, write)
+        if arrival == "before_send":
+            with pytest.raises(Paused):
+                await remote.perform(store.task(task_id), "push", "fixture", {}, observe, write)
+        else:
+            assert await remote.perform(store.task(task_id), "push", "fixture", {}, observe, write)
         assert not Controls(store).checkpoint(task_id)
-    assert written and store.task(task_id)["state"] == State.WAITING_INSTRUCTION
-    assert store.evidence(task_id)["operations"][0]["state"] == "succeeded"
+    assert written == (arrival == "after_send")
+    assert store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    operations = store.evidence(task_id)["operations"]
+    assert [op["state"] for op in operations] == (["succeeded"] if written else [])
     assert not store.db.execute("SELECT 1 FROM leases").fetchone()
 
 
