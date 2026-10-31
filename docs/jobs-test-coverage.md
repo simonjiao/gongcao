@@ -13,7 +13,9 @@
 | QA 误用生产门禁 | QA loader 忽略无效生产 scheduler/roles/quality | smoke 命令在带无效生产 quality 的统一 YAML 下完成；没有远端资源或写入意图 |
 | 批次结果只看摘要、证据未核验 | 原 QA 篡改/队列/取消等安全回归保持不变 | 真实 verify-batch 核对每批 Run、峰值、排队、档案；篡改自有 verdict 后必须退出 1 |
 
-`tests/test_jobs.py` 现有 **22 个内部用例 + 3 条离线 E2E 路径**：
+现行配置检查位于 `tests/test_config.py`；并发及 QA 离线命令路径分别位于
+`tests/test_scheduler.py`、`tests/test_qa_execution.py`，职责映射见 [测试组织](test-organization.md)。
+以下是 PR #54 当时的 **22 个内部用例 + 3 条离线命令路径**及规模记录：
 
 1. QA 默认/YAML/覆盖 → 3 个批次、各 3 个 smoke Run → verify-batch → 篡改证据被拒绝。
 2. 正式默认/YAML/覆盖 → 实际 serve 进程、SQLite 和既有调度器 → 释放屏障前由实际 status 核验活动租约数及控制器 PID → 1–3 并发及排队 → 关闭目标阻断 Agent。

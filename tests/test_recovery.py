@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import json
 import os
 import signal
@@ -8,117 +7,21 @@ import time
 from pathlib import Path
 
 import pytest
-from test_pr2 import WORKER
-from test_pr2 import fixture_github as fixture_github
-from test_pr2 import policy as policy
-from test_runner import SUCCESS, install_worker
+from _support.github import RegisteredGitHub
+from _support.tasks import analysis_ready, wait_for
+from _support.worker import SUCCESS, WORKER, install_worker
 
-from gongcao.cli import logs
 from gongcao.config import Config
-from gongcao.github import Deferred, GitHub
+from gongcao.github import Deferred
 from gongcao.github import command as git_command
 from gongcao.leases import Lease, identity, session_alive
 from gongcao.model import AgentResult, Role, Stage, State
 from gongcao.processes import CleanupError, NotStarted, launch, stop
 from gongcao.recovery import Recovery, diagnose
-from gongcao.remote import Controlled
 from gongcao.runner import Runner
 from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 from gongcao.workflow import Workflow
-
-
-class RegisteredGitHub(GitHub):
-    def __init__(self, store):
-        self.store = store
-        self.review_rows = []
-        self.writes = 0
-
-    async def snapshot(self, target):
-        return next(dict(t["snapshot"]) for t in self.store.tasks() if t["url"] == target.url)
-
-    async def pages(self, path, field=None):
-        return self.review_rows
-
-    async def mutate(self, path, payload):
-        self.writes += 1
-        raise AssertionError("Recovery must never write remotely")
-
-
-def register_more(store, repo, sha, snapshot, count):
-    return [
-        store.register(
-            snapshot["url"].rsplit("/", 1)[0] + f"/{i}",
-            repo,
-            sha,
-            snapshot | {"number": i, "url": snapshot["url"].rsplit("/", 1)[0] + f"/{i}"},
-        )
-        for i in range(2, count + 2)
-    ]
-
-
-def analysis_ready(store, task_id, sha):
-    run = store.begin_run(task_id, Role.ANALYST)
-    result = AgentResult(
-        conclusion="ready",
-        summary="Confirmed plan",
-        basis=["Inspect sample.txt"],
-        target_sha=sha,
-        next_steps=["Implement in an isolated worktree"],
-    )
-    store.finish(
-        run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "planned", result.model_dump_json()
-    )
-
-
-async def wait_for(predicate):
-    async with asyncio.timeout(15):
-        while not predicate():  # noqa: ASYNC110 -- observing SQLite/OS state across processes
-            await asyncio.sleep(0.02)
-
-
-async def test_leases_exclude_duplicate_tasks_and_limit_all_controllers(
-    store, task_id, repo, sha, snapshot
-):
-    ids = [task_id, *register_more(store, repo, sha, snapshot, 3)]
-    other = Store(store.root)
-    try:
-        async with contextlib.AsyncExitStack() as stack:
-            for tid in ids[:3]:
-                assert (await stack.enter_async_context(Lease(store, tid))).acquired
-            async with Lease(other, task_id) as duplicate:
-                assert not duplicate.acquired
-            async with Lease(other, ids[3]) as fourth:
-                assert not fourth.acquired
-            assert store.db.execute("SELECT count(*) FROM leases").fetchone()[0] == 3
-        assert store.db.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
-    finally:
-        other.close()
-
-
-async def test_two_registered_objects_cannot_own_the_same_pr(store, task_id, repo, sha, snapshot):
-    second = register_more(store, repo, sha, snapshot, 1)[0]
-    with store.db:
-        store.db.execute("UPDATE tasks SET pr_number=9")
-    async with Lease(store, task_id) as first:
-        async with Lease(store, second) as duplicate:
-            assert first.acquired and not duplicate.acquired
-        assert store.db.execute("SELECT owner FROM leases").fetchone()[0] == first.owner
-
-
-async def test_heartbeat_renews_and_late_results_require_the_original_owner(store, task_id, sha):
-    async with Lease(store, task_id, ttl=0.15):
-        await asyncio.sleep(0.25)
-        assert store.db.execute("SELECT expires FROM leases").fetchone()[0] > time.time()
-        run = store.begin_run(task_id, Role.ANALYST)
-        with store.db:
-            store.db.execute("UPDATE leases SET owner='replacement'")
-        with pytest.raises(ValueError, match="lease lost"):
-            store.record(store.task(task_id), "quality-results", "policy", {"passed": True})
-        store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late", "{}")
-        assert store.task(task_id)["state"] == State.RECONCILE
-        assert not store.runs(task_id)[0]["evidence_valid"]
-    assert store.db.execute("SELECT owner FROM leases").fetchone()[0] == "replacement"
 
 
 async def test_pending_spawn_blocks_fresh_execution_but_failed_exec_is_settled(store, task_id):
@@ -313,116 +216,6 @@ async def test_unknown_review_is_queried_and_never_replayed(
         assert store.task(task_id)["state"] == State.RECONCILE
 
 
-async def test_dependency_cycle_rolls_back_and_a_blocked_task_cannot_launch(
-    store, task_id, repo, sha, snapshot
-):
-    second = register_more(store, repo, sha, snapshot, 1)[0]
-    store.depend(task_id, [second])
-    with pytest.raises(ValueError, match="cycle"):
-        store.depend(second, [task_id])
-    assert store.dependencies(second) == []
-    assert await Workflow(store, Config(), RegisteredGitHub(store)).run(task_id) == []
-    assert not store.runs(task_id)
-    assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
-    store.halt(task_id, State.HUMAN, "manual gate")
-    await Workflow(store, Config(), RegisteredGitHub(store)).run(task_id)
-    assert store.task(task_id)["state"] == State.HUMAN
-
-
-async def test_parallel_developers_write_distinct_worktrees_and_leave_source_unchanged(
-    store, task_id, repo, sha, snapshot, auth_file, monkeypatch
-):
-    second = register_more(store, repo, sha, snapshot, 1)[0]
-    for tid in (task_id, second):
-        analysis_ready(store, tid, sha)
-    worker = SUCCESS.replace("'changed in worktree\\n'", "str(request['context']['task_id'])")
-    install_worker(monkeypatch, worker)
-    at_publish = []
-    release = asyncio.Event()
-
-    async def publish(self, task, run):
-        at_publish.append((task["id"], Path(run["worktree"])))
-        await release.wait()
-        raise OSError("Fixture stops before remote writes")
-
-    monkeypatch.setattr(Controlled, "publish", publish)
-    config = Config(auth_file=auth_file)
-    scheduler = Scheduler(store, config, RegisteredGitHub(store), 2)
-    running = asyncio.create_task(scheduler.serve(once=True))
-    try:
-        await wait_for(lambda: len(at_publish) == 2)
-        assert store.db.execute("SELECT count(*) FROM leases").fetchone()[0] == 2
-        assert len({p for _, p in at_publish}) == 2
-        for tid, path in at_publish:
-            assert (path / "sample.txt").read_text() == str(tid)
-        assert (repo / "sample.txt").read_text() == "original\n"
-    finally:
-        release.set()
-        await running
-
-
-async def test_scheduler_stops_after_three_failures_and_manual_retry_preserves_history(
-    store, task_id, auth_file, monkeypatch
-):
-    install_worker(monkeypatch, "import sys;sys.stdin.readline();raise SystemExit(7)")
-    github = RegisteredGitHub(store)
-    scheduler = Scheduler(store, Config(auth_file=auth_file), github)
-    for _ in range(3):
-        await scheduler.serve(once=True)
-        with store.db:
-            store.db.execute("UPDATE retries SET next_at=0")
-    assert len(store.runs(task_id)) == 3
-    assert store.task(task_id)["state"] == State.HUMAN
-    await scheduler.serve(once=True)
-    assert len(store.runs(task_id)) == 3
-    assert "no_progress_after_bounded_attempts" in diagnose(store, task_id)["issues"]
-    assert (await Recovery(store, github).retry(task_id))["recovered"]
-    assert store.task(task_id)["state"] == State.QUEUED
-    assert len(store.runs(task_id)) == 3
-    assert not any(r["evidence_valid"] for r in store.runs(task_id))
-
-
-async def test_logs_filter_a_selected_run_without_exposing_other_runs(store, task_id, sha, capsys):
-    from gongcao.events import Journal, Redactor
-
-    analysis_ready(store, task_id, sha)
-    run = store.runs(task_id)[0]["id"]
-    journal = Journal(store, run, 2048, Redactor())
-    journal.emit("progress", {"message": "ignored"})
-    journal.emit("error", {"message": "key github_pat_PRIVATEvalue"})
-    await logs(store, task_id, False, run_id=run, kind="error", contains="REDACTED")
-    output = capsys.readouterr().out
-    assert "PRIVATEvalue" not in output and "ignored" not in output
-    assert json.loads(output)["kind"] == "error"
-    with pytest.raises(ValueError, match="belong"):
-        await logs(store, task_id, False, run_id="../outside")
-
-
-def test_schema_one_upgrade_keeps_unknown_intents_and_history(store, task_id, sha):
-    analysis_ready(store, task_id, sha)
-    store.intent(store.task(task_id), "pending", "push", "{}")
-    with store.db:
-        store.db.execute("ALTER TABLE runs DROP COLUMN details")
-        store.db.execute("DROP TRIGGER status_dirty")
-        store.db.execute("DROP TABLE claims")
-        store.db.execute("DROP TABLE controller")
-        for table in ("leases", "processes", "dependencies", "retries", "instructions"):
-            store.db.execute(f"DROP TABLE {table}")
-        store.db.execute("DROP INDEX events_run_kind")
-        store.db.execute("ALTER TABLE runs DROP COLUMN owner_token")
-        store.db.execute("ALTER TABLE tasks DROP COLUMN control")
-        store.db.execute("PRAGMA user_version=1")
-    for _ in range(2):
-        restarted = Store(store.root)
-        try:
-            assert restarted.db.execute("PRAGMA user_version").fetchone()[0] == 5
-            assert len(restarted.runs(task_id)) == 1
-            assert restarted.operation("pending")["state"] == "pending"
-            assert restarted.runs(task_id)[0]["owner_token"] is None
-        finally:
-            restarted.close()
-
-
 @pytest.mark.parametrize("role", [Role.REVIEWER, Role.VALIDATOR])
 async def test_recovery_cannot_revive_legacy_ready_evidence_for_the_wrong_sha(
     store, task_id, sha, role
@@ -452,61 +245,6 @@ async def test_recovery_cannot_revive_legacy_ready_evidence_for_the_wrong_sha(
     assert workflow.cached_run(store.task(task_id), role) is None
     assert (await Recovery(store, RegisteredGitHub(store)).retry(task_id))["recovered"]
     assert not store.runs(task_id)[0]["evidence_valid"]
-
-
-async def test_unsettled_process_retains_the_branch_resource_across_task_aliases(
-    store, task_id, repo, sha, snapshot
-):
-    second = register_more(store, repo, sha, snapshot, 1)[0]
-    with store.db:
-        store.db.execute(
-            "UPDATE tasks SET pr_number=9,snapshot=?",
-            (json.dumps(snapshot | {"head_ref": "feature", "head_repository": "Example/Demo"}),),
-        )
-    process = None
-    try:
-        async with Lease(store, task_id):
-            process = await launch(sys.executable, "-c", "import time;time.sleep(60)")
-        assert store.db.execute("SELECT expires FROM leases").fetchone()[0] == 0
-        async with Lease(store, second) as blocked:
-            assert not blocked.acquired
-        assert "occupied" in store.task(second)["reason"]
-        assert process.returncode is None
-    finally:
-        if process is not None:
-            await stop(process)
-
-
-async def test_unconfirmed_new_pr_reserves_its_branch_before_local_association(
-    store, task_id, repo, sha, snapshot
-):
-    from gongcao.leases import resource
-
-    branch = resource(store.task(task_id)).split(":branch:", 1)[1]
-    pull = snapshot | {
-        "url": "https://github.com/EXAMPLE/DEMO/pull/9",
-        "kind": "pull",
-        "number": 9,
-        "repository": "EXAMPLE/DEMO",
-        "head_repository": "EXAMPLE/DEMO",
-        "head_ref": branch,
-    }
-    second = store.register(pull["url"], repo, sha, pull)
-    async with Lease(store, task_id):
-        store.intent(store.task(task_id), "pending-pr", "pull", "{}")
-        store.halt(task_id, State.RECONCILE, "API result unconfirmed")
-    async with Lease(store, second) as blocked:
-        assert not blocked.acquired
-    assert store.db.execute("SELECT task_id FROM leases").fetchone()[0] == task_id
-
-
-def test_registration_canonicalizes_github_case_aliases(store, task_id, repo, sha, snapshot):
-    from gongcao.github import Target
-
-    alias = snapshot["url"].replace("example/demo", "Example/Demo")
-    assert Target.parse(alias).url == snapshot["url"]
-    assert store.register(alias, repo, sha, snapshot) == task_id
-    assert len(store.tasks()) == 1
 
 
 ESCAPED = """
@@ -543,29 +281,6 @@ async def test_setsided_descendant_cannot_be_cleared_by_recovery(store, task_id,
             os.kill(child_pid, signal.SIGKILL)
         if process is not None:
             await stop(process)
-
-
-async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, repo, sha, snapshot):
-    ids = register_more(store, repo, sha, snapshot, 3)
-    store.halt(task_id, State.WAITING_ENVIRONMENT, "one actual failure")
-    with store.db:
-        store.db.execute("INSERT INTO retries VALUES(?,?,?,?)", (task_id, 1, "old", 0))
-    scheduler = Scheduler(store, Config(), RegisteredGitHub(store))
-    scheduler.github.traffic.defer(store, task_id, Deferred("readback limited"), recovery=True)
-    async with contextlib.AsyncExitStack() as stack:
-        for tid in ids:
-            assert (await stack.enter_async_context(Lease(store, tid))).acquired
-        for _ in range(3):
-            await scheduler.advance(task_id)
-        assert (
-            store.db.execute("SELECT failures FROM retries WHERE task_id=?", (task_id,)).fetchone()[
-                0
-            ]
-            == 1
-        )
-        assert not store.runs(task_id)
-        assert store.artifact(task_id, "github-cooldown", "")["recovery"]
-        assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
 
 
 async def test_manual_retry_runs_failed_quality_checks_again(store, task_id, planned_quality):

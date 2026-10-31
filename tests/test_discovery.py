@@ -1,113 +1,19 @@
 """Intake risks at existing GitHub/SQLite seams; workflow/OS behavior lives in CLI tests."""
 
 import asyncio
-import hashlib
 import json
-import subprocess
-from collections import Counter
 from copy import deepcopy
-from dataclasses import replace
 
 import pytest
 
-from gongcao.config import Config, DiscoveryConfig, Source
+from gongcao.config import Config
 from gongcao.control import Controls, InstructionChanged
 from gongcao.discovery import Discovery
-from gongcao.github import Deferred, GitHub, command
+from gongcao.github import command
 from gongcao.leases import Lease
 from gongcao.model import Stage, State
 from gongcao.recovery import Recovery
 from gongcao.store import Store
-
-
-@pytest.fixture
-def intake(store, repo, sha, snapshot):
-    name = "example/discovery-" + hashlib.sha256(str(store.root).encode()).hexdigest()[:12]
-    snapshot.update(repository=name, url=f"https://github.com/{name}/issues/1")
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", f"https://github.com/{name}.git"],
-        cwd=repo,
-        check=True,
-    )
-
-    class API(GitHub):
-        def __init__(self):
-            self.rows = {
-                n: snapshot
-                | {
-                    "number": n,
-                    "url": snapshot["url"][:-1] + str(n),
-                    "labels": [{"name": "agent-ready"}],
-                    "assignees": [],
-                }
-                for n in range(1, 7)
-            }
-            self.rows[2]["pull_request"] = {}
-            self.rows[3]["labels"] = [{"name": "agent-ready-extra"}]
-            self.comments, self.writes, self.failure = [], [], ""
-            self.sha = sha
-            self.branch = "main"
-            self.calls = Counter()
-
-        async def read(self, path):
-            self.calls["read"] += 1
-            if path == "user":
-                return {"login": "owner"}
-            if "/comments/" in path:
-                item = deepcopy(
-                    next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
-                )
-                # Real GitHub list/detail payloads use different avatar URL variants.
-                item["user"]["avatar_url"] = "https://avatars.example/variant"
-                return item
-            if "/issues/" in path:
-                return deepcopy(self.rows[int(path.rsplit("/", 1)[1])])
-            current = self.sha if path.endswith("/" + self.branch) else sha
-            return (
-                {"object": {"sha": current}}
-                if "/git/ref/" in path
-                else {"default_branch": self.branch}
-            )
-
-        async def snapshot(self, target):
-            return deepcopy(self.rows[target.number])
-
-        async def pages(self, path, field=None):
-            self.calls["pages"] += 1
-            if self.failure in {"403", "429"}:
-                raise PermissionError("HTTP " + self.failure)
-            if "/labels" in path:
-                return self.rows[int(path.split("/issues/")[1].split("/")[0])]["labels"]
-            if "/timeline" in path:
-                return (
-                    [{"source": {"issue": {"pull_request": {"url": "handled"}}}}]
-                    if "/4/" in path
-                    else []
-                )
-            if "/comments" in path:
-                return deepcopy(self.comments)
-            return list(reversed(list(self.rows.values())))
-
-        async def mutate(self, path, payload, *, method="POST"):
-            self.writes.append(method)
-            if self.failure == "limited":
-                raise Deferred("HTTP 429: rejected")
-            if self.failure == "absent":
-                raise ConnectionError("POST result unknown")
-            if method == "POST":
-                self.comments.append(
-                    {"id": len(self.comments) + 1, "user": {"login": "owner"}, **payload}
-                )
-            else:
-                self.comments[0].update(payload)
-            if self.failure == "lost":
-                raise ConnectionError("Reply lost after remote write")
-            if self.failure == "interrupted":
-                raise asyncio.CancelledError
-            return deepcopy(self.comments[-1])
-
-    config = replace(Config(), discovery=DiscoveryConfig(True, 60, 1, (Source(name, repo),)))
-    return Discovery(store, config, API())
 
 
 async def test_filter_dedupe_backlog_status_and_cross_state_lock(
@@ -441,72 +347,3 @@ async def test_merged_fact_wins_over_new_default_base_without_operators(intake, 
     assert (current["stage"], current["state"]) == (Stage.MERGED, State.COMPLETED)
     assert "`merged`" in intake.github.comments[-1]["body"] and not current["status_sync"]["dirty"]
     assert not store.runs(task["id"])
-
-
-def test_discovery_configuration_defaults_and_rejections(tmp_path):
-    assert not Config.load(None).discovery.enabled
-    for raw in (
-        {"enabled": True},
-        {"interval_seconds": 0},
-        {"max_new_per_scan": True},
-        {"sources": [{"repo": "example/demo", "path": "relative"}]},
-        {"unexpected": 1},
-    ):
-        with pytest.raises(ValueError):
-            DiscoveryConfig.load(raw)
-    path = tmp_path / "config.yaml"
-    path.write_text(
-        "discovery:\n  enabled: true\n  sources:\n    - repo: EXAMPLE/Demo\n"
-        f"      path: {tmp_path}\n"
-    )
-    assert Config.load(path).discovery.sources[0].repo == "example/demo"
-
-
-def test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims():
-    from qa.discovery import verify
-
-    data = {
-        "records": [
-            {
-                "url": f"issue:{number}",
-                "task_id": 1,
-                "intent": "",
-                "dirty": 0,
-                "comment_id": number,
-                "confirmed": "claim",
-                "data": json.dumps({"marker": "claim", "mode": mode}),
-            }
-            for number, mode in ((10, "step"), (11, "auto"))
-        ],
-        "comments": [
-            {"id": number, "user": {"login": "owner"}, "body": "claim"} for number in (10, 11)
-        ],
-        "excluded": {"url": "issue:12"},
-        "step": {
-            "state": "waiting_instruction",
-            "stage": "pending_development",
-            "evidence": {
-                "instructions": [
-                    {
-                        "id": "github:1",
-                        "status": "consumed",
-                        "data": {"actor": "owner", "fingerprint": "proof"},
-                    }
-                ]
-            },
-        },
-        "pause_id": "github:1",
-        "before": {},
-        "after": {},
-    }
-    verify(data, "owner")
-    for change in (
-        lambda d: d["records"][0].update(intent="unknown"),
-        lambda d: d["comments"][0]["user"].update(login="other"),
-        lambda d: d["step"]["evidence"]["instructions"][0].update(status="pending"),
-        lambda d: d.update(after={"runs": ["new"]}),
-    ):
-        invalid = deepcopy(data)
-        change(invalid)
-        with pytest.raises(ValueError):
-            verify(invalid, "owner")

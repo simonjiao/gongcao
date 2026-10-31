@@ -1,23 +1,28 @@
-import argparse
 import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from beartype.roar import BeartypeCallHintParamViolation
 
-from gongcao.cli import execute, parser
-from gongcao.config import Config
 from gongcao.github import Deferred, GitHub, Target, Traffic, background, command
-from gongcao.model import Role
 
 
-def test_runtime_type_checks_are_enabled(store):
-    with pytest.raises(BeartypeCallHintParamViolation):
-        Target.parse(123)
-    with pytest.raises(BeartypeCallHintParamViolation):
-        store.task("wrong-type")
+async def test_paginated_cli_json_is_read_without_newer_slurp_flag(monkeypatch):
+    calls = []
+
+    async def raw(*args):
+        calls.append(args)
+        pages = [
+            'HTTP/2.0 200 OK\nLink: <next?after=AbC>; rel="next"\n\n{"items":[{"id":1}]}',
+            '{"items":[{"id":2}]}',
+        ]
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr("gongcao.github.command", raw)
+    assert await GitHub().pages("path", "items") == [{"id": 1}, {"id": 2}]
+    assert "--slurp" not in calls[0]
+    assert len(calls) == 2 and calls[-1][-1] == "next?after=AbC"
 
 
 @pytest.mark.parametrize(
@@ -36,17 +41,6 @@ def test_invalid_target_rejected(url):
 
 def test_canonical_target():
     assert Target.parse("https://github.com/a/b/pull/12/").url == "https://github.com/a/b/pull/12"
-
-
-def test_config_does_not_allow_granting_write_permissions(tmp_path):
-    config = tmp_path / "config.yaml"
-    config.write_text("roles:\n  reviewer:\n    writable: true\n")
-    with pytest.raises(ValueError):
-        Config.load(config)
-    config.write_text("timeout_seconds: -1\n")
-    with pytest.raises(ValueError):
-        Config.load(config)
-    assert not Role.REVIEWER.writable
 
 
 async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
@@ -202,24 +196,3 @@ async def test_pr_snapshot_keeps_base_branch_identity(monkeypatch):
     assert snapshot["base_ref"] == "release"
     assert snapshot["base_repository"] == "example/demo"
     assert snapshot["head_ref"] == "gongcao/task-277cd634480e"
-
-
-async def test_status_inspect_and_cancel_are_local(store, task_id, capsys):
-    for name in ("status", "inspect", "cancel"):
-        args = parser().parse_args([name, str(task_id)])
-        assert await execute(args, store) == 0
-        assert json.loads(capsys.readouterr().out)
-
-
-async def test_sync_queries_only_explicitly_registered_targets(
-    store, task_id, snapshot, monkeypatch
-):
-    urls = []
-
-    async def read(self, target):
-        urls.append(target.url)
-        return snapshot
-
-    monkeypatch.setattr(GitHub, "snapshot", read)
-    await execute(argparse.Namespace(command="sync", task=None), store)
-    assert urls == [snapshot["url"]]

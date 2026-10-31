@@ -5,11 +5,9 @@ GitHub 是 Issue、PR、Commit、Review、CI 和合并事实的权威来源。
 
 实现计划与验收边界见 [Issue #1](https://github.com/simonjiao/gongcao/issues/1)。
 
-基础阶段已在 [PR #2](https://github.com/simonjiao/gongcao/pull/2) 合并；
-第二阶段已在 [PR #4：GitHub 工作闭环与质量门禁](https://github.com/simonjiao/gongcao/pull/4) 合并。
-支持 Issue→开发/PR→独立审查/有限修订→项目检查、CI/真实验证→待人工合并。
-第三阶段在 [PR #14](https://github.com/simonjiao/gongcao/pull/14) 补充前台轮询、有限并发、依赖与安全恢复，
-见 [执行契约](docs/stage3.md) 和 [验收记录](docs/acceptance-stage3.md)。
+支持 Issue→开发/草稿 PR→独立审查/有限修订→项目检查与必要的真实验证→待人工合并，
+以及前台轮询、有限并发、依赖与安全恢复。当前契约见 [运行与恢复](docs/runtime.md)、
+[验证与证据归档](docs/validation-evidence.md)；CI 是否需要由目标项目决定。
 
 ## 安装与检查
 
@@ -107,9 +105,9 @@ Issue 初始代码基线为登记时本地 HEAD；首次发布时须仍匹配远
 默认本地数据目录是 `~/.local/state/gongcao`，可通过 `--state-dir PATH` 或
 `GONGCAO_STATE_DIR` 指定。目录包含 SQLite、结构化日志、上下文、SDK 会话和 Worktree；
 请使用专属目录。inspect 包含按版本绑定的检查结果及远端写入意图/确认记录。
-旧 SQLite 在事务内依次升级到模式版本 4；更高版本数据库会被拒绝打开，不静默降级。
-运行边界见 [第一阶段说明](docs/pr1.md) 和 [第二阶段说明](docs/pr2.md)，
-验证结果见 [第二阶段验收记录](docs/acceptance-pr2.md)。
+旧 SQLite 在事务内依次升级到模式版本 5；更高版本数据库会被拒绝打开，不静默降级。
+[基础执行](docs/pr1.md)、[工作流](docs/pr2.md)、[调度恢复](docs/stage3.md) 及
+[验收记录](docs/acceptance-stage3.md) 保留当时实现与固定 SHA 证据，属于历史记录。
 
 ## 自动发现与状态同步
 
@@ -156,7 +154,8 @@ SDK 原始输出、提示词及详细诊断继续保存在私有状态目录；`
 
 控制器先保存领取意图，再创建和回读唯一状态评论，确认作者、标记、评论 ID 后才登记任务。
 中断或写入结果不明时先对账；无法确认则保留记录并告警，禁止盲目重发或启动 Agent。
-任务变更会持久标记待同步，`serve` 维护同一条评论；`status` 的 `status_sync` 显示同步状态。
+领取评论保留为不可变锚点，任务里程碑由 `serve` 追加新评论；纠错引用原事件与评论。
+`status` 的 `status_sync` 显示同步状态，结果不明的发送只读对账、不重发。
 普通进度同步失败不打断 Agent。停用发现只停止新领取，已领取任务继续调度、同步。
 
 同用户、同文件系统命名空间内，以 `/tmp/gongcao-claims-UID/仓库哈希.lock` 跨 state-dir

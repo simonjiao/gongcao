@@ -1,48 +1,16 @@
 import asyncio
 import json
-import sys
 
 import pytest
+from _support.github import ReadOnlyGitHub
+from _support.worker import SUCCESS, install_worker
 
 from gongcao.config import Config
 from gongcao.events import Journal
-from gongcao.github import GitHub
 from gongcao.model import Stage, State
 from gongcao.processes import CleanupError
 from gongcao.runner import Runner
 from gongcao.sandbox import IsolationError, Sandbox
-
-
-class ReadOnlyGitHub(GitHub):
-    def __init__(self, snapshot):
-        self.value = snapshot
-
-    async def snapshot(self, target):
-        return dict(self.value)
-
-
-def install_worker(monkeypatch, source):
-    original = Sandbox.argv
-
-    def argv(self, *payload):
-        if payload[1:3] == ("-m", "gongcao.worker"):
-            payload = (sys.executable, "-c", source)
-        return original(self, *payload)
-
-    monkeypatch.setattr(Sandbox, "argv", argv)
-
-
-SUCCESS = """
-import json,sys,pathlib
-request = json.loads(sys.stdin.readline())
-if request['writable']:
-    pathlib.Path('/workspace/sample.txt').write_text('changed in worktree\\n')
-print(json.dumps({'kind':'thread','data':{'thread_id':request['context']['role']+'-thread'}}))
-print(json.dumps({'kind':'result','data':{
-    'conclusion':'ready','summary':'Inspected the assigned revision',
-    'basis':['sample.txt was inspected'],'target_sha':request['context']['target_sha'],
-    'next_steps':['Run validation']}}))
-"""
 
 
 async def test_complete_local_flow_uses_new_context_and_stops_at_pr_gate(

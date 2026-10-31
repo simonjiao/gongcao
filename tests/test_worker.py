@@ -7,7 +7,6 @@ import pytest
 from openai_codex.models import Notification, UnknownNotification
 
 from gongcao import worker
-from gongcao.config import Config
 
 
 @pytest.fixture
@@ -128,35 +127,6 @@ async def test_sdk_never_silently_falls_back(sdk, capsys, bad):
         )
     assert '"kind": "result"' not in capsys.readouterr().out
     assert len(calls) == (2 if bad == "reroute" else 1 if bad == "ack" else 0)
-
-
-def test_config_defaults_overrides_sources_and_policy(tmp_path):
-    default = Config.load(None)
-    assert default.model == "gpt-6.1-sol" and default.reasoning_effort == "xhigh"
-    assert set(default.execution["source"].values()) == {"project-default"}
-    path = tmp_path / "config.yaml"
-    path.write_text("model: gpt-6.1-sol\nreasoning_effort: xhigh\n")
-    assert set(Config.load(path).execution["source"].values()) == {"configuration"}
-    path.write_text("reasoning_effort: high\n")
-    assert Config.load(path).policy_hash != default.policy_hash
-    assert Config.load(path).execution["source"]["model"] == "project-default"
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "model: null",
-        'model: ""',
-        "reasoning_effort: turbo",
-        "reasoning_effort: null",
-        "reasoning_effort: []",
-    ],
-)
-def test_invalid_model_configuration_fails_before_session(tmp_path, text):
-    path = tmp_path / "config.yaml"
-    path.write_text(text)
-    with pytest.raises(ValueError):
-        Config.load(path)
 
 
 async def test_configured_model_on_later_catalog_page_is_supported(sdk, monkeypatch):

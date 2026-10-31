@@ -1,4 +1,4 @@
-"""Foreground PR2 controller. GitHub facts and exact-version evidence own every gate."""
+"""Advance task workflows through controller gates backed by exact-version evidence."""
 
 import asyncio
 import json

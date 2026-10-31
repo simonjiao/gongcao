@@ -44,7 +44,8 @@ README.md、manifest.json、SHA256SUMS。独立孤立提交起步，后续追加
 离线协议替身不冒充真实引擎/浏览器验收；真实 GitHub 归档须另获明确授权。
 
 分工按最新 Issue 正文执行：#78 负责 doctor/示例配置；本次仅删除失效 quality 示例段。
-#80 随后整理剩余 test_pr2/跨文件夹具/长期文档；#55 再做 E2E 去重和扩展，本次不搬迁剩余测试。
+#80 的当前测试职责与去重对应见 [测试组织](test-organization.md)；
+#55 负责未覆盖的真实端到端场景与 AirDB 实际验收。下文固定 SHA 记录保留原验收范围。
 
 固定实现 `906bc4fe2f6e2b80152d82185437d561d7419f94`：Python 3.12/3.13 各 284 项全量通过，
 Ruff、format、mypy、离线 QA 通过；本地复审无阻断项。验证在本机 WSL/Bubblewrap 执行，不依赖 CI，未使用 Docker。

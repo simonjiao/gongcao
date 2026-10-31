@@ -1,4 +1,4 @@
-"""One explicitly selected task per invocation. Remote writes are absent from PR1."""
+"""Execute an Agent in a fresh isolated session and record version-bound results."""
 
 import asyncio
 import json

@@ -4,7 +4,6 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_discovery import intake as intake
 
 from gongcao.config import DiscoveryConfig, Source
 from gongcao.discovery import Discovery
@@ -240,7 +239,7 @@ async def test_preparation_ignores_backlog_and_isolates_repository_failure(
 async def test_invalid_historical_path_does_not_abort_other_tasks_or_migrate(
     intake, store, tmp_path, monkeypatch, auth_file
 ):
-    from test_runner import SUCCESS, install_worker
+    from _support.worker import SUCCESS, install_worker
 
     install_worker(monkeypatch, SUCCESS)
     await intake.scan()
