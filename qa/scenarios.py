@@ -40,8 +40,7 @@ def fixture(run_id: str, model: str | None, scenario: str) -> tuple[str, dict[st
         "Keep imports at the top, Python style clean, and run the relevant stdlib unittest: "
         "uv run --offline --no-project --python /usr/bin/python3.12 python -B -m unittest "
         f"discover -s tests -p test_{module}.py -v. "
-        "Do not run full project checks yourself. "
-        + completion_guidance,
+        "Do not run full project checks yourself. " + completion_guidance,
         "reviewer": scope + "Read only. Independently inspect actual requirement, diff and tests. "
         "Check negative values return 0, zero/100 are preserved, >100 returns 100. "
         "Passing tests that omit negative inputs are insufficient. Return revise for the initial "
