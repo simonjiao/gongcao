@@ -2,6 +2,7 @@
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -281,7 +282,7 @@ def evaluate_delivery(task: dict[str, Any], facts: dict[str, Any]) -> dict[str, 
 
 async def probe(run: Run, sha: str) -> list[int]:
     module = f"qa_fixture_{run.id[:12]}"
-    directory = run.root / "probes" / sha
+    directory = run.root / "probes" / sha / uuid.uuid4().hex
     workspace = directory / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / ".git").touch()

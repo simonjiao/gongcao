@@ -100,6 +100,8 @@ async def test_independent_boundary_probe_uses_actual_read_only_sandbox(tmp_path
     )
     sha = (await command("git", "rev-parse", "HEAD", cwd=str(source))).strip()
     assert await probe(run, sha) == [-500, -1, 0, 1, 99, 100, 100, 100]
+    # Repeated verification of one SHA needs a fresh independent sandbox.
+    assert await probe(run, sha) == [-500, -1, 0, 1, 99, 100, 100, 100]
 
 
 def test_partial_sdk_log_never_counts_thread_start_as_inference(tmp_path):
