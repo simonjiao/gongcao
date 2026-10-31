@@ -44,7 +44,7 @@ Similar-looking cases remain independent: Store base/head invalidation versus Ru
 
 Changed assertions (no removed function/parameter):
 - `delivery::test_delivery_write_boundary_and_restart_preserve_completed_developer[acceptance_blocked]` also checks the new QA verifier against actual controller records; synthetic SDK facts are labelled offline. Ready/incomplete reports, non-draft/stale/duplicate PR facts, absent command evidence or missing controller checks are rejected.
-- `qa_evidence::test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims` now rejects overwritten claims, missing/repeated history, duplicate event/comment identities and foreign authors; both observation windows are corrupted when testing intrinsic uniqueness.
+- `qa_evidence::test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims` now rejects overwritten claims, missing/repeated history, duplicate event/comment identities and foreign authors; both observation windows are corrupted when testing intrinsic uniqueness. Normal later archive comments remain allowed, while a repeated step Agent is rejected.
 - `qa_resources::test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl` also checks checkpoint ownership, a moved checkpoint blocking all writes, exact-SHA deletion and repeat cleanup without replay.
 - The 33-line checkpoint helper and 239-line CLI helper move to `tests/_support/` with their existing callers/CLI entry updated; no old wrappers remain. These are offline protocols, never real QA.
 

@@ -189,6 +189,7 @@ def test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims()
         "step": {
             "state": "waiting_instruction",
             "stage": "pending_development",
+            "runs": [{"id": "step-analysis"}],
             "evidence": {
                 "instructions": [
                     {
@@ -236,11 +237,21 @@ def test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims()
         for row, comment in zip(data["records"], data["comments"], strict=True)
     }
     verify(data, "owner")
+    archived = deepcopy(data)
+    archived["history_after"][0].append(
+        {
+            "id": 999,
+            "body": "Gongcao evidence archive: confirmed link",
+            "user": {"id": 42, "login": "owner"},
+        }
+    )
+    verify(archived, "owner")  # Later archives must not invalidate real verification.
     for change in (
         lambda d: d["records"][0].update(intent="unknown"),
         lambda d: d["comments"][0]["user"].update(login="other"),
         lambda d: d["step"]["evidence"]["instructions"][0].update(status="pending"),
         lambda d: d.update(after={"runs": ["new"]}),
+        lambda d: d["step"]["runs"].append({"id": "duplicate-analysis"}),
         lambda d: d["history_after"][0].pop(),
         lambda d: d["claims"]["issue:10"].update(body="overwritten"),
         lambda d: d["history_after"][0].append(d["history_after"][0][-1]),

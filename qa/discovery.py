@@ -167,6 +167,7 @@ async def exercise(run: Run, github: GitHub) -> None:
             await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed"
         )
         history_after = [await github.instructions(row) for row in records]
+        records = [dict(row) for row in store.db.execute("SELECT * FROM claims ORDER BY url")]
         require(
             len(store.tasks()) == 2
             and store.db.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 2,
@@ -205,6 +206,7 @@ def verify(data: dict[str, Any], actor: str) -> None:
     require(
         data["step"]["state"] == "waiting_instruction"
         and data["step"]["stage"] == "pending_development"
+        and len(data["step"]["runs"]) == 1
         and any(
             i["id"] == data["pause_id"]
             and i["status"] == "consumed"
@@ -235,6 +237,16 @@ def verify(data: dict[str, Any], actor: str) -> None:
             "Original claim was overwritten",
         )
         # Reactions/avatar metadata can change; preserve comment identity, author and text.
+        # Normal evidence archives append their own comments after the serve window.
+        before, after = (
+            [
+                c
+                for c in rows
+                if claim["marker"] in (c.get("body") or "")
+                or "<!-- gongcao-progress:" in (c.get("body") or "")
+            ]
+            for rows in (before, after)
+        )
         require(
             [(c["id"], c["user"]["id"], c["user"]["login"], c["body"]) for c in before]
             == [(c["id"], c["user"]["id"], c["user"]["login"], c["body"]) for c in after],
