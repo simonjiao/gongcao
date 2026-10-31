@@ -244,7 +244,20 @@ async def test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl(
             ]
         },
     }
-    ref_exists, state = True, "open"
+    checkpoint = branch.replace("gongcao/work-", "gongcao/save-") + "-" + "a" * 32
+    saved = {"run_id": "a" * 32, "branch": checkpoint, "sha": sha}
+    task["runs"] = [
+        {
+            "id": saved["run_id"],
+            "role": "developer",
+            "state": "completed",
+            "details": {"save": saved | {"state": "confirmed"}},
+        }
+    ]
+    task["evidence"]["operations"].append(
+        {"kind": "checkpoint", "state": "succeeded", "payload": saved}
+    )
+    refs, state = {branch: sha, checkpoint: sha}, "open"
     writes = []
 
     class Remote(GitHub):
@@ -252,21 +265,23 @@ async def test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl(
             if row := base_response(run, path):
                 return row
             if "/git/ref/" in path:
-                if not ref_exists:
+                name = path.split("/git/ref/heads/")[1]
+                if name not in refs:
                     raise RuntimeError("HTTP 404")
-                return {"object": {"sha": sha}}
+                return {"object": {"sha": refs[name]}}
             return {"number": 19, "body": run.marker, "user": {"login": "qa"}, "state": state}
 
         async def pages(self, path, field=None):
             return []
 
     async def mutate(*args, **kwargs):
-        nonlocal ref_exists, state
+        nonlocal state
         writes.append(args)
         if args[:2] == ("git", "push"):
             assert "git@github.com:example/demo.git" in args
-            assert f"--force-with-lease=refs/heads/{branch}:{sha}" in args
-            ref_exists = False
+            name = args[-1].removeprefix(":refs/heads/")
+            assert f"--force-with-lease=refs/heads/{name}:{sha}" in args
+            del refs[name]
         else:
             state = "closed"
         return ""
@@ -277,8 +292,15 @@ async def test_branch_cleanup_validates_origin_and_ignores_foreign_pushurl(
             await cleanup(run, task, Remote())
         assert not writes
     else:
+        refs[checkpoint] = "f" * 40
+        with pytest.raises(Unconfirmed, match="foreign commit"):
+            await cleanup(run, task, Remote())
+        assert not writes and source.exists()
+        refs[checkpoint] = sha
         await cleanup(run, task, Remote())
-        assert run.value["cleaned"] and not ref_exists and len(writes) == 2
+        assert run.value["cleaned"] and not refs and len(writes) == 3
+        await cleanup(run, task, Remote())
+        assert len(writes) == 3  # Already-removed checkpoint never replays deletion.
 
 
 @pytest.mark.parametrize(
