@@ -3,6 +3,7 @@ import io
 import logging
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from gongcao.events import Journal, Redactor, terminal_logging
@@ -53,6 +54,23 @@ def test_dashboard_uses_local_activity_and_bounded_redacted_logs(
     narrow = io.StringIO()
     Console(file=narrow, width=46, height=12).print(view.render(46, 12))
     assert "另有 6 项" in narrow.getvalue() and "demo #1" in narrow.getvalue()
+
+
+def test_dashboard_wraps_long_logs_and_indents_continuations(store):
+    view = Dashboard(store)
+    with terminal_logging(view):
+        logging.getLogger("gongcao").info("长日志：%s 末尾标记", "中文数据" * 22)
+    lines = view.log_lines(56, 10)
+    assert len(lines) >= 3
+    assert lines[0].startswith("20") and " INFO " in lines[0]
+    assert all(line.startswith("    ") for line in lines[1:])
+    assert all(cell_len(line) <= 52 for line in lines)
+    assert "末尾标记" in "".join(lines)
+    assert view.log_lines(56, 2) == lines[-2:]
+
+    stream = io.StringIO()
+    Console(file=stream, width=56, height=17).print(view.render(56, 17))
+    assert "末尾标记" in stream.getvalue()
 
 
 @pytest.mark.parametrize(
