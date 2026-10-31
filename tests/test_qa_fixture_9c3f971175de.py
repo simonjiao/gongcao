@@ -11,6 +11,14 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class TestClampScore(unittest.TestCase):
+    def test_below_lower_bound(self) -> None:
+        for value in (-1000, -1):
+            with self.subTest(value=value):
+                self.assertEqual(_MODULE.clamp_score(value), 0)
+
+    def test_lower_bound(self) -> None:
+        self.assertEqual(_MODULE.clamp_score(0), 0)
+
     def test_positive_in_range(self) -> None:
         for value in (1, 42, 99):
             with self.subTest(value=value):
