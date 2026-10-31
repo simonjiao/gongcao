@@ -5,7 +5,7 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 12
+VERSION = 13
 SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery", "delivery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
@@ -15,6 +15,14 @@ def fixture(run_id: str, model: str | None, scenario: str) -> tuple[str, dict[st
     name = "delivery" if scenario == "delivery" else "requirement"
     requirement = (Path(__file__).parent / f"fixtures/{name}.md").read_text().format(module=module)
     scope = f"Only work on {module}.py and tests/test_{module}.py. "
+    completion_guidance = (
+        "Return ready with delivery_complete=true and the original context target_sha when "
+        "the two files for this authorized round are written. The deliberately faulty first "
+        "round is complete for delivery to independent review; it does not complete acceptance. "
+        "Use delivery_complete=false only if this round's editing itself is unfinished."
+        if scenario == "discovery"
+        else "Return ready with the original context target_sha."
+    )
     roles = {
         "analyst": scope + "Read only. Inspect the request and plan the complete final contract. "
         "Execute /usr/bin/sleep 20 after your first inspection command, for the cancel probe. "
@@ -33,10 +41,7 @@ def fixture(run_id: str, model: str | None, scenario: str) -> tuple[str, dict[st
         "uv run --offline --no-project --python /usr/bin/python3.12 python -B -m unittest "
         f"discover -s tests -p test_{module}.py -v. "
         "Do not run full project checks yourself. "
-        "Return ready with delivery_complete=true and the original context target_sha when "
-        "the two files for this authorized round are written. The deliberately faulty first "
-        "round is complete for delivery to independent review; it does not complete acceptance. "
-        "Use delivery_complete=false only if this round's editing itself is unfinished.",
+        + completion_guidance,
         "reviewer": scope + "Read only. Independently inspect actual requirement, diff and tests. "
         "Check negative values return 0, zero/100 are preserved, >100 returns 100. "
         "Passing tests that omit negative inputs are insufficient. Return revise for the initial "
