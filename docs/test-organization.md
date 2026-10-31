@@ -39,7 +39,7 @@ AST 比对测试体与参数（排除导入位置）无变化。随后仅合并�
 | 本地 bare Git、交付唯一性与验收缺项（#107） | test_delivery 的 test_delivery_write_boundary_and_restart_preserve_completed_developer[acceptance_blocked] 保留 blocked+true、单 PR、NOT_RUN、后续检查阻断；test_incomplete_developer_report_cannot_deliver 保留全部四个负例 |
 | Review/Validation 与需求变化门禁（#107） | test_delivery 保留全部请求变更窗口、安全负例、交付中断后旧上下文拒绝；test_workflow 保留独立评审/修订与正式批准缺失门禁 |
 | 未知写入与重启 | test_remote_writes 的 test_ambiguous_write_queries_remote_and_never_replays 全部六个参数；test_recovery 保留 SIGKILL、活进程/逃逸后代、精确 SHA、PR 成功但未本地确认等原 test_stability 用例 |
-| 追加 POST、历史不覆盖、未知对账、旧 PATCH 只读、取消与纠错（#107） | test_discovery 原有十个测试函数及其参数/断言不变；特别保留 test_filter_dedupe_backlog_status_and_cross_state_lock 与 test_refresh_only_current_status_without_scanning_and_respects_owner_lock |
+| 追加 POST、历史不覆盖、未知对账、旧 PATCH 只读、取消与纠错（#107） | test_discovery 保留九个测试函数及原有参数/断言；另两项按职责迁至 test_config（发现配置）和 test_qa_evidence（发现 QA 证据）；特别保留 test_filter_dedupe_backlog_status_and_cross_state_lock 与 test_refresh_only_current_status_without_scanning_and_respects_owner_lock |
 | CLI/本地 Git/OS 链（#107） | test_control_cli、test_discovery_cli 不变；test_checkpoints 仅迁出升级测试与改夹具导入 |
 | QA 取消/排队、证据、归属与清理 | test_qa_execution、test_qa_evidence、test_qa_resources 保留原 test_qa/test_qa_review 全部函数和参数；Discovery QA 证据核对移入 test_qa_evidence |
 
