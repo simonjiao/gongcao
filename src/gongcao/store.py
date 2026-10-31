@@ -192,11 +192,14 @@ class Store:
         facts["request"] = baseline(task) if any(facts.values()) else None
 
         def enqueue(data: dict[str, Any]) -> None:
-            if facts == data.get("progress_facts", dict.fromkeys(facts)):
+            if facts == data.get("progress_facts", dict.fromkeys(facts)) and (
+                not correction or task["reason"] == data.get("progress_reason")
+            ):
                 return
             if correction and not data.get("progress_last"):
                 raise ValueError("Correction requires a confirmed progress comment")
             data["progress_facts"] = facts
+            data["progress_reason"] = task["reason"]
             data.setdefault("progress", []).append(
                 {
                     "id": uuid.uuid4().hex,

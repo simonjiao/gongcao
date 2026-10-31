@@ -146,6 +146,12 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
         reopened.cancel(task["id"])
         await Discovery(reopened, Config(), intake.github).refresh(task["id"])
         assert intake.github.writes == ["POST"] * 2
+        reopened.halt(task["id"], State.CANCELLED, "Stopped before execution", correction=True)
+        await disabled.refresh(task["id"])
+        assert "Correction of event" in intake.github.comments[-1]["body"]
+        reopened.halt(task["id"], State.CANCELLED, "Stopped before execution", correction=True)
+        await disabled.refresh(task["id"])
+        assert intake.github.writes == ["POST"] * 3
         assert intake.github.comments[0] == claim
         assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
