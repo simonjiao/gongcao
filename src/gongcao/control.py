@@ -379,6 +379,7 @@ class Controls:
                         task_id,
                     ),
                 )
+            self.store.progress(task_id)
             return not pause
 
     def revalidate(self, task_id: int, config: Config) -> bool:

@@ -79,6 +79,12 @@ async def execute(request: dict[str, Any]) -> None:
                     "True engine/browser QA needs controlled environment and explicit "
                     "network/variables "
                     "grants; never request host credentials. Other roles return validation_plan=[]."
+                    " Only Developer in development/revision may set delivery_complete. Set it "
+                    "true only when implementation is complete and any blocked conclusion is "
+                    "solely pending later review, real-environment or release-artifact acceptance; "
+                    "list missing inputs and NOT_RUN checks honestly. Incomplete implementation "
+                    "or failing code/local execution must not claim delivery_complete=true. "
+                    "Other roles leave it null. This declaration does not authorize publication."
                 ),
             }
         )

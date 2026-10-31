@@ -6,10 +6,11 @@ import os
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .model import VERSION_FIELDS, Role, Stage, State, same_version
+from .model import VERSION_FIELDS, Role, Stage, State, development_complete, same_version
 
 
 class Store:
@@ -135,6 +136,84 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+    def claim_data(self, url: str, update: Callable[[dict[str, Any]], None]) -> None:
+        """Merge queue/retry changes under the same SQLite writer transaction."""
+        from .control import Controls
+
+        with Controls(self).transaction():
+            row = self.db.execute("SELECT data FROM claims WHERE url=?", (url,)).fetchone()
+            if row:
+                data = json.loads(row[0])
+                update(data)
+                self.db.execute("UPDATE claims SET data=? WHERE url=?", (json.dumps(data), url))
+
+    def progress(self, task_id: int, *, correction: bool = False) -> None:
+        """Called inside business transactions; retain facts, never polling/heartbeat changes."""
+        row = self.db.execute("SELECT url FROM claims WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return
+        task, runs = self.task(task_id), self.runs(task_id)
+        settled = [r for r in runs if r["ended"] and r["role"] != Role.ANALYST]
+        saves = [r for r in runs if r["details"].get("save", {}).get("state") == "confirmed"]
+        saved = saves[-1]["details"]["save"]["sha"] if saves else None
+        unchanged = bool(runs and runs[-1]["details"].get("save", {}).get("state") == "unchanged")
+        artifacts = [
+            a
+            for a in self.evidence(task_id)["artifacts"]
+            if a["valid"]
+            and a["sha"] == task["target_sha"]
+            and a["kind"] in {"quality-results", "validation"}
+        ]
+        facts = {
+            "run": settled[-1]["id"] if settled else None,
+            "save": [saved, unchanged] if saved or unchanged else None,
+            "pull": [task["pr_number"], task["target_sha"]] if task["pr_number"] else None,
+            "stage": task["stage"] if task["pr_number"] else None,
+            "checks": artifacts[-1]["id"] if artifacts else None,
+            "block": [
+                task["stage"],
+                task["state"],
+                None if task["state"] == State.CANCELLED else task["reason"],
+            ]
+            if task["state"]
+            in {
+                State.HUMAN,
+                State.RECONCILE,
+                State.FAILED,
+                State.WAITING_ENVIRONMENT,
+                State.WAITING_INSTRUCTION,
+                State.CANCELLED,
+            }
+            else None,
+        }
+        from .control import baseline
+
+        facts["request"] = baseline(task) if any(facts.values()) else None
+
+        def enqueue(data: dict[str, Any]) -> None:
+            if facts == data.get("progress_facts", dict.fromkeys(facts)) and (
+                not correction or task["reason"] == data.get("progress_reason")
+            ):
+                return
+            if correction and not data.get("progress_last"):
+                raise ValueError("Correction requires a confirmed progress comment")
+            data["progress_facts"] = facts
+            data["progress_reason"] = task["reason"]
+            data.setdefault("progress", []).append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "attempted": False,
+                    "corrects": dict(data["progress_last"]) if correction else None,
+                    "task": task,
+                    "runs": ([saves[-1]] if saves and (not runs or saves[-1] != runs[-1]) else [])
+                    + runs[-1:],
+                    "artifacts": list({a["kind"]: a for a in artifacts}.values()),
+                }
+            )
+            self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))
+
+        self.claim_data(row["url"], enqueue)
 
     def refresh_base(self, task_id: int, sha: str) -> None:
         """Caller owns the task lease and transaction, as for recovery retry."""
@@ -286,7 +365,7 @@ class Store:
         report = json.loads(run["result"] or "{}")
         if (
             run["state"] == State.COMPLETED
-            and report.get("conclusion") == "ready"
+            and development_complete(report)
             and report.get("target_sha") == task["target_sha"]
             and (run["evidence_valid"] or run["details"].get("delivery_changed"))
         ):
@@ -356,6 +435,7 @@ class Store:
                     else "GitHub version changed; renew instruction",
                     required_pause=changed_delivery,
                 )
+            self.progress(task_id)
 
     def begin_run(
         self,
@@ -429,6 +509,7 @@ class Store:
             details = json.loads(row["details"]) | values
             self.db.execute("UPDATE runs SET details=? WHERE id=?", (json.dumps(details), run_id))
             self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (row["task_id"],))
+            self.progress(row["task_id"])
 
     def save_guard(self, expected: dict[str, Any]) -> dict[str, Any]:
         """Narrow authority to preserve settled output, never to advance a stage or PR."""
@@ -503,7 +584,7 @@ class Store:
                     delivery
                     and run_state == State.COMPLETED
                     and result
-                    and json.loads(result).get("conclusion") == "ready"
+                    and development_complete(json.loads(result))
                 ):
                     stage, task_state = Stage(task["stage"]), State.WAITING_DEPENDENCY
                     reason = "Requirements changed; original output awaits draft PR delivery"
@@ -532,6 +613,7 @@ class Store:
             from .control import Controls
 
             Controls(self).checkpoint(task["id"], previous_stage=task["stage"])
+            self.progress(task["id"])
 
     def cancel(self, task_id: int) -> None:
         with self.db:
@@ -542,6 +624,7 @@ class Store:
                 "UPDATE tasks SET cancel_requested=1,state=?,reason=?,updated=? WHERE id=?",
                 (state, "Cancellation requested", time.time(), task_id),
             )
+            self.progress(task_id)
 
     def event(self, run_id: str, kind: str, summary: str) -> None:
         with self.db:
@@ -628,6 +711,7 @@ class Store:
             )
             if pause_reason:
                 Controls(self).invalidate(task["id"], pause_reason, required_pause=True)
+            self.progress(task["id"])
 
     def artifact(self, task_id: int, kind: str, policy: str) -> dict[str, Any] | None:
         task = self.task(task_id)
@@ -649,6 +733,8 @@ class Store:
                 "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
                 (expected["id"], expected["target_sha"], kind, policy, json.dumps(data)),
             )
+            if kind in {"quality-results", "validation"}:
+                self.progress(expected["id"])
 
     def operation(self, key: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM operations WHERE id=?", (key,)).fetchone()
@@ -680,7 +766,8 @@ class Store:
                 (state, json.dumps(response) if response is not None else None, key),
             )
 
-    def halt(self, task_id: int, state: State, reason: str) -> None:
+    def halt(self, task_id: int, state: State, reason: str, *, correction: bool = False) -> None:
+        """Only an explicit controller correction references the last published progress."""
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
@@ -690,6 +777,7 @@ class Store:
                 "UPDATE tasks SET state=?,reason=?,updated=? WHERE id=?",
                 (state, reason, time.time(), task_id),
             )
+            self.progress(task_id, correction=correction)
 
     def evidence(self, task_id: int) -> dict[str, Any]:
         artifacts = [

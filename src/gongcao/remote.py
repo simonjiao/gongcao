@@ -13,7 +13,7 @@ from .config import Config
 from .control import Controls, InstructionChanged, Paused, baseline
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
-from .model import VERSION_FIELDS, Role, Stage, State
+from .model import VERSION_FIELDS, Role, Stage, State, development_complete
 from .processes import NotStarted
 from .recovery import Recovery
 from .sandbox import Sandbox
@@ -304,7 +304,11 @@ class Controlled:
             return
         task = await self.before(task, "checkpoint")
         source = run["details"].get("source", {})
-        if source.get("baseline") != baseline(task) or run["target_sha"] != task["target_sha"]:
+        delivery = self.store.development_output(task)
+        if (
+            source.get("baseline") != baseline(task)
+            and not (delivery and delivery["id"] == run["id"] and run["state"] == State.COMPLETED)
+        ) or run["target_sha"] != task["target_sha"]:
             raise UncertainWrite("Run source no longer matches the task; preserving local output")
         if run["role"] != Role.DEVELOPER or run["state"] in {State.RUNNING, State.RECONCILE}:
             raise ValueError("Only settled Developer output can be saved")
@@ -382,12 +386,12 @@ class Controlled:
             if row["id"] == run["id"]
             and row["role"] == Role.DEVELOPER
             and row["state"] == "completed"
-            and (row["evidence_valid"] or self.store.development_output(task))
+            and self.store.development_output(task)
             and row["target_sha"] == task["target_sha"]
         ]
-        if not valid or any(
-            json.loads(valid[0]["result"]).get(key) != value
-            for key, value in (("conclusion", "ready"), ("target_sha", task["target_sha"]))
+        if not valid or (
+            not development_complete(json.loads(valid[0]["result"]))
+            or json.loads(valid[0]["result"]).get("target_sha") != task["target_sha"]
         ):
             raise ValueError("Publishing requires a confirmed developer result for this target")
         run = valid[0]
@@ -395,6 +399,10 @@ class Controlled:
         original = task | {
             "snapshot": run["details"].get("source", {}).get("request", task["snapshot"])
         }
+        report = json.loads(run["result"])
+        if report["conclusion"] == "blocked":
+            await self.checkpoint(task, run)
+            run = next(row for row in self.store.runs(task["id"]) if row["id"] == run["id"])
         source = await self.source(original)
         expected = run["details"].get("source", {}).get("sha", task["target_sha"])
         saved = run["details"].get("save", {})
@@ -448,7 +456,19 @@ class Controlled:
             "base": base_ref,
             "draft": True,
             "title": original["snapshot"]["title"],
-            "body": f"Implements {task['url']}\n\n{tag}",
+            "body": Redactor().text(
+                f"Implements {task['url']}\n\n{tag}\n\n"
+                f"Delivered output: Run `{run['id']}`, controller commit `{head}`, "
+                f"source `{expected}`, original target `{run['target_sha']}`.\n"
+                f"Checkpoint: {saved.get('state', 'not recorded')}.\n"
+                f"Agent report (self-reported, not controller acceptance): "
+                f"`{report['conclusion']}`; delivery_complete={report.get('delivery_complete')}.\n"
+                f"{report['summary']}\nReported checks/basis: {'; '.join(report['basis'])[:6000]}\n"
+                f"Remaining / missing inputs: {'; '.join(report['next_steps'])[:6000]}\n"
+                "Report excerpts only; full report retained locally.\n"
+                "Controller checks at this PR head: NOT_RUN. Review / quality / real acceptance "
+                "remain pending; missing inputs do not satisfy their gates. No merge or release."
+            ),
         }
 
         async def existing() -> dict[str, Any] | None:

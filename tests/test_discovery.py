@@ -104,7 +104,7 @@ def intake(store, repo, sha, snapshot):
                 raise ConnectionError("Reply lost after remote write")
             if self.failure == "interrupted":
                 raise asyncio.CancelledError
-            return deepcopy(self.comments[0])
+            return deepcopy(self.comments[-1])
 
     config = replace(Config(), discovery=DiscoveryConfig(True, 60, 1, (Source(name, repo),)))
     return Discovery(store, config, API())
@@ -124,7 +124,7 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
         assert task["control"]["mode"] == "step"
         assert task["target_sha"] == sha
         assert await command("git", "rev-parse", "HEAD", cwd=str(repo)) == head
-        assert intake.github.writes == ["POST", "PATCH"]
+        assert intake.github.writes == ["POST"]
         other = Store(tmp_path / "other-state")
         try:
             with pytest.raises(ValueError, match="already owns"):
@@ -134,11 +134,25 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
             other.close()
         await intake.scan()
         assert len(store.tasks()) == 2 and len(intake.github.comments) == 1
+    claim = deepcopy(intake.github.comments[0])
+    store.cancel(task["id"])
     reopened = Store(store.root)
     try:
         disabled = Discovery(reopened, Config(), intake.github)
         async with disabled.active(once=True):
-            assert len(reopened.tasks()) == 2 and len(intake.github.writes) == 2
+            assert len(reopened.tasks()) == 2 and intake.github.writes == ["POST"] * 2
+            assert "State: `cancelled`" in intake.github.comments[-1]["body"]
+        reopened.sync(task["id"], task["snapshot"])
+        reopened.cancel(task["id"])
+        await Discovery(reopened, Config(), intake.github).refresh(task["id"])
+        assert intake.github.writes == ["POST"] * 2
+        reopened.halt(task["id"], State.CANCELLED, "Stopped before execution", correction=True)
+        await disabled.refresh(task["id"])
+        assert "Correction of event" in intake.github.comments[-1]["body"]
+        reopened.halt(task["id"], State.CANCELLED, "Stopped before execution", correction=True)
+        await disabled.refresh(task["id"])
+        assert intake.github.writes == ["POST"] * 3
+        assert intake.github.comments[0] == claim
         assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         reopened.close()
@@ -191,8 +205,38 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
         assert len(intake.github.writes) == writes
     await intake.refresh(task["id"])
     assert len(store.tasks()) == 1 and len(intake.github.writes) == writes + 1
-    assert intake.github.calls == {"read": 3} and not intake.records()[0]["dirty"]
-    assert "waiting_instruction" in intake.github.comments[0]["body"]
+    assert intake.github.calls == {"read": 2, "pages": 2} and not intake.records()[0]["dirty"]
+    assert "waiting_instruction" in intake.github.comments[-1]["body"]
+    claim = deepcopy(intake.github.comments[0])
+    mutate = intake.github.mutate
+
+    async def completed(*args, **kwargs):
+        result = await mutate(*args, **kwargs)
+        # A separate controller connection enqueues while the first POST awaits confirmation.
+        other = Store(store.root)
+        try:
+            other.halt(task["id"], State.HUMAN, "Missing acceptance package")
+        finally:
+            other.close()
+        return result
+
+    monkeypatch.setattr(intake.github, "mutate", completed)
+    Controls(store).issue(task["id"], "auto", policy=intake.config.policy_hash)
+    await intake.refresh(task["id"])
+    assert intake.github.comments[0] == claim and intake.github.writes == ["POST"] * 4
+    assert len({c["body"].splitlines()[0] for c in intake.github.comments[1:]}) == 3
+    history = deepcopy(intake.github.comments)
+    assert all("Correction of event" not in c["body"] for c in history)
+    previous = history[-1]
+    event_id = previous["body"].splitlines()[0].split(":")[1].split()[0]
+    monkeypatch.setattr(intake.github, "mutate", mutate)
+    store.halt(task["id"], State.HUMAN, "Package exists; authorization missing", correction=True)
+    await Discovery(store, Config(), intake.github).refresh(task["id"])
+    correction = intake.github.comments[-1]["body"]
+    assert f"Correction of event `{event_id}`" in correction
+    assert f"{task['url']}#issuecomment-{previous['id']}" in correction
+    assert intake.github.comments[:-1] == history and intake.github.writes == ["POST"] * 5
+    assert intake.github.rows[task["snapshot"]["number"]]["body"] == task["snapshot"]["body"]
 
 
 @pytest.mark.parametrize("failure", ["absent", "limited"])
@@ -205,7 +249,8 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     Controls(store).issue(task["id"], "pause")
     await intake.cycle(discover=False)
     row = intake.records()[0]
-    assert row["dirty"] and bool(row["intent"]) == (failure == "absent") and row["reason"]
+    event = json.loads(row["data"])["progress"][0]
+    assert row["dirty"] and event["attempted"] == (failure == "absent") and row["reason"]
     assert store.task(task["id"])["state"] == State.WAITING_INSTRUCTION
     writes = len(intake.github.writes)
     intake.github.failure = ""
@@ -213,22 +258,27 @@ async def test_progress_failure_is_durable_without_stopping_work_and_preserves_o
     await restarted.cycle(discover=False)
     assert len(intake.github.writes) == writes
     if failure == "absent":
-        intake.github.comments[0]["body"] = row["intent"]
+        store.halt(task["id"], State.HUMAN, "New milestone behind unknown POST")
+        with pytest.raises(ValueError, match="refusing replay"):
+            await restarted.publish(restarted.records()[0])
+        assert len(intake.github.writes) == writes
+        intake.github.comments.append({"id": 2, "user": {"login": "owner"}, "body": event["body"]})
     restarted.retry.clear()
     import time
 
     future = time.time() + 1000
     monkeypatch.setattr("gongcao.discovery.time.time", lambda: future)
     await restarted.cycle(discover=False)
-    assert not restarted.records()[0]["intent"] and not restarted.records()[0]["dirty"]
-    assert len(intake.github.writes) == writes + (failure == "limited")
+    assert not json.loads(restarted.records()[0]["data"])["progress"]
+    assert not restarted.records()[0]["dirty"]
+    assert len(intake.github.writes) == writes + 1
     intake.github.comments[0]["user"]["login"] = "other"
     with pytest.raises(ValueError, match="author"):
         await restarted.publish(restarted.records()[0])
 
 
 @pytest.mark.parametrize("lost_response", [False, True])
-async def test_status_recovers_after_repeated_failures_and_restart_without_replaying_patch(
+async def test_status_recovers_after_repeated_failures_and_restart_without_replaying_post(
     intake, store, monkeypatch, lost_response
 ):
     import time
@@ -239,6 +289,7 @@ async def test_status_recovers_after_repeated_failures_and_restart_without_repla
     now = time.time()
     monkeypatch.setattr("gongcao.discovery.time.time", lambda: now)
     original_owned, original_mutate = intake.owned, intake.github.mutate
+    original_instructions = intake.github.instructions
     offline = not lost_response
     reads = 0
 
@@ -254,12 +305,18 @@ async def test_status_recovers_after_repeated_failures_and_restart_without_repla
         result = await original_mutate(*args, **kwargs)
         if lost_response:
             offline = True
-            raise ConnectionError("PATCH applied, response lost")
+            raise ConnectionError("POST applied, response lost")
         return result
+
+    async def instructions(task):
+        if offline:
+            raise ConnectionError("Comment pages unavailable")
+        return await original_instructions(task)
 
     monkeypatch.setattr(Discovery, "owned", owned)
     monkeypatch.setattr(intake.github, "mutate", mutate)
-    patches = intake.github.writes.count("PATCH")
+    monkeypatch.setattr(intake.github, "instructions", instructions)
+    posts = intake.github.writes.count("POST")
     # Exceed the old three-attempt cutoff and reach the capped delay.
     for failures in range(1, 8):
         await intake.handoff(task_id)
@@ -280,12 +337,30 @@ async def test_status_recovers_after_repeated_failures_and_restart_without_repla
         row = restarted.records()[0]
         assert not row["dirty"] and not row["intent"] and not row["reason"]
         assert "status_retry" not in json.loads(row["data"])
-        assert row["confirmed"] == intake.github.comments[0]["body"] == restarted.render(row)
-        assert intake.github.writes.count("PATCH") == patches + 1
+        assert row["confirmed"] == intake.github.comments[0]["body"]
+        assert json.loads(row["data"])["progress_last"]["comment_id"] == 2
+        assert intake.github.writes.count("POST") == posts + 1
         await restarted.handoff(task_id)
-        assert intake.github.writes.count("PATCH") == patches + 1
+        assert intake.github.writes.count("POST") == posts + 1
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("applied", [False, True])
+async def test_legacy_status_intent_is_read_only(intake, store, applied):
+    await intake.scan()
+    row = intake.records()[0]
+    intended = row["confirmed"] + "\nHistorical status update"
+    intake.save(row["url"], intent=intended)
+    if applied:
+        intake.github.comments[0]["body"] = intended
+        await intake.publish(intake.records()[0])
+        assert intake.records()[0]["confirmed"] == intended and not intake.records()[0]["intent"]
+    else:
+        with pytest.raises(ValueError, match="refusing replay"):
+            await intake.publish(intake.records()[0])
+        assert intake.records()[0]["intent"] == intended
+    assert intake.github.writes == ["POST"]
 
 
 @pytest.mark.parametrize("unsafe", [False, True])
@@ -331,6 +406,25 @@ async def test_merged_fact_wins_over_new_default_base_without_operators(intake, 
             "UPDATE tasks SET pr_number=9,stage=?,state=? WHERE id=?",
             (Stage.MERGEABLE, state, task["id"]),
         )
+    # Validation and the final stage must retain the actual current-SHA check results.
+    with store.db:
+        store.db.execute(
+            "UPDATE tasks SET stage=?,state=? WHERE id=?",
+            (Stage.VALIDATION, State.WAITING_DEPENDENCY, task["id"]),
+        )
+    store.record(
+        store.task(task["id"]),
+        "quality-results",
+        "test",
+        {"items": [{"category": "internal", "status": "passed"}]},
+    )
+    store.record(store.task(task["id"]), "validation", "test", {})
+    store.transition(store.task(task["id"]), Stage.MERGEABLE, State.COMPLETED, "Await human merge")
+    await intake.handoff(task["id"])
+    assert "`mergeable`" in intake.github.comments[-1]["body"]
+    assert "Controller checks: internal: PASS" in intake.github.comments[-1]["body"]
+    with store.db:
+        store.db.execute("UPDATE tasks SET state=? WHERE id=?", (state, task["id"]))
     intake.github.rows[9] = intake.github.rows[1] | {
         "merged": True,
         "state": "closed",
@@ -345,7 +439,7 @@ async def test_merged_fact_wins_over_new_default_base_without_operators(intake, 
     await intake.cycle(discover=False)
     current = store.task(task["id"])
     assert (current["stage"], current["state"]) == (Stage.MERGED, State.COMPLETED)
-    assert "`merged`" in intake.github.comments[0]["body"] and not current["status_sync"]["dirty"]
+    assert "`merged`" in intake.github.comments[-1]["body"] and not current["status_sync"]["dirty"]
     assert not store.runs(task["id"])
 
 

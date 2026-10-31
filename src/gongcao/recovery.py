@@ -11,7 +11,7 @@ from .control import Controls, InstructionChanged
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
 from .leases import Lease, identity, session_alive
-from .model import AgentResult, Stage, State
+from .model import AgentResult, Role, Stage, State, development_complete
 from .store import Store
 from .workspace import repository
 
@@ -180,10 +180,12 @@ class Recovery:
             if run["state"] == State.COMPLETED and verify:
                 try:
                     report = AgentResult.model_validate_json(run["result"] or "{}")
-                    valid = report.target_sha == run["target_sha"] and report.conclusion in {
-                        "ready",
-                        "revise",
-                    }
+                    valid = report.target_sha == run["target_sha"] and (
+                        development_complete(report.model_dump())
+                        if run["role"] == Role.DEVELOPER
+                        else report.conclusion in {"ready", "revise"}
+                        and report.delivery_complete is None
+                    )
                 except ValueError:
                     valid = False
                 if not valid:
@@ -338,7 +340,11 @@ class Recovery:
                 self.store.refresh_base(task_id, refreshed_sha)
             self.store.db.execute(
                 "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
-                "(state!='completed' OR json_extract(result,'$.conclusion')!='ready' "
+                "(state!='completed' OR NOT ("
+                "(json_extract(result,'$.conclusion')='ready' AND "
+                "COALESCE(json_extract(result,'$.delivery_complete'),1)!=0) OR "
+                "(role='developer' AND json_extract(result,'$.conclusion')='blocked' "
+                "AND json_extract(result,'$.delivery_complete')=1)) "
                 "OR json_extract(result,'$.target_sha')!=target_sha "
                 "OR role IN ('reviewer','validator'))",
                 (task_id,),
