@@ -134,11 +134,19 @@ async def test_filter_dedupe_backlog_status_and_cross_state_lock(
             other.close()
         await intake.scan()
         assert len(store.tasks()) == 2 and len(intake.github.comments) == 1
+    claim = deepcopy(intake.github.comments[0])
+    store.cancel(task["id"])
     reopened = Store(store.root)
     try:
         disabled = Discovery(reopened, Config(), intake.github)
         async with disabled.active(once=True):
-            assert len(reopened.tasks()) == 2 and len(intake.github.writes) == 1
+            assert len(reopened.tasks()) == 2 and intake.github.writes == ["POST"] * 2
+            assert "State: `cancelled`" in intake.github.comments[-1]["body"]
+        reopened.sync(task["id"], task["snapshot"])
+        reopened.cancel(task["id"])
+        await Discovery(reopened, Config(), intake.github).refresh(task["id"])
+        assert intake.github.writes == ["POST"] * 2
+        assert intake.github.comments[0] == claim
         assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         reopened.close()
@@ -211,6 +219,17 @@ async def test_refresh_only_current_status_without_scanning_and_respects_owner_l
     await intake.refresh(task["id"])
     assert intake.github.comments[0] == claim and intake.github.writes == ["POST"] * 4
     assert len({c["body"].splitlines()[0] for c in intake.github.comments[1:]}) == 3
+    history = deepcopy(intake.github.comments)
+    assert all("Correction of event" not in c["body"] for c in history)
+    previous = history[-1]
+    event_id = previous["body"].splitlines()[0].split(":")[1].split()[0]
+    monkeypatch.setattr(intake.github, "mutate", mutate)
+    store.halt(task["id"], State.HUMAN, "Package exists; authorization missing", correction=True)
+    await Discovery(store, Config(), intake.github).refresh(task["id"])
+    correction = intake.github.comments[-1]["body"]
+    assert f"Correction of event `{event_id}`" in correction
+    assert f"{task['url']}#issuecomment-{previous['id']}" in correction
+    assert intake.github.comments[:-1] == history and intake.github.writes == ["POST"] * 5
     assert intake.github.rows[task["snapshot"]["number"]]["body"] == task["snapshot"]["body"]
 
 

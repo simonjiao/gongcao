@@ -580,6 +580,12 @@ class Discovery:
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
+        if event and (corrects := event.get("corrects")):
+            body += (
+                f"\nCorrection of event `{corrects['event_id']}`: "
+                f"[comment {corrects['comment_id']}]"
+                f"({task['url']}#issuecomment-{corrects['comment_id']})"
+            )
 
         if runs:
             run = runs[-1]

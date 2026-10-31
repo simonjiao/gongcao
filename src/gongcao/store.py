@@ -148,7 +148,7 @@ class Store:
                 update(data)
                 self.db.execute("UPDATE claims SET data=? WHERE url=?", (json.dumps(data), url))
 
-    def progress(self, task_id: int) -> None:
+    def progress(self, task_id: int, *, correction: bool = False) -> None:
         """Called inside business transactions; retain facts, never polling/heartbeat changes."""
         row = self.db.execute("SELECT url FROM claims WHERE task_id=?", (task_id,)).fetchone()
         if not row:
@@ -171,7 +171,11 @@ class Store:
             "pull": [task["pr_number"], task["target_sha"]] if task["pr_number"] else None,
             "stage": task["stage"] if task["pr_number"] else None,
             "checks": artifacts[-1]["id"] if artifacts else None,
-            "block": [task["stage"], task["state"], task["reason"]]
+            "block": [
+                task["stage"],
+                task["state"],
+                None if task["state"] == State.CANCELLED else task["reason"],
+            ]
             if task["state"]
             in {
                 State.HUMAN,
@@ -179,6 +183,7 @@ class Store:
                 State.FAILED,
                 State.WAITING_ENVIRONMENT,
                 State.WAITING_INSTRUCTION,
+                State.CANCELLED,
             }
             else None,
         }
@@ -189,11 +194,14 @@ class Store:
         def enqueue(data: dict[str, Any]) -> None:
             if facts == data.get("progress_facts", dict.fromkeys(facts)):
                 return
+            if correction and not data.get("progress_last"):
+                raise ValueError("Correction requires a confirmed progress comment")
             data["progress_facts"] = facts
             data.setdefault("progress", []).append(
                 {
                     "id": uuid.uuid4().hex,
                     "attempted": False,
+                    "corrects": dict(data["progress_last"]) if correction else None,
                     "task": task,
                     "runs": ([saves[-1]] if saves and (not runs or saves[-1] != runs[-1]) else [])
                     + runs[-1:],
@@ -613,6 +621,7 @@ class Store:
                 "UPDATE tasks SET cancel_requested=1,state=?,reason=?,updated=? WHERE id=?",
                 (state, "Cancellation requested", time.time(), task_id),
             )
+            self.progress(task_id)
 
     def event(self, run_id: str, kind: str, summary: str) -> None:
         with self.db:
@@ -754,7 +763,8 @@ class Store:
                 (state, json.dumps(response) if response is not None else None, key),
             )
 
-    def halt(self, task_id: int, state: State, reason: str) -> None:
+    def halt(self, task_id: int, state: State, reason: str, *, correction: bool = False) -> None:
+        """Only an explicit controller correction references the last published progress."""
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.task(task_id)
@@ -764,7 +774,7 @@ class Store:
                 "UPDATE tasks SET state=?,reason=?,updated=? WHERE id=?",
                 (state, reason, time.time(), task_id),
             )
-            self.progress(task_id)
+            self.progress(task_id, correction=correction)
 
     def evidence(self, task_id: int) -> dict[str, Any]:
         artifacts = [
