@@ -1,12 +1,13 @@
-"""Review regressions: cancellation boundaries and remote cleanup races, offline only."""
-
 import asyncio
-import hashlib
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from test_qa import new_run
+from _support.cli import QA, cli_env, events, run_cli
+from _support.qa import new_run
 
 from gongcao.config import Config
 from gongcao.github import GitHub, command
@@ -16,10 +17,187 @@ from gongcao.store import Store
 from qa.__main__ import execute as cli_execute
 from qa.__main__ import parser
 from qa.copilot import wake
+from qa.evidence import verify_archived, verify_batch
 from qa.ledger import Run, RunCancelled
-from qa.resources import Unconfirmed, cleanup
-from qa.runner import batch, core, execute
+from qa.runner import batch, core, execute, verify_implementation
 from qa.scenarios import pytest_snapshot_script
+
+
+def test_offline_qa_defaults_yaml_override_and_batch_evidence(checkout, tmp_path):
+    env = cli_env(checkout, tmp_path / "gate")
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    path = tmp_path / "jobs.yaml"
+    path.write_text("scheduler:\n  jobs: 3\nqa:\n  jobs: 1\nmodel: ignored-production-policy\n")
+    for name, options, expected in (
+        ("default", [], 2),
+        ("yaml", ["--config", str(path)], 1),
+        ("override", ["--config", str(path), "--jobs", "2"], 2),
+    ):
+        data = tmp_path / name
+        argv = (*QA, "--data-dir", str(data))
+        report = run_cli(checkout, env, *argv, "run", "smoke", "--repeat", "3", *options)
+        assert report["passed"] and report["jobs"] == expected
+        assert [row["status"] for row in report["results"]] == ["passed"] * 3
+        verified = run_cli(checkout, env, *argv, "verify-batch", report["id"])
+        assert verified["passed"] and verified["peak_runs"] == expected and verified["queued"]
+        assert verified["runs"] == report["runs"] and len(set(report["runs"])) == 3
+        for run_id in report["runs"]:
+            manifest = json.loads((data / "runs" / run_id / "manifest.json").read_text())
+            assert manifest["implementation_sha"] == sha
+            assert not manifest["resources"] and not manifest["actions"]
+        # A real verification command must reject changed archived evidence.
+        if name == "override":
+            (data / "runs" / report["id"] / "verdict.json").write_text("{}")
+            rejected = subprocess.run(
+                [*argv, "verify-batch", report["id"]],
+                cwd=checkout,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert rejected.returncode == 1
+            assert "Evidence changed" in json.loads(rejected.stdout)["failure"]
+    assert not events(tmp_path / "gate")
+
+
+async def test_batch_queue_failure_isolation_and_durable_evidence(tmp_path, monkeypatch):
+    active = set()
+    peak = 0
+    release = asyncio.Event()
+    seen = []
+
+    async def environment(**kwargs):
+        return {}
+
+    async def command(*args, **kwargs):
+        return "a" * 40 if args[:3] == ("git", "rev-parse", "HEAD") else ""
+
+    async def execute(run, **kwargs):
+        nonlocal peak
+        assert run.root.is_dir()
+        active.add(run.id)
+        peak = max(peak, len(active))
+        seen.append(run.id)
+        if len(seen) == 1:
+            await release.wait()
+        elif len(seen) == 2:
+            release.set()
+            await asyncio.sleep(0.01)
+        try:
+            if run.value["scenario"] == "recover":
+                raise ValueError("one deliberately fails")
+            run.archive("verdict", {"passed": True, "at": 1})
+            run.value["status"] = "passed"
+            run.save()
+        finally:
+            active.remove(run.id)
+
+    monkeypatch.setattr("qa.runner.check", environment)
+    monkeypatch.setattr("qa.runner.command", command)
+    monkeypatch.setattr("qa.runner.execute", execute)
+    report = await batch(
+        tmp_path,
+        ["smoke", "recover", "smoke"],
+        jobs=2,
+        real=True,
+        repository="example/demo",
+        model=None,
+        clean=False,
+    )
+    assert peak == 2 and len(seen) == 3 and not report["passed"]
+    assert [r["status"] for r in report["results"]] == ["passed", "interrupted", "passed"]
+    events = report["events"]
+    third = next(e for e in events if e["kind"] == "started" and e["run_id"] == seen[2])
+    assert any(e["kind"] == "released" and e["at"] <= third["at"] for e in events)
+    first = Run(tmp_path, seen[0])
+    assert verify_archived(first)["passed"]
+    with pytest.raises(ValueError):
+        verify_batch(tmp_path, report["id"])
+
+
+async def test_fault_kills_only_owned_controller_before_local_ack(tmp_path, repo, sha, snapshot):
+    run = new_run(tmp_path, "recover")
+    run.value["resources"]["issue"] = {"url": snapshot["url"]}
+    run.save()
+    store = Store(run.root / "state")
+    try:
+        task_id = store.register(snapshot["url"], repo, sha, snapshot)
+        store.intent(store.task(task_id), "owned-op", "review", "{}")
+    finally:
+        store.close()
+
+    script = """
+from pathlib import Path
+from gongcao.store import Store
+import qa.fault as fault
+import os
+store = Store(Path(os.environ['QA_TEST_STATE']))
+fault.gongcao_main = lambda: store.operation_result('owned-op', 'succeeded', {'id': 23})
+fault.main()
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        env={
+            **os.environ,
+            "GONGCAO_QA_DATA": str(tmp_path),
+            "GONGCAO_QA_RUN": run.id,
+            "QA_TEST_STATE": str(run.root / "state"),
+        },
+    )
+    assert await asyncio.wait_for(process.wait(), 10) == -9
+    witness = json.loads((run.root / "fault.json").read_text())
+    assert witness["operation"] == "owned-op" and witness["observed_response"] == {"id": 23}
+    store = Store(run.root / "state")
+    try:
+        assert store.operation("owned-op")["state"] == "pending"
+    finally:
+        store.close()
+
+
+async def test_cancel_scenario_must_not_pass_a_normal_loop(tmp_path, monkeypatch):
+    run = new_run(tmp_path, "cancel")
+    task = {"stage": "mergeable", "state": "completed", "evidence": {"operations": []}}
+
+    async def prepare(run, github, model):
+        run.value["task_id"] = 1
+
+    async def drive(run, **kwargs):
+        return 0
+
+    monkeypatch.setattr("qa.runner.prepare", prepare)
+    monkeypatch.setattr("qa.runner.drive", drive)
+    monkeypatch.setattr("qa.runner.inspect", lambda run: task)
+    await execute(run, model=None, clean=False)
+    assert run.value["status"] == "failed"
+    assert "never triggered" in run.value["failure"]
+
+
+async def test_changed_implementation_cannot_start_or_pass(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+
+    async def command(*args, **kwargs):
+        return "b" * 40 if args[:3] == ("git", "rev-parse", "HEAD") else ""
+
+    monkeypatch.setattr("qa.runner.command", command)
+    with pytest.raises(ValueError, match="Implementation changed"):
+        await verify_implementation(run)
+
+
+async def test_qa_launches_actual_native_cli_without_remote_credentials(tmp_path, monkeypatch):
+    run = new_run(tmp_path)
+
+    async def fixed(run):
+        pass  # The protocol fixture has no implementation checkout; test the real CLI launch.
+
+    monkeypatch.setattr("qa.runner.verify_implementation", fixed)
+    assert await core(run, "status") == 0
+    records = list(run.root.glob("command-*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert json.loads(record["stdout"]) == [] and not record["stderr"]
 
 
 async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_path, monkeypatch):
@@ -61,7 +239,6 @@ async def test_copilot_wakeup_waits_for_lease_release_before_stopping_serve(tmp_
 async def test_qa_pytest_snapshot_supports_git_clones_inside_real_quality_sandbox(
     store, repo, snapshot
 ):
-    from pathlib import Path
     from shutil import copyfile, copytree, ignore_patterns
 
     # This fixture owns its pytest dependencies at the target SHA. Quality no longer
@@ -340,124 +517,3 @@ async def test_cancellation_during_implementation_check_prevents_native_spawn(
     monkeypatch.setattr("qa.runner.asyncio.create_subprocess_exec", forbidden)
     with pytest.raises(RunCancelled):
         await core(run, "run", "1")
-
-
-@pytest.mark.parametrize(
-    "race",
-    [
-        "merge_on_confirmation",
-        "merge_at_finish",
-        "base_at_start",
-        "base_at_finish",
-        "merged_pr_missing_from_listing",
-        "registered_pr_404",
-        "published_pr_not_associated",
-    ],
-)
-async def test_cleanup_rechecks_unmerged_pr_and_fixed_base_before_reporting_cleaned(
-    tmp_path, repo, sha, monkeypatch, race
-):
-    run = new_run(tmp_path)
-    source = run.root / "source"
-    await command("git", "clone", "-q", str(repo), str(source))
-    await command(
-        "git", "remote", "set-url", "origin", "https://github.com/example/demo.git", cwd=str(source)
-    )
-    issue_url = "https://github.com/example/demo/issues/19"
-    branch = "gongcao/work-" + hashlib.sha256(issue_url.encode()).hexdigest()[:12]
-    run.value["resources"] = {"issue": {"number": 19, "url": issue_url}, "branch": branch}
-    task = {
-        "url": issue_url,
-        "repo_path": str(source),
-        "snapshot": {"repository": "example/demo"},
-        "pr_number": 23,
-        "runtime": {"lease": None, "processes": []},
-        "runs": [],
-        "evidence": {
-            "operations": [
-                {"kind": "push", "state": "succeeded", "payload": {"branch": branch, "sha": sha}}
-            ]
-        },
-    }
-    if race == "published_pr_not_associated":
-        task["pr_number"] = None
-        task["evidence"]["operations"].append(
-            {"kind": "pull", "state": "succeeded", "response": {"number": 23}}
-        )
-    pull = {
-        "number": 23,
-        "state": "open",
-        "merged": False,
-        "merged_at": None,
-        "body": f"Implements {issue_url}",
-        "user": {"login": "qa"},
-        "head": {"repo": {"full_name": "example/demo"}, "ref": branch},
-    }
-    branch_exists = True
-    issue_state = "open"
-    base_sha = "b" * 40 if race == "base_at_start" else run.value["base_sha"]
-    writes = []
-
-    class Remote(GitHub):
-        async def read(self, path):
-            if path == "repos/example/demo":
-                return {"default_branch": "main"}
-            if path.endswith("/git/ref/heads/main"):
-                return {"object": {"sha": base_sha}}
-            if "/git/ref/" in path:
-                if not branch_exists:
-                    raise RuntimeError("HTTP 404")
-                return {"object": {"sha": sha}}
-            if "/pulls/" in path:
-                if race == "registered_pr_404":
-                    raise RuntimeError("HTTP 404")
-                if race == "merged_pr_missing_from_listing":
-                    return pull | {
-                        "state": "closed",
-                        "merged": True,
-                        "merged_at": "2026-10-25T00:00:00Z",
-                    }
-                return dict(pull)
-            return {"number": 19, "body": run.marker, "state": issue_state, "user": {"login": "qa"}}
-
-        async def pages(self, path, field=None):
-            if race in {
-                "merged_pr_missing_from_listing",
-                "registered_pr_404",
-                "published_pr_not_associated",
-            }:
-                return []
-            return [dict(pull)]
-
-    async def mutate(*args, **kwargs):
-        nonlocal branch_exists, issue_state, base_sha
-        writes.append(args)
-        if args[:2] == ("git", "push"):
-            branch_exists = False
-            if race == "merge_at_finish":
-                pull.update(merged=True, merged_at="2026-10-25T00:00:00Z")
-            if race == "base_at_finish":
-                base_sha = "b" * 40
-        elif "/pulls/" in args[4]:
-            pull["state"] = "closed"
-            if race == "merge_on_confirmation":
-                pull.update(merged=True, merged_at="2026-10-25T00:00:00Z")
-        else:
-            issue_state = "closed"
-        return "{}"
-
-    monkeypatch.setattr("qa.resources.command", mutate)
-    with pytest.raises(Unconfirmed):
-        await cleanup(run, task, Remote())
-    assert not run.value["cleaned"] and run.value["status"] == "needs_reconciliation"
-    assert source.exists() and not (run.root / "cleanup-confirmed.json").exists()
-    if race == "merge_on_confirmation":
-        assert branch_exists and len(writes) == 1
-        assert run.value["actions"]["close-pull"]["state"] == "unknown"
-    elif race in {
-        "base_at_start",
-        "merged_pr_missing_from_listing",
-        "registered_pr_404",
-        "published_pr_not_associated",
-    }:
-        assert not writes and branch_exists

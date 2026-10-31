@@ -1,5 +1,9 @@
 import json
 
+import pytest
+from _support.tasks import analysis_ready
+
+from gongcao.cli import logs
 from gongcao.events import Journal, Redactor
 from gongcao.model import Role
 
@@ -49,3 +53,19 @@ def test_oversized_event_is_valid_json_and_secret_is_redacted(store, task_id):
     record = json.loads(journal.path.read_text())
     assert record["data"]["truncated"]
     assert "a-secret-credential" not in journal.path.read_text()
+
+
+async def test_logs_filter_a_selected_run_without_exposing_other_runs(store, task_id, sha, capsys):
+    from gongcao.events import Journal, Redactor
+
+    analysis_ready(store, task_id, sha)
+    run = store.runs(task_id)[0]["id"]
+    journal = Journal(store, run, 2048, Redactor())
+    journal.emit("progress", {"message": "ignored"})
+    journal.emit("error", {"message": "key github_pat_PRIVATEvalue"})
+    await logs(store, task_id, False, run_id=run, kind="error", contains="REDACTED")
+    output = capsys.readouterr().out
+    assert "PRIVATEvalue" not in output and "ignored" not in output
+    assert json.loads(output)["kind"] == "error"
+    with pytest.raises(ValueError, match="belong"):
+        await logs(store, task_id, False, run_id="../outside")

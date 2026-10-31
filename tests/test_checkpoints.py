@@ -5,9 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from test_pr2 import fixture_github as fixture_github
-from test_pr2 import policy as policy
-from test_runner import install_worker
+from _support.worker import install_worker
 
 from gongcao.control import Controls
 from gongcao.github import command
@@ -229,23 +227,6 @@ async def test_save_failure_no_change_and_lost_response_do_not_duplicate_commits
             await Controlled(store, config, github).checkpoint(store.task(task_id), run)
         assert store.runs(task_id)[-1]["details"]["save"]["sha"] == save["sha"]
         assert len(store.evidence(task_id)["operations"]) == 1
-
-
-def test_v4_upgrade_preserves_history_without_inventing_execution_defaults(store, task_id):
-    from gongcao.model import Role
-
-    run = store.begin_run(task_id, Role.ANALYST)
-    with store.db:
-        store.db.execute("ALTER TABLE runs DROP COLUMN details")
-        store.db.execute("PRAGMA user_version=4")
-    for _ in range(2):
-        reopened = Store(store.root)
-        try:
-            assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 5
-            assert reopened.runs(task_id)[0]["details"] == {}
-            assert reopened.runs(task_id)[0]["id"] == run
-        finally:
-            reopened.close()
 
 
 @pytest.mark.parametrize("action", ["pause", "cancel"])

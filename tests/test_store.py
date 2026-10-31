@@ -1,11 +1,133 @@
+import asyncio
+import contextlib
 import json
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from _support.tasks import register_more
+from beartype.roar import BeartypeCallHintParamViolation
 
+from gongcao.github import Target
+from gongcao.leases import Lease
 from gongcao.model import AgentResult, Role, Stage, State, after_run
+from gongcao.processes import launch, stop
 from gongcao.store import Store
+
+
+def test_target_change_invalidates_quality_artifacts(store, task_id, snapshot):
+    task = store.task(task_id)
+    store.record(task, "quality-results", "policy", {"passed": True})
+    store.sync(task_id, snapshot | {"base_sha": "0" * 40})
+    assert store.artifact(task_id, "quality-results", "policy") is None
+
+
+async def test_leases_exclude_duplicate_tasks_and_limit_all_controllers(
+    store, task_id, repo, sha, snapshot
+):
+    ids = [task_id, *register_more(store, repo, sha, snapshot, 3)]
+    other = Store(store.root)
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            for tid in ids[:3]:
+                assert (await stack.enter_async_context(Lease(store, tid))).acquired
+            async with Lease(other, task_id) as duplicate:
+                assert not duplicate.acquired
+            async with Lease(other, ids[3]) as fourth:
+                assert not fourth.acquired
+            assert store.db.execute("SELECT count(*) FROM leases").fetchone()[0] == 3
+        assert store.db.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
+    finally:
+        other.close()
+
+
+async def test_two_registered_objects_cannot_own_the_same_pr(store, task_id, repo, sha, snapshot):
+    second = register_more(store, repo, sha, snapshot, 1)[0]
+    with store.db:
+        store.db.execute("UPDATE tasks SET pr_number=9")
+    async with Lease(store, task_id) as first:
+        async with Lease(store, second) as duplicate:
+            assert first.acquired and not duplicate.acquired
+        assert store.db.execute("SELECT owner FROM leases").fetchone()[0] == first.owner
+
+
+async def test_heartbeat_renews_and_late_results_require_the_original_owner(store, task_id, sha):
+    async with Lease(store, task_id, ttl=0.15):
+        await asyncio.sleep(0.25)
+        assert store.db.execute("SELECT expires FROM leases").fetchone()[0] > time.time()
+        run = store.begin_run(task_id, Role.ANALYST)
+        with store.db:
+            store.db.execute("UPDATE leases SET owner='replacement'")
+        with pytest.raises(ValueError, match="lease lost"):
+            store.record(store.task(task_id), "quality-results", "policy", {"passed": True})
+        store.finish(run, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late", "{}")
+        assert store.task(task_id)["state"] == State.RECONCILE
+        assert not store.runs(task_id)[0]["evidence_valid"]
+    assert store.db.execute("SELECT owner FROM leases").fetchone()[0] == "replacement"
+
+
+async def test_unsettled_process_retains_the_branch_resource_across_task_aliases(
+    store, task_id, repo, sha, snapshot
+):
+    second = register_more(store, repo, sha, snapshot, 1)[0]
+    with store.db:
+        store.db.execute(
+            "UPDATE tasks SET pr_number=9,snapshot=?",
+            (json.dumps(snapshot | {"head_ref": "feature", "head_repository": "Example/Demo"}),),
+        )
+    process = None
+    try:
+        async with Lease(store, task_id):
+            process = await launch(sys.executable, "-c", "import time;time.sleep(60)")
+        assert store.db.execute("SELECT expires FROM leases").fetchone()[0] == 0
+        async with Lease(store, second) as blocked:
+            assert not blocked.acquired
+        assert "occupied" in store.task(second)["reason"]
+        assert process.returncode is None
+    finally:
+        if process is not None:
+            await stop(process)
+
+
+async def test_unconfirmed_new_pr_reserves_its_branch_before_local_association(
+    store, task_id, repo, sha, snapshot
+):
+    from gongcao.leases import resource
+
+    branch = resource(store.task(task_id)).split(":branch:", 1)[1]
+    pull = snapshot | {
+        "url": "https://github.com/EXAMPLE/DEMO/pull/9",
+        "kind": "pull",
+        "number": 9,
+        "repository": "EXAMPLE/DEMO",
+        "head_repository": "EXAMPLE/DEMO",
+        "head_ref": branch,
+    }
+    second = store.register(pull["url"], repo, sha, pull)
+    async with Lease(store, task_id):
+        store.intent(store.task(task_id), "pending-pr", "pull", "{}")
+        store.halt(task_id, State.RECONCILE, "API result unconfirmed")
+    async with Lease(store, second) as blocked:
+        assert not blocked.acquired
+    assert store.db.execute("SELECT task_id FROM leases").fetchone()[0] == task_id
+
+
+def test_registration_canonicalizes_github_case_aliases(store, task_id, repo, sha, snapshot):
+    from gongcao.github import Target
+
+    alias = snapshot["url"].replace("example/demo", "Example/Demo")
+    assert Target.parse(alias).url == snapshot["url"]
+    assert store.register(alias, repo, sha, snapshot) == task_id
+    assert len(store.tasks()) == 1
+
+
+def test_runtime_type_checks_are_enabled(store):
+    with pytest.raises(BeartypeCallHintParamViolation):
+        Target.parse(123)
+    with pytest.raises(BeartypeCallHintParamViolation):
+        store.task("wrong-type")
 
 
 def result(sha, conclusion="ready"):
