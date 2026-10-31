@@ -40,6 +40,23 @@ class Dashboard(logging.Handler):
         insort(self.records, (record.created, self.format(record)[:2000]), key=lambda r: r[0])
         del self.records[:-150]
 
+    def log_lines(self, width: int, height: int) -> list[str]:
+        # Panel borders and horizontal padding consume four terminal cells.
+        inner_width = max(1, width - 4)
+        indent = " " * min(4, inner_width - 1)
+        wrap_width = inner_width - len(indent)
+        console = Console(width=inner_width)
+        lines: list[str] = []
+        for _, record in reversed(self.records):
+            wrapped = Text(record).wrap(console, wrap_width, overflow="fold")
+            for index in range(len(wrapped) - 1, -1, -1):
+                lines.append((indent if index else "") + wrapped[index].plain)
+                if len(lines) >= height:
+                    break
+            if len(lines) >= height:
+                break
+        return list(reversed(lines))
+
     def render(self, width: int, height: int) -> Layout:
         tasks = self.store.tasks()
         by_id = {task["id"]: task for task in tasks}
@@ -108,7 +125,7 @@ class Dashboard(logging.Handler):
         if len(tasks) > limit:
             lines.append(f"另有 {len(tasks) - limit} 项；详情见 gongcao status / inspect")
         overview_height = min(height - 3, len(lines) + 2)
-        recent = [text for _, text in self.records[-max(1, height - overview_height - 2) :]]
+        recent = self.log_lines(width, max(1, height - overview_height - 2))
         layout = Layout()
         layout.split_column(
             Layout(
@@ -120,7 +137,7 @@ class Dashboard(logging.Handler):
             ),
             Layout(
                 Panel(
-                    Text("\n".join(recent) or "暂无新日志", no_wrap=True, overflow="ellipsis"),
+                    Text("\n".join(recent) or "暂无新日志", overflow="fold"),
                     title="最近日志 · 完整记录见 gongcao logs",
                 )
             ),
