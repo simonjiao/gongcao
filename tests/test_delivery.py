@@ -242,6 +242,49 @@ async def test_delivery_write_boundary_and_restart_preserve_completed_developer(
             assert (
                 restarted.task(task_id)["stage"] != Stage.MERGEABLE and fixture_github.pull["draft"]
             )
+            # Pure verifier regression with synthetic SDK facts; this is not real QA.
+            from copy import deepcopy
+
+            from gongcao.recovery import diagnose
+            from qa.evidence import evaluate_delivery
+
+            task = restarted.task(task_id) | {
+                "runs": restarted.runs(task_id),
+                "evidence": restarted.evidence(task_id),
+                "runtime": diagnose(restarted, task_id),
+            }
+            developer = next(r for r in task["runs"] if r["role"] == "developer")
+            facts = await fixture_github.gates(task)
+            facts.update(
+                pulls=await fixture_github.pages("pulls"),
+                reviews=[],
+                commands=[{"run_id": developer["id"], "at": developer["started"]}],
+            )
+            assert evaluate_delivery(task, facts)["acceptance"] == "NOT_RUN"
+            for failure in ("ready", "complete", "draft", "sha", "duplicate", "sdk", "checks"):
+                changed, remote = deepcopy(task), deepcopy(facts)
+                if failure in {"ready", "complete"}:
+                    report = json.loads(developer["result"])
+                    report.update(
+                        {"conclusion": "ready"}
+                        if failure == "ready"
+                        else {"delivery_complete": False}
+                    )
+                    next(r for r in changed["runs"] if r["role"] == "developer")["result"] = (
+                        json.dumps(report)
+                    )
+                elif failure == "draft":
+                    remote["isDraft"] = False
+                elif failure == "sha":
+                    remote["headRefOid"] = "0" * 40
+                elif failure == "duplicate":
+                    remote["pulls"] *= 2
+                elif failure == "sdk":
+                    remote["commands"] = []
+                else:
+                    changed["evidence"]["artifacts"] = []
+                with pytest.raises(ValueError):
+                    evaluate_delivery(changed, remote)
 
 
 @pytest.mark.parametrize(

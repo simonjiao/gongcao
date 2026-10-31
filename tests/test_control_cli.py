@@ -40,10 +40,16 @@ def test_offline_cli_preserves_task_pr_sha_and_evidence_through_control_modes(
     env = {
         **os.environ,
         "GONGCAO_COPILOT_FIXTURE": str(fixture),
-        "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root))),
+        "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root), str(root / "tests"))),
     }
 
-    command = [sys.executable, "-m", "qa.copilot_fixture", "--state-dir", str(tmp_path / "state")]
+    command = [
+        sys.executable,
+        "-m",
+        "_support.copilot_fixture",
+        "--state-dir",
+        str(tmp_path / "state"),
+    ]
 
     def cli(*args):
         result = subprocess.run(

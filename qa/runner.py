@@ -175,7 +175,7 @@ async def drive(
 
 async def prepare(run: Run, github: GitHub, model: str | None) -> None:
     run.check_cancelled()
-    requirement, config = fixture(run.id, model)
+    requirement, config = fixture(run.id, model, run.value["scenario"])
     if run.value["scenario"] == "copilot":
         config["copilot"] = {"operators": ["gongcao-unauthorized-fixture"], "mode": "step"}
     config_path = run.root / "config.yaml"
@@ -319,7 +319,9 @@ async def execute(
                         }
                         run.archive("cancellation", {"commands": command_activity(run)})
                         break
-                    if task["stage"] == "mergeable" and task["state"] == "completed":
+                    if run.value["scenario"] == "delivery" or (
+                        task["stage"] == "mergeable" and task["state"] == "completed"
+                    ):
                         require(
                             run.value["scenario"] != "cancel",
                             "Cancellation checkpoint was never triggered",
@@ -357,34 +359,39 @@ async def execute(
                                 "review_ids_after": [r["id"] for r in rows],
                             },
                         )
+                        if run.value["scenario"] == "delivery":
+                            await verify_live(run, after, config, github)
                         verdict = {
                             "passed": True,
                             "at": time.time(),
-                            "kind": "real-loop",
+                            "kind": "real-delivery-blocked"
+                            if run.value["scenario"] == "delivery"
+                            else "real-loop",
                             **result,
                             "repeat_unchanged": True,
                         }
-                        require(
-                            await core(
-                                run,
-                                "quality",
-                                str(run.value["task_id"]),
-                                "--config",
-                                str(run.root / "config.yaml"),
-                                "--archive",
-                                "--real",
+                        if run.value["scenario"] != "delivery":
+                            require(
+                                await core(
+                                    run,
+                                    "quality",
+                                    str(run.value["task_id"]),
+                                    "--config",
+                                    str(run.root / "config.yaml"),
+                                    "--archive",
+                                    "--real",
+                                )
+                                == 0,
+                                "Current execution evidence was not archived to GitHub",
                             )
-                            == 0,
-                            "Current execution evidence was not archived to GitHub",
-                        )
-                        run.archive(
-                            "quality-archives",
-                            [
-                                a
-                                for a in inspect(run)["evidence"]["artifacts"]
-                                if a["kind"] == "archive"
-                            ],
-                        )
+                            run.archive(
+                                "quality-archives",
+                                [
+                                    a
+                                    for a in inspect(run)["evidence"]["artifacts"]
+                                    if a["kind"] == "archive"
+                                ],
+                            )
                         break
                     require(
                         task["state"] in {"queued", "waiting_dependency"},

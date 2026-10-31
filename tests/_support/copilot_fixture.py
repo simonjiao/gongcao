@@ -12,8 +12,7 @@ from gongcao import remote
 from gongcao.cli import main as native_main
 from gongcao.github import GitHub, Target, command
 from gongcao.sandbox import Sandbox
-
-from .ledger import write_json
+from qa.ledger import write_json
 
 WORKER = """
 import json,pathlib,sys,uuid

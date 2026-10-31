@@ -46,3 +46,5 @@ AST 比对测试体与参数（排除导入位置）无变化。随后仅合并�
 收集清单、前后全量日志及迁移/规模统计保存在本次执行的本地证据中，结果与固定 SHA 见 PR。
 验收命令为 Ruff check/format、mypy、全量 pytest 和 `python -m qa check --offline`。
 本地 Git、Bubblewrap 和 CLI 使用实际执行；GitHub/模型运输仍是离线替身，真实远端验收 NOT_RUN。
+
+The [#55 assertion/parameter audit](test-qa-audit.md) records retained internal risks and related real QA boundaries.

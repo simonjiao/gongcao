@@ -115,15 +115,29 @@ This does not provide cross-process/global scheduling.
   Uses the existing owned-resource cleanup; it never merges the test PR.
 - `discovery`: requires explicit real-QA authorization. Native continuous serve discovers
   an auto issue and a step issue through two run-owned labels, excludes an unlabelled issue,
-  confirms unique controller status comments, and consumes a trusted pause on the step issue.
+  confirms immutable claim anchors and separate progress POST event markers/actors/comment IDs,
+  retains delivery/review/validation history across a fresh serve, and consumes a trusted pause on the step issue.
   The auto issue uses the existing role loop and exact-SHA acceptance. A repeated scan
   must preserve sessions/PRs; cleanup additionally validates and closes the companion issues
   and removes only the run-owned labels. Run with
   `uv run python -m qa run discovery --real --repo OWNER/REPO --cleanup`.
 
+- `delivery`: completes the full clamp fixture with the real Developer returning
+  `blocked + delivery_complete=true`. Required package acceptance is intentionally
+  unavailable. The expected terminal state is `pending_review / waiting_environment`,
+  with one original Run/controller commit/checkpoint and one open draft PR disclosing
+  NOT_RUN; no Reviewer/Validator or merge-ready evidence may be substituted. A fresh
+  native run must preserve sessions/writes and unique remote PR identity. The independent
+  read-only probe checks all clamp boundaries. Cleanup validates and removes both the
+  owned checkpoint and PR branches with exact-SHA leases, preserving all raw evidence.
+  After separate authorization, run only these two #55 scenes using the existing entries:
+  `uv run python -m qa run discovery delivery --jobs 1 --real --repo simonjiao/gongcao`;
+  then `verify RUN_ID --real`, `verify-batch BATCH_ID` and `cleanup RUN_ID`.
+  Unexecuted real scenarios remain NOT_RUN. See [the internal audit](../docs/test-qa-audit.md).
+
 The #57 offline CLI regression is `uv run pytest -q tests/test_control_cli.py`.
 It runs the actual CLI in separate processes, real Git worktrees/pushes to a local
-bare repository and production OS sandboxes. `qa.copilot_fixture` substitutes only
+bare repository and production OS sandboxes. `tests/_support/copilot_fixture.py` substitutes only
 the GitHub/model protocols. Its persistent serve receives an authorized comment,
 wakes the paused task, publishes once, and stops at review with no lease held.
 This is offline evidence, not real model/GitHub acceptance.

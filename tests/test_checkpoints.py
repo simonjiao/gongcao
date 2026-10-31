@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _support.checkpoint_fixture import BLOCKED_AGAIN, WORKER
 from _support.worker import install_worker
 
 from gongcao.control import Controls
@@ -12,7 +13,6 @@ from gongcao.github import command
 from gongcao.model import Stage, State
 from gongcao.store import Store
 from gongcao.workflow import Workflow
-from qa.checkpoint_fixture import BLOCKED_AGAIN, WORKER
 
 
 @pytest.fixture

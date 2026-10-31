@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 from typing import Any
 from urllib.parse import quote
@@ -75,6 +76,7 @@ async def exercise(run: Run, github: GitHub) -> None:
         core(run, "serve", "--poll", "1", "--config", str(path), stop_event=stop)
     )
     pause_id = None
+    claims: dict[str, Any] = {}
     try:
         deadline = time.monotonic() + 2400
         while time.monotonic() < deadline:
@@ -95,6 +97,13 @@ async def exercise(run: Run, github: GitHub) -> None:
                 for current in (primary, paused):
                     if current is None:
                         continue
+                    if current["url"] not in claims:
+                        claim = store.db.execute(
+                            "SELECT * FROM claims WHERE task_id=?", (current["id"],)
+                        ).fetchone()
+                        claims[current["url"]] = await github.read(
+                            f"repos/{repo}/issues/comments/{claim['comment_id']}"
+                        )
                     require(
                         current["state"]
                         not in {
@@ -143,7 +152,6 @@ async def exercise(run: Run, github: GitHub) -> None:
         stop.set()
         await asyncio.wait_for(asyncio.shield(serving), 30)
     before = signature(inspect(run))
-    require(await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed")
     traces = (json.loads(p.read_text())["stderr"] for p in run.root.glob("command-*.json"))
     require(any("GitHub 周期请求：" in text for text in traces), "Missing request accounting")
     store = Store(run.root / "state")
@@ -154,21 +162,25 @@ async def exercise(run: Run, github: GitHub) -> None:
             await github.read(f"repos/{repo}/issues/comments/{row['comment_id']}")
             for row in records
         ]
-        for row in records:
-            matches = [
-                c
-                for c in await github.instructions({"url": row["url"]})
-                if json.loads(row["data"])["marker"] in (c.get("body") or "")
-            ]
-            require(
-                len(matches) == 1 and matches[0]["id"] == row["comment_id"],
-                "Status comment is not unique",
-            )
+        history_before = [await github.instructions(row) for row in records]
+        require(
+            await core(run, "serve", "--once", "--config", str(path)) == 0, "Repeat scan failed"
+        )
+        history_after = [await github.instructions(row) for row in records]
+        records = [dict(row) for row in store.db.execute("SELECT * FROM claims ORDER BY url")]
+        require(
+            len(store.tasks()) == 2
+            and store.db.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 2,
+            "Restart duplicated discovery intake",
+        )
         run.archive(
             "discovery",
             {
                 "records": records,
                 "comments": comments,
+                "claims": claims,
+                "history_before": history_before,
+                "history_after": history_after,
                 "step": inspect(run, paused["id"]),
                 "excluded": excluded,
                 "pause_id": pause_id,
@@ -194,6 +206,7 @@ def verify(data: dict[str, Any], actor: str) -> None:
     require(
         data["step"]["state"] == "waiting_instruction"
         and data["step"]["stage"] == "pending_development"
+        and len(data["step"]["runs"]) == 1
         and any(
             i["id"] == data["pause_id"]
             and i["status"] == "consumed"
@@ -203,11 +216,74 @@ def verify(data: dict[str, Any], actor: str) -> None:
         ),
         "Missing Copilot pause",
     )
-    for row, comment in zip(data["records"], data["comments"], strict=True):
+    for row, comment, before, after in zip(
+        data["records"],
+        data["comments"],
+        data["history_before"],
+        data["history_after"],
+        strict=True,
+    ):
         require(
             row["task_id"] and not row["intent"] and not row["dirty"], "Claim/status is unconfirmed"
         )
         require(not json.loads(row["data"]).get("progress"), "Progress queue is unconfirmed")
+        claim = json.loads(row["data"])
+        original = data["claims"][row["url"]]
+        require(
+            original["body"] == comment["body"]
+            and original["id"] == comment["id"]
+            and original["user"]["id"] == comment["user"]["id"]
+            and "claim pending confirmation" in original["body"],
+            "Original claim was overwritten",
+        )
+        # Reactions/avatar metadata can change; preserve comment identity, author and text.
+        # Normal evidence archives append their own comments after the serve window.
+        before, after = (
+            [
+                c
+                for c in rows
+                if claim["marker"] in (c.get("body") or "")
+                or "<!-- gongcao-progress:" in (c.get("body") or "")
+            ]
+            for rows in (before, after)
+        )
+        require(
+            [(c["id"], c["user"]["id"], c["user"]["login"], c["body"]) for c in before]
+            == [(c["id"], c["user"]["id"], c["user"]["login"], c["body"]) for c in after],
+            "Restart changed or removed milestone history",
+        )
+        anchors = [c for c in after if claim["marker"] in (c.get("body") or "")]
+        require(len(anchors) == 1 and anchors[0]["id"] == comment["id"], "Claim is not unique")
+        progress = [c for c in after if "<!-- gongcao-progress:" in (c.get("body") or "")]
+        markers = [
+            re.findall(r"<!-- gongcao-progress:([0-9a-f]{32}) -->", c["body"]) for c in progress
+        ]
+        require(
+            progress
+            and all(len(m) == 1 for m in markers)
+            and len({m[0] for m in markers}) == len(progress)
+            and len({c["id"] for c in progress}) == len(progress)
+            and all(
+                c["id"] != comment["id"]
+                and c["user"]["login"] == actor
+                and c["user"]["id"] == comment["user"]["id"]
+                for c in progress
+            ),
+            "Progress event marker/author/comment ID is not unique",
+        )
+        require(
+            claim["progress_last"]
+            == {"event_id": markers[-1][0], "comment_id": progress[-1]["id"]},
+            "Last POST does not match the confirmed event",
+        )
+        if claim["mode"] == "auto":
+            require(
+                all(
+                    any(f"Stage: `{stage}`" in c["body"] for c in progress)
+                    for stage in ("pending_review", "pending_validation", "mergeable")
+                ),
+                "Missing delivery/review/validation milestones",
+            )
         require(
             comment["id"] == row["comment_id"]
             and comment["user"]["login"] == actor

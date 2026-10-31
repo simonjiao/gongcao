@@ -2,8 +2,10 @@
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from gongcao.config import Config
 from gongcao.github import GitHub, command
@@ -181,9 +183,106 @@ def evaluate(task: dict[str, Any], config: Config, facts: dict[str, Any]) -> dic
     }
 
 
+def evaluate_delivery(task: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
+    """Expected blocked acceptance is successful delivery QA, never merge readiness."""
+    settled(task)
+    sha, snapshot = task["target_sha"], task["snapshot"]
+    require(
+        (task["stage"], task["state"]) == ("pending_review", "waiting_environment")
+        and snapshot["state"] == "open"
+        and not snapshot.get("merged")
+        and facts["headRefOid"] == sha
+        and facts["isDraft"],
+        "Delivery must stop at blocked review with an open draft at the exact SHA",
+    )
+    developers = [r for r in task["runs"] if r["role"] == "developer"]
+    require(len(developers) == 1, "Delivery must preserve one original Developer Run")
+    developer = developers[0]
+    report = json.loads(developer["result"])
+    saved = developer["details"]["save"]
+    require(
+        developer["state"] == "completed"
+        and report["conclusion"] == "blocked"
+        and report.get("delivery_complete") is True
+        and report["target_sha"] == developer["target_sha"] == snapshot["base_sha"]
+        and saved["state"] == "confirmed"
+        and saved["sha"] == sha
+        and saved["parent"] == developer["details"]["source"]["sha"] == developer["target_sha"],
+        "Blocked report, original target or controller checkpoint was lost",
+    )
+    operations = task["evidence"]["operations"]
+    require(
+        [o["kind"] for o in operations] == ["checkpoint", "push", "pull"]
+        and operations[0]["payload"]["sha"] == operations[1]["payload"]["sha"] == sha
+        and operations[0]["payload"]["branch"] == saved["branch"]
+        and operations[1]["payload"]["branch"] == snapshot["head_ref"]
+        and operations[2]["response"]["number"] == task["pr_number"],
+        "Delivery duplicated writes or lost commit/PR identity",
+    )
+    require(
+        not any(r["role"] in {"reviewer", "validator"} for r in task["runs"])
+        and not any(a["kind"] == "validation" and a["valid"] for a in task["evidence"]["artifacts"])
+        and not facts["reviews"],
+        "Delivery bypassed Review/Validation gates",
+    )
+    checks = [
+        a["data"]
+        for a in task["evidence"]["artifacts"]
+        if a["kind"] == "quality-results" and a["valid"] and a["sha"] == sha
+    ]
+    require(
+        checks
+        and all(checks[-1].get(k) == v for k, v in binding(task).items())
+        and verdict(checks[-1], include_e2e=False) == "blocked"
+        and any(
+            i["category"] == "internal"
+            and i["required"]
+            and i["status"] == "blocked"
+            and not i["entry"]
+            for i in checks[-1]["items"]
+        ),
+        "Missing controller-owned current-version NOT_RUN acceptance evidence",
+    )
+    pulls = facts["pulls"]
+    body = snapshot["pull_body"]
+    require(
+        len(pulls) == 1
+        and pulls[0]["number"] == task["pr_number"]
+        and pulls[0]["head"]["sha"] == sha
+        and pulls[0]["body"] == body
+        and all(
+            text in body
+            for text in (
+                developer["id"],
+                sha,
+                developer["target_sha"],
+                "`blocked`",
+                "delivery_complete=True",
+                "NOT_RUN",
+                "missing acceptance package",
+            )
+        ),
+        "Draft PR is duplicated or does not disclose pending acceptance and provenance",
+    )
+    require(
+        developer["thread_id"]
+        and any(
+            c["run_id"] == developer["id"] and developer["started"] <= c["at"] <= developer["ended"]
+            for c in facts["commands"]
+        ),
+        "Delivery has no actual SDK command in its Developer session",
+    )
+    return {
+        "target_sha": sha,
+        "developer_run": developer["id"],
+        "original_target": developer["target_sha"],
+        "acceptance": "NOT_RUN",
+    }
+
+
 async def probe(run: Run, sha: str) -> list[int]:
     module = f"qa_fixture_{run.id[:12]}"
-    directory = run.root / "probes" / sha
+    directory = run.root / "probes" / sha / uuid.uuid4().hex
     workspace = directory / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / ".git").touch()
@@ -217,17 +316,42 @@ async def verify_live(
         "GitHub target/version changed; archived evidence is stale",
     )
     facts = await github.gates(task)
-    result = evaluate(task, config, facts)
+    reviews = await github.pages(
+        f"repos/{run.value['repository']}/pulls/{task['pr_number']}/reviews?per_page=100"
+    )
+    delivery = run.value["scenario"] == "delivery"
+    if delivery:
+        query = urlencode(
+            {
+                "state": "all",
+                "head": f"{run.value['repository'].split('/')[0]}:{current['head_ref']}",
+                "per_page": 100,
+            }
+        )
+        facts.update(
+            pulls=await github.pages(f"repos/{run.value['repository']}/pulls?{query}"),
+            commands=command_activity(run),
+            reviews=reviews,
+        )
+        result = evaluate_delivery(task | {"snapshot": current}, facts)
+    else:
+        result = evaluate(task, config, facts)
     # Deliberately corrupt only an in-memory copy, never the business database.
     try:
-        evaluate(task | {"target_sha": "0" * 40}, config, facts)
+        if delivery:
+            evaluate_delivery(task | {"target_sha": "0" * 40}, facts)
+        else:
+            evaluate(task | {"target_sha": "0" * 40}, config, facts)
     except ValueError:
         result["stale_sha_rejected"] = True
     else:
         raise ValueError("Verifier accepted stale SHA evidence")
-    old = await probe(run, result["initial_sha"])
+    old = None if delivery else await probe(run, result["initial_sha"])
     final = await probe(run, task["target_sha"])
-    require(old == [min(x, 100) for x in VECTORS], "Initial implementation was not the known fault")
+    if not delivery:
+        require(
+            old == [min(x, 100) for x in VECTORS], "Initial implementation was not the known fault"
+        )
     require(final == [max(0, min(100, x)) for x in VECTORS], "Independent boundary probe failed")
     files = (
         await command(
@@ -255,9 +379,6 @@ async def verify_live(
         ref["object"]["sha"] == run.value["base_sha"],
         "Target main changed during QA; rerun against a fixed base",
     )
-    reviews = await github.pages(
-        f"repos/{run.value['repository']}/pulls/{task['pr_number']}/reviews?per_page=100"
-    )
     for op in task["evidence"]["operations"]:
         if op["kind"] == "review":
             matches = [
@@ -272,6 +393,14 @@ async def verify_live(
                 "Review is missing or duplicated",
             )
     run.archive("github", {"snapshot": current, "facts": facts, "reviews": reviews})
+    if run.value["scenario"] == "discovery":
+        from .discovery import verify
+
+        discovery = json.loads((run.root / "discovery.json").read_text())
+        discovery["history_after"] = [
+            await github.instructions(row) for row in discovery["records"]
+        ]
+        verify(discovery, run.value["github_login"])
     if run.value["scenario"] == "recover":
         verify_recovery(run, task, reviews)
     result.update(
@@ -318,7 +447,16 @@ def verify_archived(run: Run) -> dict[str, Any]:
             )
         else:
             github = json.loads((run.root / "github.json").read_text())
-            verified = evaluate(task, Config.load(run.root / "config.yaml"), github["facts"])
+            delivery = run.value["scenario"] == "delivery"
+            if delivery:
+                require(
+                    github["facts"]["commands"] == command_activity(run), "SDK evidence differs"
+                )
+                verified = evaluate_delivery(
+                    task | {"snapshot": github["snapshot"]}, github["facts"]
+                )
+            else:
+                verified = evaluate(task, Config.load(run.root / "config.yaml"), github["facts"])
             if run.value["scenario"] == "recover":
                 verify_recovery(run, task, github["reviews"])
             require(verified["target_sha"] == result["target_sha"], "Verdict SHA mismatch")
@@ -363,7 +501,7 @@ def verify_archived(run: Run) -> dict[str, Any]:
             boundaries = result["boundary_probe"]
             require(
                 boundaries["inputs"] == list(VECTORS)
-                and boundaries["initial"] == [min(x, 100) for x in VECTORS]
+                and boundaries["initial"] == (None if delivery else [min(x, 100) for x in VECTORS])
                 and boundaries["final"] == [max(0, min(100, x)) for x in VECTORS],
                 "Boundary evidence is missing or failed",
             )

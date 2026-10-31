@@ -60,8 +60,8 @@ async def action(
     actions[key] = {"intent": intent, "state": "pending"}
     run.save()
     try:
-        if key == "delete-branch":
-            branch = run.value["resources"]["branch"]
+        if key == "delete-branch" or key.startswith("delete-branch-"):
+            branch = path.split("/git/refs/heads/", 1)[1]
             await command(
                 "git",
                 "push",
@@ -290,7 +290,36 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     )
     if ref and ref["object"]["sha"] not in owned_shas:
         raise Unconfirmed("Branch contains an unconfirmed or foreign commit")
-    if ref:
+    checkpoints = {}
+    checkpoint_present = False
+    if task:
+        for op in task["evidence"]["operations"]:
+            if op["kind"] != "checkpoint":
+                continue
+            saved = op["payload"]
+            role = next((r for r in task["runs"] if r["id"] == saved["run_id"]), None)
+            expected = (
+                expected_branch.replace("gongcao/work-", "gongcao/save-") + "-" + saved["run_id"]
+            )
+            if (
+                saved["branch"] != expected
+                or not role
+                or role["role"] != "developer"
+                or role["details"]["save"].get("state") != "confirmed"
+                or role["details"]["save"].get("sha") != saved["sha"]
+            ):
+                raise Unconfirmed("Checkpoint branch ownership is unconfirmed")
+            checkpoint = await optional(github, f"{prefix}/git/ref/heads/{expected}")
+            checkpoint_present |= checkpoint is not None
+            if checkpoint and checkpoint["object"]["sha"] != saved["sha"]:
+                raise Unconfirmed("Checkpoint branch contains a foreign commit")
+            query = urlencode(
+                {"state": "all", "head": f"{repo.split('/')[0]}:{expected}", "per_page": 100}
+            )
+            if await github.pages(f"{prefix}/pulls?{query}"):
+                raise Unconfirmed("Checkpoint branch unexpectedly has a PR")
+            checkpoints[expected] = saved["sha"]
+    if ref or checkpoint_present:
         source = run.root / "source"
         if source.is_symlink() or source.resolve() != source:
             raise Unconfirmed("Source clone has been redirected")
@@ -298,7 +327,9 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
         if actual_root != source:
             raise Unconfirmed("Source clone is outside this QA Run")
     if not (run.root / "cleanup-remote.json").exists():
-        run.archive("cleanup-remote", {"issue": issue, "pull": pull, "ref": ref})
+        run.archive(
+            "cleanup-remote", {"issue": issue, "pull": pull, "ref": ref, "checkpoints": checkpoints}
+        )
 
     if run.value["scenario"] == "discovery":
         from .discovery import cleanup_extras
@@ -322,27 +353,37 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     await action(
         run, "close-issue", "PATCH", issue_path, {"state": "closed"}, lambda: closed(issue_path)
     )
-    if ref:
+    branches = checkpoints | ({branch: ref["object"]["sha"]} if ref else {})
+    for owned_branch, expected_sha in branches.items():
         if pull_path:
             if await closed(pull_path) is None:
                 raise Unconfirmed("Test PR reopened during cleanup")
         await unchanged_base()
 
-        async def deleted() -> Any:
-            return {"deleted": True} if await optional(github, ref_path) is None else None
+        async def deleted(owned_branch: str = owned_branch) -> Any:
+            return (
+                {"deleted": True}
+                if await optional(github, f"{prefix}/git/ref/heads/{owned_branch}") is None
+                else None
+            )
 
         await action(
             run,
-            "delete-branch",
+            "delete-branch"
+            if owned_branch == branch
+            else "delete-branch-" + owned_branch.rsplit("-", 1)[1],
             "DELETE",
-            f"{prefix}/git/refs/heads/{branch}",
-            {"expected_sha": ref["object"]["sha"]},
+            f"{prefix}/git/refs/heads/{owned_branch}",
+            {"expected_sha": expected_sha},
             deleted,
         )
     if pull_path and await closed(pull_path) is None:
         raise Unconfirmed("Test PR reopened during cleanup")
     if await closed(issue_path) is None or await optional(github, ref_path) is not None:
         raise Unconfirmed("Owned remote resources changed during cleanup")
+    for owned_branch in checkpoints:
+        if await optional(github, f"{prefix}/git/ref/heads/{owned_branch}") is not None:
+            raise Unconfirmed("Checkpoint branch reappeared during cleanup")
     base = await unchanged_base()
     run.archive(
         "cleanup-confirmed",
@@ -353,6 +394,7 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
             else None,
             "issue_closed": True,
             "branch_deleted": True,
+            "checkpoints_deleted": list(checkpoints),
         },
     )
     # Keep logs, contexts, SQLite and manifests; remove only this Run's clone/worktrees
@@ -373,7 +415,7 @@ async def reconcile(run: Run, github: GitHub) -> None:
             continue
 
         async def observe(key: str = key, intent: dict[str, Any] = intent) -> Any:
-            if key == "delete-branch":
+            if key == "delete-branch" or key.startswith("delete-branch-"):
                 path = intent["path"].replace("/git/refs/heads/", "/git/ref/heads/")
                 return {"deleted": True} if await optional(github, path) is None else None
             if key in {"close-issue", "close-pull"}:

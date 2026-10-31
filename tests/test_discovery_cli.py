@@ -65,9 +65,15 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
     env = {
         **os.environ,
         "GONGCAO_COPILOT_FIXTURE": str(fixture),
-        "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root))),
+        "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root), str(root / "tests"))),
     }
-    argv = [sys.executable, "-m", "qa.copilot_fixture", "--state-dir", str(tmp_path / "state")]
+    argv = [
+        sys.executable,
+        "-m",
+        "_support.copilot_fixture",
+        "--state-dir",
+        str(tmp_path / "state"),
+    ]
 
     def cli(*args):
         result = subprocess.run([*argv, *args], env=env, capture_output=True, text=True, timeout=60)

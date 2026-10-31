@@ -100,6 +100,8 @@ async def test_independent_boundary_probe_uses_actual_read_only_sandbox(tmp_path
     )
     sha = (await command("git", "rev-parse", "HEAD", cwd=str(source))).strip()
     assert await probe(run, sha) == [-500, -1, 0, 1, 99, 100, 100, 100]
+    # Repeated verification of one SHA needs a fresh independent sandbox.
+    assert await probe(run, sha) == [-500, -1, 0, 1, 99, 100, 100, 100]
 
 
 def test_partial_sdk_log_never_counts_thread_start_as_inference(tmp_path):
@@ -189,6 +191,7 @@ def test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims()
         "step": {
             "state": "waiting_instruction",
             "stage": "pending_development",
+            "runs": [{"id": "step-analysis"}],
             "evidence": {
                 "instructions": [
                     {
@@ -203,14 +206,70 @@ def test_discovery_qa_evidence_rejects_unknown_writes_and_false_control_claims()
         "before": {},
         "after": {},
     }
+    data["history_before"] = []
+    for row, comment in zip(data["records"], data["comments"], strict=True):
+        comment.update(body=f"<!-- claim:{row['comment_id']} --> claim pending confirmation")
+        comment["user"]["id"] = 42
+        history = [deepcopy(comment)] + [
+            {
+                "id": row["comment_id"] * 10 + i,
+                "user": {"id": 42, "login": "owner"},
+                "body": f"<!-- gongcao-progress:{row['comment_id'] * 10 + i:032x} -->"
+                f"\nStage: `{stage}`",
+            }
+            for i, stage in enumerate(("pending_review", "pending_validation", "mergeable"), 1)
+        ]
+        row.update(
+            confirmed=comment["body"],
+            data=json.dumps(
+                {
+                    "marker": f"<!-- claim:{row['comment_id']} -->",
+                    "mode": json.loads(row["data"])["mode"],
+                    "progress_last": {
+                        "event_id": f"{history[-1]['id']:032x}",
+                        "comment_id": history[-1]["id"],
+                    },
+                }
+            ),
+        )
+        data["history_before"].append(history)
+    data["history_after"] = deepcopy(data["history_before"])
+    data["claims"] = {
+        row["url"]: deepcopy(comment)
+        for row, comment in zip(data["records"], data["comments"], strict=True)
+    }
     verify(data, "owner")
+    archived = deepcopy(data)
+    archived["history_after"][0].append(
+        {
+            "id": 999,
+            "body": "Gongcao evidence archive: confirmed link",
+            "user": {"id": 42, "login": "owner"},
+        }
+    )
+    verify(archived, "owner")  # Later archives must not invalidate real verification.
     for change in (
         lambda d: d["records"][0].update(intent="unknown"),
         lambda d: d["comments"][0]["user"].update(login="other"),
         lambda d: d["step"]["evidence"]["instructions"][0].update(status="pending"),
         lambda d: d.update(after={"runs": ["new"]}),
+        lambda d: d["step"]["runs"].append({"id": "duplicate-analysis"}),
+        lambda d: d["history_after"][0].pop(),
+        lambda d: d["claims"]["issue:10"].update(body="overwritten"),
+        lambda d: d["history_after"][0].append(d["history_after"][0][-1]),
+        lambda d: d["history_before"][0][-1]["user"].update(id=99),
     ):
         invalid = deepcopy(data)
         change(invalid)
+        with pytest.raises(ValueError):
+            verify(invalid, "owner")
+    for field, value in (
+        ("id", 101),
+        ("body", data["history_before"][0][-2]["body"]),
+        ("user", {"login": "other", "id": 99}),
+    ):
+        invalid = deepcopy(data)
+        for name in ("history_before", "history_after"):
+            invalid[name][0][-1][field] = value
         with pytest.raises(ValueError):
             verify(invalid, "owner")

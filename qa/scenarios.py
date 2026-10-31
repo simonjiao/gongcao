@@ -5,17 +5,24 @@ from typing import Any
 
 from .ledger import digest
 
-VERSION = 10
-SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery")
+VERSION = 13
+SCENARIOS = ("smoke", "loop", "recover", "cancel", "copilot", "discovery", "delivery")
 VECTORS = (-500, -1, 0, 1, 99, 100, 101, 500)
 
 
-def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
+def fixture(run_id: str, model: str | None, scenario: str) -> tuple[str, dict[str, Any]]:
     module = f"qa_fixture_{run_id[:12]}"
-    requirement = (
-        (Path(__file__).parent / "fixtures/requirement.md").read_text().format(module=module)
-    )
+    name = "delivery" if scenario == "delivery" else "requirement"
+    requirement = (Path(__file__).parent / f"fixtures/{name}.md").read_text().format(module=module)
     scope = f"Only work on {module}.py and tests/test_{module}.py. "
+    completion_guidance = (
+        "Return ready with delivery_complete=true and the original context target_sha when "
+        "the two files for this authorized round are written. The deliberately faulty first "
+        "round is complete for delivery to independent review; it does not complete acceptance. "
+        "Use delivery_complete=false only if this round's editing itself is unfinished."
+        if scenario == "discovery"
+        else "Return ready with the original context target_sha."
+    )
     roles = {
         "analyst": scope + "Read only. Inspect the request and plan the complete final contract. "
         "Execute /usr/bin/sleep 20 after your first inspection command, for the cancel probe. "
@@ -33,8 +40,7 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
         "Keep imports at the top, Python style clean, and run the relevant stdlib unittest: "
         "uv run --offline --no-project --python /usr/bin/python3.12 python -B -m unittest "
         f"discover -s tests -p test_{module}.py -v. "
-        "Do not run full project checks yourself. "
-        "Return ready with the original context target_sha.",
+        "Do not run full project checks yourself. " + completion_guidance,
         "reviewer": scope + "Read only. Independently inspect actual requirement, diff and tests. "
         "Check negative values return 0, zero/100 are preserved, >100 returns 100. "
         "Passing tests that omit negative inputs are insufficient. Return revise for the initial "
@@ -46,6 +52,26 @@ def fixture(run_id: str, model: str | None) -> tuple[str, dict[str, Any]]:
         "Return ready only for actual passing evidence at exact context target_sha; "
         "revise for code defects or blocked for missing evidence. No credentials or writes.",
     }
+    if scenario == "delivery":
+        roles["analyst"] = scope + (
+            "Read only. Plan the complete clamp contract and return ready at context target_sha. "
+            "Propose all three plan categories. The required acceptance package is intentionally "
+            "unavailable: keep internal required=True with entry=[] and reason='missing acceptance "
+            "package'. Do not replace this check with unittest or mark it not applicable. "
+            "The clamp has no external integration: E2E is not applicable with that reason."
+        )
+        roles["developer"] = (
+            scope
+            + requirement
+            + (
+                " Implement the complete contract now, including negative inputs. Run only "
+                "uv run --offline --no-project --python /usr/bin/python3.12 python -B -m unittest "
+                f"discover -s tests -p test_{module}.py -v. "
+                "Return blocked with delivery_complete=true and original context target_sha. "
+                "Record unittest results honestly and 'NOT_RUN: missing acceptance package' in "
+                "next_steps. Completing code does not complete required acceptance."
+            )
+        )
     config: dict[str, Any] = {"timeout_seconds": 900, "max_revisions": 3, "roles": roles}
     if model:
         config["model"] = model
@@ -91,5 +117,5 @@ def vector_script(module: str) -> str:
 
 
 def version_digest() -> str:
-    paths = [Path(__file__), Path(__file__).parent / "fixtures/requirement.md"]
+    paths = [Path(__file__), *sorted((Path(__file__).parent / "fixtures").glob("*.md"))]
     return digest({path.name: path.read_text() for path in paths})
