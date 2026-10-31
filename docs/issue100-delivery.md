@@ -33,11 +33,11 @@ An OS-confirmed failed exec raises `NotStarted` with the original error as its
 cause; only this pre-start failure can cancel a newly created write intent.
 Failures after a process starts remain subject to remote readback reconciliation.
 
-Offline regression uses `test_pr2.py` for both metadata refresh windows, three
+Offline regression uses `tests/test_delivery.py` for both metadata refresh windows, three
 request-edit windows, delivery safety and write/restart boundaries. Existing
 checkpoint/control tests distinguish cancellation/pause before and after send.
 The after-PR interruption case rejects altered context before safely adopting the
-existing PR; the readback-limit case shares the existing ambiguous-write test.
+existing PR; the readback-limit case shares `tests/test_remote_writes.py`'s ambiguous-write test.
 `test_control_cli.py` runs native CLI processes and persistent `serve`, real bare
 Git and production OS sandboxes; only GitHub/model protocols are substituted.
 The QA comment fixture now also changes the Issue timestamp on status updates.

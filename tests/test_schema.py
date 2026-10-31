@@ -10,7 +10,7 @@ from gongcao.store import Store
 
 
 @pytest.mark.parametrize("run_state", ["completed", "running"])
-def test_pr1_schema_upgrade_preserves_history_and_restarts(
+def test_schema_zero_upgrade_preserves_history_and_restarts(
     tmp_path, repo, sha, snapshot, run_state
 ):
     root = tmp_path / "old"

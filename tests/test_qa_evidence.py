@@ -32,7 +32,7 @@ def test_manifest_locks_paths_redaction_and_archive_tamper(tmp_path):
         Run(tmp_path, "f" * 32)
 
 
-async def test_verifier_uses_controller_and_ci_evidence_not_agent_ready(
+async def test_verifier_requires_current_controller_evidence_not_agent_ready(
     store,
     task_id,
     fixture_github,

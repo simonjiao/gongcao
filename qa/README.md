@@ -15,7 +15,7 @@ cd gongcao-qa
 sudo apt-get install git gh bubblewrap
 uv sync --locked
 uv run python -m qa check --offline
-uv run pytest -q tests/test_qa.py
+uv run pytest -q tests/test_qa_execution.py tests/test_qa_resources.py tests/test_qa_evidence.py
 uv run python -m qa run smoke --repeat 3 --jobs 2
 # Read qa.jobs from the shared YAML (an explicit --jobs still takes precedence):
 uv run python -m qa run smoke --config gongcao.example.yaml
@@ -97,7 +97,7 @@ This does not provide cross-process/global scheduling.
   This is a controller/remote-write recovery test. It does **not** claim that a
   real SDK developer session was interrupted. Quality-stage interruptions and
   detached-child cleanup also have separately labelled OS/protocol regressions
-  in `tests/test_stability.py`.
+  in `tests/test_recovery.py` and `tests/test_quality_execution.py`.
 - `cancel`: waits for a real model command (and an active peer when running in a
   parallel batch), invokes native `cancel`, confirms stopped descendants and no
   remote controller writes, then archives and cleans its own issue. Expected
@@ -199,7 +199,8 @@ CI/Run/Thread IDs, failure boundaries and cleanup results in the acceptance reco
 Feature-branch evidence does not replace this final integration requirement.
 
 Issue #79 uses version-bound build/internal/e2e plans instead of configured command/CI gates.
-Offline `tests/test_quality.py` exercises actual sandboxes, current-SHA execution, plan invalidation,
+Offline `tests/test_quality_plan.py`, `tests/test_quality_execution.py` and `tests/test_archive.py`
+exercise actual sandboxes, current-SHA execution, plan invalidation,
 controlled QA entry authorization, and append/readback against a local bare Git repository.
 GitHub archive acceptance is separate and requires explicit `--real` authorization; these transport
 fixtures do not claim real engine/browser acceptance. See `docs/validation-evidence.md`.

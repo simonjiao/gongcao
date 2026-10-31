@@ -116,10 +116,12 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
         assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
 
 
-def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(checkout, tmp_path):
+def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(offline_checkout, tmp_path):
     path = tmp_path / "jobs.yaml"
     path.write_text("scheduler:\n  jobs: 2\nqa:\n  jobs: 7\n")
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=offline_checkout, text=True
+    ).strip()
     for jobs, options in (
         (1, []),
         (2, ["--config", str(path)]),
@@ -132,7 +134,7 @@ def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(checkout, tmp_path):
                 url = f"https://github.com/example/demo/issues/{number}"
                 store.register(
                     url,
-                    checkout,
+                    offline_checkout,
                     sha,
                     {
                         "url": url,
@@ -147,10 +149,10 @@ def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(checkout, tmp_path):
                 )
         finally:
             store.close()
-        env = cli_env(checkout, gate)
+        env = cli_env(offline_checkout, gate)
         with subprocess.Popen(
             [GONGCAO, "--state-dir", str(state), "serve", "--once", *options],
-            cwd=checkout,
+            cwd=offline_checkout,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -166,7 +168,9 @@ def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(checkout, tmp_path):
                 ):
                     time.sleep(0.01)
                 assert len(events(gate)) == jobs  # Others cannot read until a slot releases.
-                status = run_cli(checkout, env, GONGCAO, "--state-dir", str(state), "status")
+                status = run_cli(
+                    offline_checkout, env, GONGCAO, "--state-dir", str(state), "status"
+                )
                 occupied = [t for t in status if t["runtime"]["lease"] is not None]
                 assert len(status) == 4 and len(occupied) == jobs
                 assert all(t["runtime"]["lease"]["pid"] == process.pid for t in occupied)

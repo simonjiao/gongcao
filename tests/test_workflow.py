@@ -11,7 +11,7 @@ from gongcao.scheduler import Scheduler
 from gongcao.workflow import Workflow
 
 
-async def test_real_worktrees_review_revision_quality_and_ci_reach_human_merge(
+async def test_worktrees_review_revision_and_quality_reach_human_merge(
     store, task_id, repo, fixture_github, policy, caplog, monkeypatch
 ):
     caplog.set_level("INFO", logger="gongcao")
@@ -108,18 +108,24 @@ async def test_missing_external_evidence_cannot_be_replaced_by_agent_claims(
     )
 
 
-async def test_changed_quality_policy_invalidates_review_and_validation(
+async def test_policy_change_rebuilds_review_and_validation_at_same_sha(
     store, task_id, fixture_github, policy
 ):
     await Workflow(store, policy, fixture_github).run(task_id)
     old = [r["id"] for r in store.runs(task_id) if r["role"] == "reviewer" and r["evidence_valid"]]
+    sha = store.task(task_id)["target_sha"]
     changed = replace(
         policy,
         model="changed-policy",
         max_revisions=0,
     )
     await Workflow(store, changed, fixture_github).run(task_id)
-    assert store.task(task_id)["state"] == State.COMPLETED
+    assert (store.task(task_id)["stage"], store.task(task_id)["state"]) == (
+        Stage.MERGEABLE,
+        State.COMPLETED,
+    )
+    assert store.task(task_id)["target_sha"] == sha
+    assert len(fixture_github.reviews) == 3
     assert not [r for r in store.runs(task_id) if r["id"] in old and r["evidence_valid"]]
     assert store.artifact(task_id, "validation", policy.policy_hash) is None
 
@@ -152,18 +158,3 @@ async def test_refresh_never_relabels_old_evidence_or_overwrites_merged(
     ]
     assert store.artifact(task_id, "validation", policy.policy_hash) is None
     assert store.artifact(task_id, "revision", policy.policy_hash) is None
-
-
-async def test_policy_change_can_publish_new_same_sha_review(
-    store, task_id, fixture_github, policy
-):
-    await Workflow(store, policy, fixture_github).run(task_id)
-    sha = store.task(task_id)["target_sha"]
-    changed = replace(
-        policy,
-        model="changed-policy",
-    )
-    await Workflow(store, changed, fixture_github).run(task_id)
-    assert store.task(task_id)["stage"] == Stage.MERGEABLE, store.task(task_id)["reason"]
-    assert store.task(task_id)["target_sha"] == sha
-    assert len(fixture_github.reviews) == 3

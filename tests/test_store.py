@@ -17,13 +17,6 @@ from gongcao.processes import launch, stop
 from gongcao.store import Store
 
 
-def test_target_change_invalidates_quality_artifacts(store, task_id, snapshot):
-    task = store.task(task_id)
-    store.record(task, "quality-results", "policy", {"passed": True})
-    store.sync(task_id, snapshot | {"base_sha": "0" * 40})
-    assert store.artifact(task_id, "quality-results", "policy") is None
-
-
 async def test_leases_exclude_duplicate_tasks_and_limit_all_controllers(
     store, task_id, repo, sha, snapshot
 ):
@@ -232,8 +225,10 @@ def test_pr_base_change_invalidates_evidence_with_unchanged_head(
     run_id = store.begin_run(task_id, Role.ANALYST)
     if not inflight:
         store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "ok")
+    store.record(store.task(task_id), "quality-results", "policy", {"passed": True})
     changed = "2" * 40 if field == "base_sha" else "different-target"
     store.sync(task_id, original | {field: changed})
+    assert store.artifact(task_id, "quality-results", "policy") is None
     if inflight:
         store.finish(run_id, State.COMPLETED, Stage.DEVELOPMENT, State.QUEUED, "late result")
     task = store.task(task_id)

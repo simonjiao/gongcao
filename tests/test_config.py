@@ -11,30 +11,19 @@ from gongcao.model import Role
 from qa.__main__ import execute, parser
 
 
-@pytest.mark.parametrize(
-    "policy_text",
-    [
+def test_invalid_policy_cannot_grant_writes_or_legacy_quality(tmp_path):
+    config = tmp_path / "config.yaml"
+    for text in (
+        "roles:\n  reviewer:\n    writable: true\n",
+        "timeout_seconds: -1\n",
         'quality: {checks: ["pytest"]}',
         'quality: {ci_workflows: ["../ci.yml"]}',
         "quality: {require_real_checks: yesplease}",
         "max_revisions: -1",
-    ],
-)
-def test_invalid_quality_policy_is_rejected(tmp_path, policy_text):
-    path = tmp_path / "config.yaml"
-    path.write_text(policy_text)
-    with pytest.raises(ValueError):
-        Config.load(path)
-
-
-def test_config_does_not_allow_granting_write_permissions(tmp_path):
-    config = tmp_path / "config.yaml"
-    config.write_text("roles:\n  reviewer:\n    writable: true\n")
-    with pytest.raises(ValueError):
-        Config.load(config)
-    config.write_text("timeout_seconds: -1\n")
-    with pytest.raises(ValueError):
-        Config.load(config)
+    ):
+        config.write_text(text)
+        with pytest.raises(ValueError):
+            Config.load(config)
     assert not Role.REVIEWER.writable
 
 
@@ -108,25 +97,25 @@ def test_serve_rejects_old_concurrency_option():
     assert exc.value.code == 2
 
 
-def test_offline_invalid_configuration_fails_before_execution(checkout, tmp_path):
+def test_offline_invalid_configuration_fails_before_execution(offline_checkout, tmp_path):
     gate = tmp_path / "gate"
-    env = cli_env(checkout, gate)
+    env = cli_env(offline_checkout, gate)
     path, state, data = tmp_path / "jobs.yaml", tmp_path / "state", tmp_path / "data"
     path.write_text("scheduler:\n  jobs: true\n")
     rejected = subprocess.run(
         [GONGCAO, "--state-dir", str(state), "serve", "--once", "--config", str(path)],
-        cwd=checkout,
+        cwd=offline_checkout,
         env=env,
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert rejected.returncode == 1 and "scheduler.jobs" in rejected.stderr
-    assert run_cli(checkout, env, GONGCAO, "--state-dir", str(state), "status") == []
+    assert run_cli(offline_checkout, env, GONGCAO, "--state-dir", str(state), "status") == []
     path.write_text("qa:\n  jobs: 0\n")
     rejected = subprocess.run(
         [*QA, "--data-dir", str(data), "run", "smoke", "--config", str(path)],
-        cwd=checkout,
+        cwd=offline_checkout,
         env=env,
         capture_output=True,
         text=True,

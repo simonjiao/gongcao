@@ -23,9 +23,11 @@ from qa.runner import batch, core, execute, verify_implementation
 from qa.scenarios import pytest_snapshot_script
 
 
-def test_offline_qa_defaults_yaml_override_and_batch_evidence(checkout, tmp_path):
-    env = cli_env(checkout, tmp_path / "gate")
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+def test_offline_qa_defaults_yaml_override_and_batch_evidence(offline_checkout, tmp_path):
+    env = cli_env(offline_checkout, tmp_path / "gate")
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=offline_checkout, text=True
+    ).strip()
     path = tmp_path / "jobs.yaml"
     path.write_text("scheduler:\n  jobs: 3\nqa:\n  jobs: 1\nmodel: ignored-production-policy\n")
     for name, options, expected in (
@@ -35,10 +37,10 @@ def test_offline_qa_defaults_yaml_override_and_batch_evidence(checkout, tmp_path
     ):
         data = tmp_path / name
         argv = (*QA, "--data-dir", str(data))
-        report = run_cli(checkout, env, *argv, "run", "smoke", "--repeat", "3", *options)
+        report = run_cli(offline_checkout, env, *argv, "run", "smoke", "--repeat", "3", *options)
         assert report["passed"] and report["jobs"] == expected
         assert [row["status"] for row in report["results"]] == ["passed"] * 3
-        verified = run_cli(checkout, env, *argv, "verify-batch", report["id"])
+        verified = run_cli(offline_checkout, env, *argv, "verify-batch", report["id"])
         assert verified["passed"] and verified["peak_runs"] == expected and verified["queued"]
         assert verified["runs"] == report["runs"] and len(set(report["runs"])) == 3
         for run_id in report["runs"]:
@@ -50,7 +52,7 @@ def test_offline_qa_defaults_yaml_override_and_batch_evidence(checkout, tmp_path
             (data / "runs" / report["id"] / "verdict.json").write_text("{}")
             rejected = subprocess.run(
                 [*argv, "verify-batch", report["id"]],
-                cwd=checkout,
+                cwd=offline_checkout,
                 env=env,
                 capture_output=True,
                 text=True,

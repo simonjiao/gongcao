@@ -226,8 +226,8 @@ def intake(store, repo, sha, snapshot):
     return Discovery(store, config, API())
 
 
-@pytest.fixture(scope="module")
-def checkout(tmp_path_factory):
+@pytest.fixture(scope="session")
+def offline_checkout(tmp_path_factory):
     root = tmp_path_factory.mktemp("jobs-offline")
     path = root / "checkout"
     subprocess.run(

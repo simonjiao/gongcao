@@ -18,10 +18,19 @@
   Gongcao's tools for other projects or require GitHub CI. Schema changes require versioned upgrade/restart tests.
 - The third stage uses shared-state leases and OS locks. Never clear unknown writes,
   uncertain descendant cleanup or another owner's resource reservation to force progress.
-  Recovery preserves interrupted work and creates fresh sessions; see docs/stage3.md.
+  Recovery preserves interrupted work and creates fresh sessions; see docs/runtime.md.
 - Issue tracker: GitHub `simonjiao/gongcao`; see `docs/agents/issue-tracker.md`.
 - Maintain `qa/` scenarios when changing workflow, security or quality gates. Default CI
   uses offline QA only; remote/model acceptance requires an explicit authorized `--real` run.
+- Name long-lived modules, tests and current documentation by responsibility, not PR
+  numbers or implementation stages. Shared pytest fixtures live in `tests/conftest.py`;
+  import pure helpers from `tests/_support/`, never from another test module.
+- Keep a sufficient minimal test set: merge or remove tests only when retained assertions
+  cover the same risk at the same execution boundary. Preserve independent negative,
+  version, cancellation, recovery and real OS/Git checks; test counts are not a goal.
+- Current contracts start at `docs/runtime.md` and `docs/validation-evidence.md`.
+  `docs/pr1.md`, `docs/pr2.md`, `docs/stage3.md`, `docs/acceptance-*.md` and
+  `docs/evidence/` retain historical implementation and fixed-SHA evidence.
 
 ## PowerShell 使用规则
 
