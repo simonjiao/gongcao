@@ -54,6 +54,7 @@ COORDINATION_INSTRUCTIONS = (
     "Never infer a deadlock merely from elapsed time. Return only the schema."
 )
 
+
 def emit(kind: str, data: Any) -> None:
     print(json.dumps({"kind": kind, "data": data}), flush=True)
 
