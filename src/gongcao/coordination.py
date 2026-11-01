@@ -142,8 +142,12 @@ def current(store: Store, task_id: int) -> dict[str, Any] | None:
         (task_id,),
     ).fetchone()
     result: dict[str, Any] | None = json.loads(row[0]) if row else None
-    if result and result["fingerprint"] == fingerprint(facts(store, task_id)):
-        return result  # All other versions remain historical advice, never current evidence.
+    if (
+        result
+        and result.get("status") != "running"
+        and result["fingerprint"] == fingerprint(facts(store, task_id))
+    ):
+        return result  # Only settled advice at current facts is reusable.
     return None
 
 
