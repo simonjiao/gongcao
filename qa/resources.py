@@ -192,7 +192,10 @@ async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None
         state = run.root / "state"
         if state.is_symlink() or state.resolve() != state:
             raise Unconfirmed("QA state path has been redirected")
-        state.mkdir(exist_ok=True, mode=0o700)
+        if not state.exists():
+            # A queued Run never prepared native execution or coordination resources.
+            await _cleanup(run, task, github)
+            return
         with (state / "coordination.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
