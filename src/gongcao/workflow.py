@@ -354,16 +354,25 @@ class Workflow:
         entry = self.store.task(task_id)["control"]
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             return []
-        recovering = bool(
+        steps = list(
             self.store.db.execute(
-                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason='' "
-                "AND json_extract(data,'$.recovery')=1",
+                "SELECT id,data FROM instructions WHERE task_id=? "
+                "AND status IN ('pending','accepted') AND reason='' "
+                "AND json_extract(data,'$.mode')='step'",
                 (task_id,),
-            ).fetchone()
+            )
         )
+        recovering = any(json.loads(row["data"]).get("recovery") for row in steps)
         async with Lease(self.store, task_id, recovery=recovering) as lease:
             self.lease = lease
             if not lease.acquired:
+                for row in steps:
+                    Controls(self.store).finish_step(
+                        task_id,
+                        command_id=row["id"],
+                        reason="Execution lease is occupied; send a new Step after it settles",
+                        active_owner=lease.lock is None,
+                    )
                 return []
             before = {run["id"] for run in self.store.runs(task_id)}
             try:

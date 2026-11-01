@@ -14,6 +14,7 @@ from _support.tasks import analysis_ready, register_more, wait_for
 from _support.worker import SUCCESS, install_worker
 
 from gongcao.config import Config
+from gongcao.control import Controls
 from gongcao.github import Deferred
 from gongcao.leases import Lease
 from gongcao.model import State
@@ -114,6 +115,12 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
         assert not store.runs(task_id)
         assert store.artifact(task_id, "github-cooldown", "")["recovery"]
         assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
+        assert Controls(store).issue(task_id, "step")
+        await Workflow(store, scheduler.config, scheduler.github).run(task_id)
+        assert store.task(task_id)["control"]["spent"]
+        assert store.evidence(task_id)["instructions"][-1]["status"] == "blocked"
+    await Workflow(store, scheduler.config, scheduler.github).run(task_id)
+    assert not store.runs(task_id)  # Free capacity does not revive that spent Step.
 
 
 @pytest.mark.parametrize("advisory", ["slow", "failed", "cancelled"])

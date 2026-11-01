@@ -6,6 +6,7 @@ import pytest
 from _support.qa import base_response, new_run
 
 from gongcao.config import Config
+from gongcao.coordination import AdvisoryProcesses
 from gongcao.discovery import Discovery
 from gongcao.github import GitHub, command
 from gongcao.store import Store
@@ -13,7 +14,7 @@ from qa.ledger import Run
 from qa.resources import Unconfirmed, action, cleanup, create_issue
 
 
-@pytest.mark.parametrize("kind", ["feedback", "uncertain", "empty", "corrupt", "busy", "stopped"])
+@pytest.mark.parametrize("kind", ["feedback", "uncertain", "busy", "stopped"])
 async def test_manual_feedback_intents_prevent_qa_cleanup(tmp_path, repo, sha, snapshot, kind):
     run = new_run(tmp_path, "delivery")
     state = Store(run.root / "state")
@@ -31,14 +32,12 @@ async def test_manual_feedback_intents_prevent_qa_cleanup(tmp_path, repo, sha, s
             state.db.commit()
         else:
             reservation = state.root / "coordination-process.json"
+            if kind == "uncertain":
+                for malformed in ("{}", "invalid"):
+                    reservation.write_text(malformed)
+                    assert AdvisoryProcesses.unresolved(reservation) is not None
             reservation.write_text(
-                "{}"
-                if kind == "empty"
-                else "invalid"
-                if kind == "corrupt"
-                else json.dumps(
-                    {"state": "stopped" if kind in {"stopped", "busy"} else "uncertain"}
-                )
+                json.dumps({"state": "stopped" if kind in {"stopped", "busy"} else "uncertain"})
             )
         if kind == "busy":
             lock = (state.root / "coordination.lock").open("a")

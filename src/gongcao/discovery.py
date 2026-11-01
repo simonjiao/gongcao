@@ -55,10 +55,8 @@ class Discovery:
         data = {
             "kind": "manual",
             "repo": task["snapshot"]["repository"],
-            "path": task["repo_path"],
             "base_sha": task["target_sha"],
             "mode": task["control"]["mode"],
-            "policy": self.config.policy_hash,
             "marker": f"<!-- gongcao:controller={self.controller};task={task['url']} -->",
             "attempted": False,
         }
@@ -621,7 +619,7 @@ class Discovery:
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
-        if step := control.get("step_result"):
+        if step := event.get("step") if event else Controls(self.store).step_result(task["id"]):
             body += (
                 "\n本次 Step："
                 + {

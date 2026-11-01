@@ -27,12 +27,6 @@ def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
-def coordination_status(store: Store, task_id: int) -> dict[str, Any] | None:
-    from .coordination import current
-
-    return current(store, task_id)
-
-
 async def logs(
     store: Store,
     task_id: int,
@@ -214,6 +208,8 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
             store.sync(task["id"], snapshot)
         output(store.tasks() if args.task is None else store.task(args.task))
     elif args.command == "status":
+        from .coordination import current as current_advice
+
         tasks = [store.task(args.task)] if args.task else store.tasks()
         output(
             [
@@ -235,17 +231,19 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                 | {
                     "dependencies": store.dependencies(task["id"]),
                     "runtime": diagnose(store, task["id"]),
-                    "coordination": coordination_status(store, task["id"]),
+                    "coordination": current_advice(store, task["id"]),
                 }
                 for task in tasks
             ]
         )
     elif args.command == "inspect":
+        from .coordination import current as current_advice
+
         task = store.task(args.task)
         task["runs"] = store.runs(args.task)
         task["evidence"] = store.evidence(args.task)
         task["runtime"] = diagnose(store, args.task)
-        task["coordination"] = coordination_status(store, args.task)
+        task["coordination"] = current_advice(store, args.task)
         output(task)
     elif args.command == "cancel":
         store.cancel(args.task)

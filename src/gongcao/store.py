@@ -150,6 +150,9 @@ class Store:
 
     def progress(self, task_id: int, *, correction: bool = False) -> None:
         """Called inside business transactions; retain facts, never polling/heartbeat changes."""
+        from .control import Controls, baseline
+        from .coordination import current
+
         row = self.db.execute("SELECT url FROM claims WHERE task_id=?", (task_id,)).fetchone()
         if not row:
             return
@@ -170,7 +173,7 @@ class Store:
             "save": [saved, unchanged] if saved or unchanged else None,
             "pull": [task["pr_number"], task["target_sha"]] if task["pr_number"] else None,
             "stage": task["stage"],
-            "step": task["control"].get("step_result"),
+            "step": Controls(self).step_result(task_id),
             "checks": artifacts[-1]["id"] if artifacts else None,
             "block": [
                 task["stage"],
@@ -188,9 +191,6 @@ class Store:
             }
             else None,
         }
-        from .control import baseline
-        from .coordination import current
-
         advice = current(self, task_id)
         facts["advice"] = [advice["fingerprint"], advice["status"]] if advice else None
 
@@ -215,6 +215,7 @@ class Store:
                     + runs[-1:],
                     "artifacts": list({a["kind"]: a for a in artifacts}.values()),
                     "coordination": advice,
+                    "step": facts["step"],
                 }
             )
             self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))

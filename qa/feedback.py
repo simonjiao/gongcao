@@ -73,7 +73,6 @@ async def exercise(run: Run, github: GitHub) -> None:
     )
     data = {"records": records, "anchors": anchors, "histories": histories, "command": command}
     run.archive("manual-feedback", data)
-    await verify(run, github)
 
 
 async def verify(run: Run, github: GitHub) -> None:

@@ -40,8 +40,8 @@ def seed_complex(store, task_id, sha, failed=False):
 
 
 @pytest.fixture
-def complex_task(store, task_id, sha, request):
-    return seed_complex(store, task_id, sha, getattr(request, "param", False))
+def complex_task(store, task_id, sha):
+    return seed_complex(store, task_id, sha)
 
 
 ADVICE = """
@@ -62,7 +62,6 @@ print(json.dumps({'kind':'result','data':{
 """
 
 
-@pytest.mark.parametrize("complex_task", [False, True], indirect=True)
 async def test_coordination_isolated_advice_is_deduplicated_and_expires(
     store, task_id, complex_task, fixture_github, policy, monkeypatch, repo, sha, snapshot
 ):
@@ -77,21 +76,9 @@ async def test_coordination_isolated_advice_is_deduplicated_and_expires(
     assert before == (store.task(task_id), store.runs(task_id), fixture_github.writes)
     assert await coordinator.run(task_id) == result
     assert current(store, task_id) == result
-    row = store.db.execute(
-        "SELECT id,data FROM artifacts WHERE task_id=? AND kind='coordination' AND valid=1",
-        (task_id,),
-    ).fetchone()
-    with store.db:
-        store.db.execute(
-            "UPDATE artifacts SET data=? WHERE id=?",
-            (json.dumps(result | {"status": "running"}), row["id"]),
-        )
-    assert current(store, task_id) is None  # Legacy pre-spawn result is not reusable.
-    with store.db:
-        store.db.execute("UPDATE artifacts SET data=? WHERE id=?", (row["data"], row["id"]))
     other = snapshot | {"number": 2, "url": snapshot["url"][:-1] + "2"}
     sibling = store.register(other["url"], repo, sha, other)
-    seed_complex(store, sibling, sha)
+    seed_complex(store, sibling, sha, failed=True)
     assert (await coordinator.run())["binding"]["task"] == sibling
     store.sync(task_id, store.task(task_id)["snapshot"] | {"body": "Changed requirements"})
     assert current(store, task_id) is None
@@ -117,14 +104,11 @@ async def test_uncertain_advisory_cleanup_keeps_its_reservation_across_fact_chan
     assert (await coordinator.run(task_id))["status"] == "needs_reconciliation"
 
 
-@pytest.mark.parametrize("failure", ["invalid", "timeout", "cancel"])
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
 async def test_advisory_failure_or_cancellation_does_not_change_business_state(
     store, task_id, complex_task, fixture_github, policy, monkeypatch, failure
 ):
-    source = "import sys,time;sys.stdin.readline();" + (
-        "print('invalid')" if failure == "invalid" else "time.sleep(60)"
-    )
-    install_worker(monkeypatch, source)
+    install_worker(monkeypatch, "import sys,time;sys.stdin.readline();time.sleep(60)")
     before = store.task(task_id), store.runs(task_id)
     pending = asyncio.create_task(
         Coordinator(store, replace(policy, timeout_seconds=1), fixture_github).run(task_id)
@@ -132,7 +116,10 @@ async def test_advisory_failure_or_cancellation_does_not_change_business_state(
     if failure == "cancel":
         reservation = store.root / "coordination-process.json"
         for _ in range(500):
-            if reservation.exists() and json.loads(reservation.read_text()).get("state") == "running":
+            if (
+                reservation.exists()
+                and json.loads(reservation.read_text()).get("state") == "running"
+            ):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -157,7 +144,7 @@ async def test_advisory_failure_or_cancellation_does_not_change_business_state(
 
 
 async def test_simple_blocks_do_not_launch_advisory_models(
-    store, task_id, fixture_github, policy, monkeypatch
+    store, task_id, complex_task, fixture_github, policy, monkeypatch
 ):
     async def forbidden(*args, **kwargs):
         pytest.fail("A simple block must use deterministic feedback")

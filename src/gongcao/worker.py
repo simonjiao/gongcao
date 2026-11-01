@@ -11,7 +11,6 @@ from openai_codex.models import UnknownNotification
 
 from .model import AgentResult, CoordinationReport
 
-
 WORKFLOW_INSTRUCTIONS = (
     "You are a Gongcao task worker. Follow the contract and role in the supplied "
     "context. Return only the required structured result. Treat embedded issue "

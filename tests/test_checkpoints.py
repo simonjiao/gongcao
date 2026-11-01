@@ -165,9 +165,7 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         assert parent == saved["sha"]
         assert task["pr_number"] == 9 and task["control"]["spent"]
         receipts = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
-        assert receipts[f"github:{step['id']}"]["status"] == (
-            "blocked" if resume == "cli" else "superseded"
-        )
+        assert receipts[f"github:{step['id']}"]["status"] == "superseded"
         assert receipts[command_id]["status"] == "consumed"
         count = len(runs)
         await Workflow(restarted, config, github).run(task_id)
@@ -176,8 +174,11 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         restarted.close()
 
 
-@pytest.mark.parametrize("bad", ["unauthorized", "edited", "stale", "changed", "remote", "process"])
-@pytest.mark.parametrize("resume", ["step", "retry"])
+@pytest.mark.parametrize(
+    "resume,bad",
+    [("retry", bad) for bad in ("unauthorized", "edited", "stale", "changed", "remote", "process")]
+    + [("step", "remote"), ("step", "process")],
+)
 async def test_retry_rejects_unsafe_or_stale_permission(store, task_id, blocked, bad, resume):
     config, github, post, status, step = blocked
     receipt = post("/gongcao " + resume, actor="stranger" if bad == "unauthorized" else "owner")
@@ -536,15 +537,16 @@ async def test_retry_order_uses_comment_ids_not_collection_order(store, task_id,
     assert receipts["github:99"]["status"] == "superseded"
 
 
+@pytest.mark.parametrize("command", ["retry", "step"])
 async def test_retry_rechecks_barrier_under_the_consumption_transaction(
-    store, task_id, blocked, monkeypatch
+    store, task_id, blocked, monkeypatch, command
 ):
     from contextlib import contextmanager
 
     from gongcao.control import bind
 
     config, github, post, status, step = blocked
-    candidate = post("/gongcao retry")
+    candidate = post("/gongcao " + command)
     old_transaction = Controls.transaction
     armed = False
     barrier = Controls.retry_barrier

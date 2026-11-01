@@ -88,10 +88,32 @@ async def test_unseen_comment_ids_use_current_facts_even_in_checkpoint_second(
     comments.post("/gongcao step", at=int(store.task(task_id)["control"]["since"]) - age)
     await controls.poll(task_id, copilot, comments)
     assert store.task(task_id)["state"] == State.QUEUED
+    store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "stage complete")
+    store.halt(task_id, State.HUMAN, "new blockage in the checkpoint second")
+    older = comments.post("/gongcao step", at=int(store.task(task_id)["control"]["since"]))
+    older["id"] = 0  # A retired newer ID still fences an older comment collected later.
+    async with Lease(store, task_id):
+        await controls.poll(task_id, copilot, comments)
+    assert store.evidence(task_id)["instructions"][-1]["status"] == "rejected"
+    assert store.task(task_id)["control"]["command_id"] == "github:1"
+    assert not store.runs(task_id)
 
 
 @pytest.mark.parametrize(
-    "entry", ["local", "github", "unavailable", "limited", "observe", "observe_edited", "edited"]
+    "entry",
+    [
+        "local",
+        "github",
+        "environment",
+        "unavailable",
+        "limited",
+        "observe",
+        "observe_edited",
+        "edited",
+        "unauthorized",
+        "stale",
+        "changed",
+    ],
 )
 async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permission(
     store, task_id, copilot, fixture_github, comments, monkeypatch, entry
@@ -101,7 +123,9 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
         State.RECONCILE
         if entry.startswith("observe")
         else State.WAITING_ENVIRONMENT
-        if entry == "limited"
+        if entry in {"limited", "environment"}
+        else State.FAILED
+        if entry == "github"
         else State.HUMAN,
         "Prior execution blocked",
     )
@@ -125,19 +149,34 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
     if entry == "local":
         assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
     else:
-        receipt = comments.post("/gongcao step")
+        receipt = comments.post(
+            "/gongcao step", actor="stranger" if entry == "unauthorized" else "owner"
+        )
         if entry == "edited":
             receipt["updated_at"] += "edited"
-    await Workflow(store, copilot, fixture_github).run(task_id)
+        if entry == "stale":
+            receipt["created_at"] = receipt["updated_at"] = "2020-01-01T00:00:00Z"
+        if entry == "changed":
+            await Controls(store).collect(task_id, copilot, fixture_github)
+            fixture_github.issue["body"] += " new request"
+    if entry in {"local", "github", "environment"}:
+        async with Lease(store, task_id):
+            await Controls(store).poll(task_id, copilot, fixture_github)
+            assert not store.task(task_id)["control"]["spent"]
+            assert store.evidence(task_id)["instructions"][-1]["status"] == "accepted"
+            # Permission handoff only: actual Git/SDK stage execution is covered in checkpoints.
+            store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "stage complete")
+    else:
+        await Workflow(store, copilot, fixture_github).run(task_id)
     task = store.task(task_id)
-    if entry in {"local", "github"}:
+    if entry in {"local", "github", "environment"}:
         assert (task["stage"], task["state"]) == (Stage.DEVELOPMENT, State.WAITING_INSTRUCTION)
-        assert len(store.runs(task_id)) == 1
-        assert task["control"]["step_result"]["status"] == "advanced"
+        assert not store.runs(task_id)
+        assert Controls(store).step_result(task_id)["status"] == "advanced"
         assert task["control"]["explicit"]
     elif entry == "observe":
         assert not store.runs(task_id) and task["state"] == State.WAITING_INSTRUCTION
-        assert task["control"]["step_result"]["status"] == "checked"
+        assert Controls(store).step_result(task_id)["status"] == "checked"
     elif entry == "observe_edited":
         assert not store.runs(task_id) and task["state"] == State.WAITING_INSTRUCTION
         assert task["control"]["spent"] and task["control"]["explicit"]
@@ -166,22 +205,54 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
 async def test_recovery_step_cannot_take_an_active_owners_os_lock(
     store, task_id, copilot, fixture_github
 ):
+    assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
     async with Lease(store, task_id) as owner:
+        run = store.begin_run(task_id, Role.ANALYST)
+        before = store.task(task_id), store.evidence(task_id)["instructions"]
+        with closing(Store(store.root)) as other:
+            await Workflow(other, copilot, fixture_github).run(task_id)
+        assert before == (store.task(task_id), store.evidence(task_id)["instructions"])
+        store.finish(run, State.FAILED, Stage.ANALYSIS, State.HUMAN, "owner blocked")
+        Controls(store).finish_step(task_id)
         store.halt(task_id, State.RECONCILE, "owner must settle")
+        stale = tuple(
+            store.db.execute("SELECT * FROM leases WHERE task_id=?", (task_id,)).fetchone()
+        )
         with closing(Store(store.root)) as other:
             assert Controls(other).issue(task_id, "step", policy=copilot.policy_hash)
+            command_id = other.evidence(task_id)["instructions"][-1]["id"]
             await Workflow(other, copilot, fixture_github).run(task_id)
+            assert other.evidence(task_id)["instructions"][-1]["status"] == "blocked"
         assert (
             store.db.execute("SELECT owner FROM leases WHERE task_id=?", (task_id,)).fetchone()[0]
             == owner.owner
         )
-        assert not store.runs(task_id)
+        assert len(store.runs(task_id)) == 1
+    await Workflow(store, copilot, fixture_github).run(task_id)
+    assert len(store.runs(task_id)) == 1 and store.task(task_id)["state"] == State.RECONCILE
+    assert (
+        next(i for i in store.evidence(task_id)["instructions"] if i["id"] == command_id)["status"]
+        == "blocked"
+    )
+    # A DB reservation without an OS owner still permits a fresh controlled recovery.
+    with store.db:
+        store.db.execute("INSERT INTO leases VALUES(?,?,?,?,?,?,?)", stale)
+    assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
+    await Workflow(store, copilot, fixture_github).run(task_id)
+    assert (
+        len(store.runs(task_id)) == 1 and store.task(task_id)["state"] == State.WAITING_INSTRUCTION
+    )
+    assert Controls(store).step_result(task_id)["status"] == "checked"
 
 
 async def test_failed_step_feedback_commits_before_releasing_its_lease(
     store, task_id, copilot, fixture_github, monkeypatch
 ):
     async def unavailable(self, task_id, owner):
+        receipt = store.evidence(task_id)["instructions"][-1]
+        assert receipt["status"] == "accepted" and store.task(task_id)["control"]["spent"]
+        # A committed in-flight attempt cannot be selected again after interruption.
+        await Controls(store).retry_pending(task_id, copilot, fixture_github)
         raise OSError("verification unavailable")
 
     monkeypatch.setattr(Recovery, "reconcile", unavailable)
@@ -191,7 +262,7 @@ async def test_failed_step_feedback_commits_before_releasing_its_lease(
         await Controls(store).poll(task_id, copilot, fixture_github)
         assert not store.db.in_transaction
         with closing(Store(store.root)) as reader:
-            assert reader.task(task_id)["control"]["step_result"]["status"] == "blocked"
+            assert Controls(reader).step_result(task_id)["status"] == "blocked"
 
 
 async def test_completed_comment_permissions_cannot_reactivate_work(

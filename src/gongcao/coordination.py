@@ -142,11 +142,7 @@ def current(store: Store, task_id: int) -> dict[str, Any] | None:
         (task_id,),
     ).fetchone()
     result: dict[str, Any] | None = json.loads(row[0]) if row else None
-    if (
-        result
-        and result.get("status") != "running"
-        and result["fingerprint"] == fingerprint(facts(store, task_id))
-    ):
+    if result and result["fingerprint"] == fingerprint(facts(store, task_id)):
         return result  # Only settled advice at current facts is reusable.
     return None
 
@@ -174,6 +170,8 @@ def complex_block(store: Store, task_id: int) -> bool:
     conflict = any(word in task["reason"].casefold() for word in ("conflict", "冲突"))
     if conflict and (len(dependencies) > 1 or len(task["control"].get("feedback", [])) > 1):
         return True
+    if task["state"] == State.WAITING_DEPENDENCY:
+        return False
     runs = store.runs(task_id)[-3:]
     simple = any(
         word in (task["reason"] + " ".join(r["error"] or "" for r in runs)).casefold()
@@ -267,25 +265,6 @@ class Coordinator:
                 "requested_execution": self.config.execution,
             }
 
-            def save() -> None:
-                with Controls(self.store).transaction():
-                    if fingerprint(facts(self.store, task["id"])) != key:
-                        result["status"] = "stale"
-                        return
-                    self.store.db.execute(
-                        "UPDATE artifacts SET valid=0 WHERE task_id=? AND kind='coordination'",
-                        (task["id"],),
-                    )
-                    self.store.db.execute(
-                        "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
-                        (task["id"], task["target_sha"], "coordination", key, json.dumps(result)),
-                    )
-                    if result["status"] != "running":
-                        self.store.progress(task["id"])
-
-            # Only the process reservation is durable while the session runs.
-            # Persist the advisory once it settles; a pre-spawn crash must not
-            # leave a permanent cached "running" result.
             journal = Journal(
                 self.store, run_dir.name, self.config.max_log_bytes, Redactor(), local=True
             )
@@ -295,6 +274,9 @@ class Coordinator:
                 sandbox = Sandbox(workspace, run_dir, Role.REVIEWER)
                 journal.redactor = Redactor(sandbox.prepare(self.config))
                 journal.emit("isolation_verified", await sandbox.verify(Path(task["repo_path"])))
+                if fingerprint(facts(self.store, task["id"])) != key:
+                    result["status"] = "stale"
+                    return result
                 context = {"role": "coordinator", "facts": data, "fingerprint": key}
                 (run_dir / "context.json").write_text(json.dumps(context, ensure_ascii=False))
                 report = await Runner(self.store, self.config, self.github).session(
@@ -322,7 +304,25 @@ class Coordinator:
             finally:
                 observer.reset(token)
                 result["duration_seconds"] = round(time.monotonic() - started, 3)
-                save()
+                with Controls(self.store).transaction():
+                    if fingerprint(facts(self.store, task["id"])) != key:
+                        result["status"] = "stale"
+                    else:
+                        self.store.db.execute(
+                            "UPDATE artifacts SET valid=0 WHERE task_id=? AND kind='coordination'",
+                            (task["id"],),
+                        )
+                        self.store.db.execute(
+                            "INSERT INTO artifacts(task_id,sha,kind,policy,data) VALUES(?,?,?,?,?)",
+                            (
+                                task["id"],
+                                task["target_sha"],
+                                "coordination",
+                                key,
+                                json.dumps(result),
+                            ),
+                        )
+                        self.store.progress(task["id"])
                 (run_dir / "result.json").write_text(
                     json.dumps(result, ensure_ascii=False, indent=2)
                 )
