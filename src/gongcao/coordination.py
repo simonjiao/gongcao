@@ -280,9 +280,9 @@ class Coordinator:
                     if result["status"] != "running":
                         self.store.progress(task["id"])
 
-            save()
-            if result["status"] == "stale":
-                return result
+            # Only the process reservation is durable while the session runs.
+            # Persist the advisory once it settles; a pre-spawn crash must not
+            # leave a permanent cached "running" result.
             journal = Journal(
                 self.store, run_dir.name, self.config.max_log_bytes, Redactor(), local=True
             )
