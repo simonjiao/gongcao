@@ -118,10 +118,16 @@ async def test_advisory_failure_or_cancellation_does_not_change_business_state(
         Coordinator(store, replace(policy, timeout_seconds=1), fixture_github).run(task_id)
     )
     if failure == "cancel":
-        for _ in range(100):
-            if store.db.execute("SELECT 1 FROM artifacts WHERE kind='coordination'").fetchone():
+        reservation = store.root / "coordination-process.json"
+        for _ in range(500):
+            if reservation.exists() and json.loads(reservation.read_text()).get("state") == "running":
                 break
             await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Coordinator subprocess did not start")
+        assert not store.db.execute(
+            "SELECT 1 FROM artifacts WHERE kind='coordination'"
+        ).fetchone()  # No cached 'running' result before the process settles.
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
