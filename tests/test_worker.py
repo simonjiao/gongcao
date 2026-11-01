@@ -108,6 +108,7 @@ async def test_coordinator_worker_has_a_strict_advisory_schema_and_readonly_role
     }
     await worker.execute(request)
     assert calls[0][1]["sandbox"] == "read-only"
+    assert calls[0][1]["developerInstructions"] == worker.COORDINATION_INSTRUCTIONS
     assert set(calls[1][1]["outputSchema"]["properties"]) == {"facts", "blockers", "suggestions"}
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["data"] == client.response
     with pytest.raises(ValueError, match="read-only"):
@@ -125,6 +126,7 @@ async def test_worker_explicit_sdk_parameters_and_confirmed_evidence(sdk, capsys
     assert calls[0][1]["config"]["model_reasoning_effort"] == effort
     assert calls[0][1]["approvalPolicy"] == "never"
     assert calls[0][1]["sandbox"] == "read-only"
+    assert calls[0][1]["developerInstructions"] == worker.WORKFLOW_INSTRUCTIONS
     assert calls[1][1]["model"] == model and calls[1][1]["effort"] == effort
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     actual = next(e["data"] for e in events if e["kind"] == "execution")
