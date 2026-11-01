@@ -259,7 +259,6 @@ class Coordinator:
                 "source": "coordinator",
                 "fingerprint": key,
                 "binding": {k: raw[k] for k in ("task", "stage", "sha", "request")},
-                "status": "running",
                 "run_dir": str(run_dir),
                 "requested_execution": self.config.execution,
             }
