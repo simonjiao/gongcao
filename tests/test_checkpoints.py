@@ -150,7 +150,10 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         runs = restarted.runs(task_id)
         second = runs[-1]
         assert second["thread_id"] != first["thread_id"]
-        assert "GitHub retry 已授权并完成恢复核验" in caplog.text
+        if resume != "cli":
+            assert "GitHub retry 已授权并完成恢复核验" in caplog.text
+        else:
+            assert command_id.startswith("local:")
         assert second["details"]["source"]["sha"] == saved["sha"]
         assert (
             Path(second["worktree"], "sample.txt").read_text()
