@@ -76,6 +76,20 @@ class AgentResult(BaseModel):
     delivery_complete: bool | None = Field(default=None, strict=True)
 
 
+class Suggestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(min_length=1, max_length=1000)
+    owner: str = Field(min_length=1, max_length=200)
+    inputs: list[str] = Field(max_length=10)
+
+
+class CoordinationReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    facts: list[str] = Field(min_length=1, max_length=12)
+    blockers: list[str] = Field(min_length=1, max_length=8)
+    suggestions: list[Suggestion] = Field(min_length=1, max_length=8)
+
+
 def development_complete(report: dict[str, Any]) -> bool:
     """Report eligibility only; controller provenance and safety gates still apply."""
     return (

@@ -5,6 +5,7 @@ import hashlib
 import math
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import Config
 from .control import Controls
@@ -31,6 +32,8 @@ class Scheduler:
 
     def failed(self, task_id: int) -> None:
         task = self.store.task(task_id)
+        if task["control"].get("mode") == "step" and task["control"].get("spent"):
+            return
         if task["state"] not in {State.FAILED, State.WAITING_ENVIRONMENT}:
             return
         previous = self.store.db.execute(
@@ -219,12 +222,16 @@ class Scheduler:
                 )
                 progress(self.store, task["id"])
         discovery = Discovery(self.store, self.config, self.github)
+        for task in self.store.tasks():
+            if task["control"].get("source") == "manual":
+                discovery.manual(task["id"])
         async with discovery.active(once=once):
             discovery.overview(once=once, config_path=self.config_path, jobs=self.concurrency)
             await self.schedule(once=once, poll=poll)
 
     async def schedule(self, *, once: bool, poll: float) -> None:
         pending: dict[int, asyncio.Task[None]] = {}
+        advisory: asyncio.Task[dict[str, Any]] | None = None
         group = None
         try:
             while True:
@@ -238,9 +245,19 @@ class Scheduler:
                         pending[task["id"]] = asyncio.create_task(
                             self.advance(task["id"], immediate=once)
                         )
+                if self.config.coordination_enabled and (advisory is None or advisory.done()):
+                    from .coordination import Coordinator
+
+                    if advisory is not None:
+                        advisory.result()
+                    advisory = asyncio.create_task(
+                        Coordinator(self.store, self.config, self.github).run()
+                    )
                 if once:
                     group = asyncio.gather(*pending.values())
                     await asyncio.shield(group)
+                    if advisory is not None:
+                        await advisory
                     self.github.report()
                     return
                 self.github.report()
@@ -251,6 +268,9 @@ class Scheduler:
                     self.store.last_activity = time.monotonic()
                 await asyncio.sleep(poll)
         except BaseException:
+            if advisory is not None:
+                advisory.cancel()
+                await asyncio.gather(advisory, return_exceptions=True)
             for workflow in self.workflows:
                 if workflow.lease:
                     workflow.lease.lost = True

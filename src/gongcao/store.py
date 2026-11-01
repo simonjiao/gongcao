@@ -169,7 +169,8 @@ class Store:
             "run": settled[-1]["id"] if settled else None,
             "save": [saved, unchanged] if saved or unchanged else None,
             "pull": [task["pr_number"], task["target_sha"]] if task["pr_number"] else None,
-            "stage": task["stage"] if task["pr_number"] else None,
+            "stage": task["stage"],
+            "step": task["control"].get("step_result"),
             "checks": artifacts[-1]["id"] if artifacts else None,
             "block": [
                 task["stage"],
@@ -188,6 +189,10 @@ class Store:
             else None,
         }
         from .control import baseline
+        from .coordination import current
+
+        advice = current(self, task_id)
+        facts["advice"] = [advice["fingerprint"], advice["status"]] if advice else None
 
         facts["request"] = baseline(task) if any(facts.values()) else None
 
@@ -209,6 +214,7 @@ class Store:
                     "runs": ([saves[-1]] if saves and (not runs or saves[-1] != runs[-1]) else [])
                     + runs[-1:],
                     "artifacts": list({a["kind"]: a for a in artifacts}.values()),
+                    "coordination": advice,
                 }
             )
             self.db.execute("UPDATE claims SET dirty=1 WHERE task_id=?", (task_id,))

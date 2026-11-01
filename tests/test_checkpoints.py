@@ -118,8 +118,9 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
     )
 
 
+@pytest.mark.parametrize("resume", ["step", "retry"])
 async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_at_review(
-    store, task_id, blocked, caplog
+    store, task_id, blocked, caplog, resume
 ):
     caplog.set_level("INFO", logger="gongcao")
     config, github, post, status, step = blocked
@@ -128,12 +129,12 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
     assert saved["state"] == "confirmed"
     assert github.pull is None
     assert store.task(task_id)["target_sha"] == first["target_sha"]
-    assert not store.task(task_id)["control"]["spent"]
-    assert store.evidence(task_id)["instructions"][-1]["status"] == "accepted"
+    assert store.task(task_id)["control"]["spent"]
+    assert store.evidence(task_id)["instructions"][-1]["status"] == "blocked"
     assert saved["sha"] in status()["body"] and "NOT_RUN" in status()["body"]
     assert "/gongcao retry" in status()["body"] and "original/r1" in status()["body"]
     assert store.task(task_id)["status_sync"]["dirty"] == 0
-    retry = post("/gongcao retry")
+    retry = post("/gongcao " + resume)
     restarted = Store(store.root)
     try:
         await Workflow(restarted, config, github).run(task_id)
@@ -210,7 +211,7 @@ async def test_save_failure_no_change_and_lost_response_do_not_duplicate_commits
     config, github, post, status, step = blocked
     run = store.runs(task_id)[-1]
     save = run["details"]["save"]
-    assert github.pull is None and not store.task(task_id)["control"]["spent"]
+    assert github.pull is None and store.task(task_id)["control"]["spent"]
     operations = store.evidence(task_id)["operations"]
     if save["state"] == "unchanged":
         assert not operations

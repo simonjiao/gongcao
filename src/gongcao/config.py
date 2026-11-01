@@ -47,6 +47,7 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
         "qa",
         "copilot",
         "discovery",
+        "coordination",
     }:
         raise ValueError("Invalid configuration keys")
     return raw
@@ -176,6 +177,7 @@ class Config:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     reasoning_effort: str = "xhigh"
     configured: frozenset[str] = frozenset()
+    coordination_enabled: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -262,6 +264,13 @@ class Config:
         mode = copilot.get("mode")
         if mode not in {None, "step", "auto"}:
             raise ValueError("copilot.mode must be step or auto")
+        coordination = raw.get("coordination", {})
+        if (
+            not isinstance(coordination, dict)
+            or coordination.keys() - {"enabled"}
+            or type(coordination.get("enabled", False)) is not bool
+        ):
+            raise ValueError("coordination must contain only boolean enabled")
         return cls(
             model,
             timeout,
@@ -276,6 +285,7 @@ class Config:
             DiscoveryConfig.load(raw.get("discovery", {})),
             raw.get("reasoning_effort", "xhigh"),
             frozenset(raw.keys() & {"model", "reasoning_effort"}),
+            coordination.get("enabled", False),
         )
 
     @classmethod

@@ -56,6 +56,9 @@ uv run gongcao status 1
 uv run gongcao inspect 1
 uv run gongcao logs 1 --follow
 uv run gongcao cancel 1
+uv run gongcao control 1 --step --config gongcao.example.yaml
+# step 自行核验并尝试一个阶段；无法继续时按反馈补齐条件，再发新的 step。
+uv run gongcao coordinate --task 1 --config gongcao.example.yaml
 
 # 只轮询已登记的任务；最多 1–3 个并发，共享同一个 state-dir。
 uv run gongcao serve --config gongcao.example.yaml --jobs 2
@@ -195,8 +198,10 @@ uv run gongcao control 1 --pause
 远端指令默认禁用。配置 `copilot.operators: [GITHUB_LOGIN]` 后，控制器只读取
 原 Issue 的顶层评论：`/gongcao step`、`/gongcao until review`（亦支持其余确定目标）、
 `/gongcao auto`、`/gongcao pause`、`/gongcao retry`。信任 API 返回的登录账户，不信任正文自报身份。
-`retry` 用于同一版本的可恢复阻塞/失败：补齐原计划需要的材料后，新发一条仅含
-`/gongcao retry` 的评论。编辑旧评论不能授权；需求/SHA 改变、未知写入或清理不明须先对账。
+日常推进只需新发 `/gongcao step`；可恢复阻塞会复用原恢复规则，成功完成一个阶段才算推进一步。
+仍阻塞则本次许可结束，补齐条件后重新发 step。`retry/recover` 保留为高级恢复/对账命令。
+编辑旧评论不能授权；需求/SHA 改变、未知写入或清理不明须先对账。
+指令与追加反馈始终在原登记 Issue/PR 的普通会话评论；代码行 Review Comments 不充当指令。
 它继续尚未完成的阶段，创建新 SDK 会话，不重放已完成阶段，也不重置修订预算。
 标签使用独立分页读取；后台评论读取不申请 jobs 或 Agent 租约。运行中收到的指令先登记为
 pending，在下一安全点核验并应用；任务暂停时 serve 仍会读取评论并按授权唤醒。

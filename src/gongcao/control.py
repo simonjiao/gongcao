@@ -29,6 +29,7 @@ LABELS = {
     "gongcao:until-validation": ("until", "validation"),
 }
 UNSAFE = {State.HUMAN, State.RECONCILE, State.CANCELLED}
+RECOVERABLE = {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
 
 
 class Paused(ValueError):
@@ -71,9 +72,12 @@ def rejection(
         target not in TARGETS if mode == "until" else target is not None
     ):
         return "Invalid instruction or target"
-    if mode == "retry":
+    recovering = mode == "retry" or (mode == "step" and data.get("recovery"))
+    if mode == "step" and (task["cancel_requested"] or task["snapshot"].get("state") != "open"):
+        return "Closed or cancelled tasks cannot advance; confirm the object lifecycle first"
+    if recovering:
         if (
-            task["state"] not in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
+            task["state"] not in RECOVERABLE
             or task["cancel_requested"]
             or task["snapshot"].get("state") != "open"
             or data["feedback"]
@@ -84,7 +88,7 @@ def rejection(
     if (
         task["stage"] == Stage.MERGED
         or task["state"] == State.COMPLETED
-        or (task["state"] in UNSAFE and mode != "retry" and (mode != "pause" or data["feedback"]))
+        or (task["state"] in UNSAFE and not recovering and (mode != "pause" or data["feedback"]))
     ):
         return "Task requires manual recovery or is terminal"
     if received and (
@@ -222,6 +226,7 @@ class Controls:
                     "created": created,
                     "policy": policy,
                     "feedback": feedback,
+                    "recovery": mode == "step" and task["state"] in RECOVERABLE,
                     "fingerprint": (received or {}).get("fingerprint")
                     or hashlib.sha256(json.dumps([mode, target, feedback]).encode()).hexdigest(),
                 },
@@ -266,6 +271,15 @@ class Controls:
             self.record(task_id, command_id, data, "rejected" if reason else "accepted", reason)
             if reason:
                 return False
+            if data["recovery"]:
+                self.record(task_id, command_id, data, "pending")
+                if received is None:
+                    self.db.execute(
+                        "UPDATE instructions SET status='superseded',reason='New local step' "
+                        "WHERE task_id=? AND status='pending' AND id!=?",
+                        (task_id, command_id),
+                    )
+                return True  # The existing async retry path owns all recovery checks.
             if received is None and replace_unverified:
                 self.db.execute(
                     "UPDATE instructions SET status='superseded',reason='New local instruction' "
@@ -289,6 +303,7 @@ class Controls:
                 "spent": False,
                 "pause_requested": mode == "pause",
                 "pause_reason": "Pause requested" if mode == "pause" else "",
+                "step_result": None,
                 "policy": policy,
                 "since": max(created, control.get("since", 0)),
                 "feedback": control.get("feedback", [])
@@ -342,6 +357,11 @@ class Controls:
             control = task["control"]
             if not control:
                 return bool(task["state"] != State.WAITING_INSTRUCTION)
+            if (
+                control.get("spent")
+                and (control.get("step_result") or {}).get("status") == "blocked"
+            ):
+                return False
             if task["state"] in UNSAFE or task["stage"] == Stage.MERGED:
                 return False
             self.fence(task_id)
@@ -365,6 +385,10 @@ class Controls:
                 control["spent"] = True
                 if command_id := control.get("command_id"):
                     self.mark(task_id, command_id, "consumed", "Safe checkpoint reached")
+                if control["mode"] == "step":
+                    control["step_result"] = bind(
+                        task, {"status": "advanced", "reason": "阶段完成"}
+                    )
             elif final and control["mode"] == "auto" and control.get("command_id"):
                 self.mark(task_id, control["command_id"], "consumed", "Ready for human merge")
             self.save(task_id, control)
@@ -381,6 +405,32 @@ class Controls:
                 )
             self.store.progress(task_id)
             return not pause
+
+    def finish_step(self, task_id: int) -> None:
+        """An unsuccessful step is one attempt, never a standing retry permission."""
+        with self.transaction():
+            task = self.store.task(task_id)
+            control = task["control"]
+            if (
+                control.get("mode") != "step"
+                or control.get("spent")
+                or not self.owns_checkpoint(task_id)
+            ):
+                return
+            if task["state"] == State.RUNNING:
+                return
+            self.save(
+                task_id,
+                control
+                | {
+                    "spent": True,
+                    "pause_requested": True,
+                    "step_result": bind(task, {"status": "blocked", "reason": task["reason"]}),
+                },
+            )
+            if control.get("command_id"):
+                self.mark(task_id, control["command_id"], "blocked", task["reason"])
+            self.store.progress(task_id)
 
     def revalidate(self, task_id: int, config: Config) -> bool:
         return self.check_policy(
@@ -444,7 +494,7 @@ class Controls:
                 (task_id,),
             ):
                 data = json.loads(row["data"])
-                if data["mode"] == "retry":
+                if data["mode"] == "retry" or data.get("recovery"):
                     continue  # Async reconciliation owns retry acceptance under the task lease.
                 if data["actor"].casefold() in operators:
                     if not unverified or int(row["id"].split(":")[1]) > max(
@@ -552,7 +602,6 @@ class Controls:
             task = self.store.task(task_id)
             if (
                 not config.copilot_operators
-                or task["snapshot"].get("kind") != "issues"
                 or task["state"] in {State.COMPLETED, State.CANCELLED}
                 or task["cancel_requested"]
                 or task["stage"] == Stage.MERGED
@@ -675,6 +724,9 @@ class Controls:
                         "updated_at": comment.get("updated_at"),
                         "fingerprint": fingerprint,
                         "mode": words[0] if words else "",
+                        "recovery": bool(
+                            words and words[0] == "step" and task["state"] in RECOVERABLE
+                        ),
                         "target": words[1] if len(words) == 2 else None,
                         "feedback": Redactor().text(feedback.strip())
                         if actor.casefold() in operators
@@ -690,7 +742,7 @@ class Controls:
                     if len(words) not in {1, 2}
                     else rejection(task, data)
                 )
-                if data["mode"] == "retry":
+                if data["mode"] == "retry" or data.get("recovery"):
                     runs = self.store.runs(task_id)
                     if runs and data["created"] < int(runs[-1]["ended"] or runs[-1]["started"]):
                         reason = "Retry comment predates the current execution"
@@ -699,13 +751,23 @@ class Controls:
     def retry_barrier(self, task_id: int, command_id: str) -> bool:
         task = self.store.task(task_id)
         rows = self.db.execute(
-            "SELECT id FROM instructions WHERE task_id=? AND (status='pending' OR "
+            "SELECT id,rowid FROM instructions WHERE task_id=? AND (status='pending' OR "
             "(status='accepted' AND id=?))",
             (task_id, task["control"].get("command_id")),
         )
+        receipt = self.db.execute(
+            "SELECT rowid FROM instructions WHERE task_id=? AND id=?", (task_id, command_id)
+        ).fetchone()
         return any(
-            row["id"].startswith("github:")
-            and int(row["id"].split(":")[1]) > int(command_id.split(":")[1])
+            (
+                row["id"].startswith("github:")
+                and command_id.startswith("github:")
+                and int(row["id"].split(":")[1]) > int(command_id.split(":")[1])
+            )
+            or (
+                row["rowid"] > receipt[0]
+                and (row["id"].startswith("local:") or command_id.startswith("local:"))
+            )
             for row in rows
         )
 
@@ -715,19 +777,23 @@ class Controls:
             return
         rows = self.db.execute(
             "SELECT id,data FROM instructions WHERE task_id=? AND status='pending' AND reason='' "
-            "AND json_extract(data,'$.mode')='retry' ORDER BY CAST(substr(id,8) AS INTEGER) DESC",
+            "AND (json_extract(data,'$.mode')='retry' OR json_extract(data,'$.recovery')=1) "
+            "ORDER BY CAST(substr(id,8) AS INTEGER) DESC,rowid DESC",
             (task_id,),
         ).fetchall()
         for row in rows:
             task = self.store.task(task_id)
             data = json.loads(row["data"])
             if self.retry_barrier(task_id, row["id"]):
-                return
+                continue
             retry = self.db.execute("SELECT * FROM retries WHERE task_id=?", (task_id,)).fetchone()
             if retry and retry["fingerprint"] == row["id"] and retry["next_at"] > time.time():
                 return
             reason = rejection(task, data, received=data)
-            if data["actor"].casefold() not in {a.casefold() for a in config.copilot_operators}:
+            local = row["id"].startswith("local:") and data["actor"] == "local"
+            if not local and data["actor"].casefold() not in {
+                a.casefold() for a in config.copilot_operators
+            }:
                 reason = "Operator is not authorized"
             changed_policy = task["control"].get("policy") not in {None, config.policy_hash}
             policy = self.store.artifact(task_id, "policy", "") or {}
@@ -763,7 +829,10 @@ class Controls:
                         await remote.checkpoint(self.store.task(task_id), runs[-1])
                     await remote.source(self.store.task(task_id))
                 # Re-read the immutable receipt after all network/OS checks, before reset.
-                await asyncio.create_task(self.collect(task_id, config, github), context=Context())
+                if not local:
+                    await asyncio.create_task(
+                        self.collect(task_id, config, github), context=Context()
+                    )
                 with self.transaction():
                     self.fence(task_id)
                     receipt = self.db.execute(
@@ -788,7 +857,18 @@ class Controls:
                         "UPDATE instructions SET status='superseded',reason=? WHERE task_id=? "
                         "AND status='pending' AND id LIKE 'github:%' "
                         "AND CAST(substr(id,8) AS INTEGER)<?",
-                        ("Verified newer retry", task_id, int(row["id"].split(":")[1])),
+                        (
+                            "Verified newer retry",
+                            task_id,
+                            int(row["id"].split(":")[1]) if not local else 0,
+                        ),
+                    )
+                    self.db.execute(
+                        "UPDATE instructions SET status='superseded',"
+                        "reason='Verified newer step' "
+                        "WHERE task_id=? AND status='pending' AND id LIKE 'local:%' AND rowid < "
+                        "(SELECT rowid FROM instructions WHERE task_id=? AND id=?)",
+                        (task_id, task_id, row["id"]),
                     )
                     self.mark(task_id, row["id"], "accepted", "")
                     if old.get("command_id"):
@@ -799,7 +879,9 @@ class Controls:
                         task_id,
                         old
                         | {
-                            "mode": old["mode"]
+                            "mode": "step"
+                            if data.get("recovery")
+                            else old["mode"]
                             if old["mode"] in {"step", "auto", "until"}
                             else "step",
                             "command_id": row["id"],
@@ -808,6 +890,7 @@ class Controls:
                             "pause_reason": "",
                             "since": data["created"],
                             "policy": config.policy_hash,
+                            "step_result": None,
                         },
                     )
                     recovery.reset_retry(task_id, task["target_sha"])
@@ -843,7 +926,31 @@ class Controls:
                     if failures >= 3:
                         self.mark(task_id, row["id"], "rejected", message)
                         message += "; restore access and post a new /gongcao retry"
+                    if data.get("recovery"):
+                        self.mark(task_id, row["id"], "blocked", message)
                 self.store.halt(task_id, State.HUMAN, message)
+            finally:
+                if data.get("recovery"):
+                    receipt = self.db.execute(
+                        "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
+                        (task_id, row["id"]),
+                    ).fetchone()
+                    if receipt["status"] in {"rejected", "blocked"}:
+                        current = self.store.task(task_id)
+                        self.save(
+                            task_id,
+                            current["control"]
+                            | {
+                                "mode": "step",
+                                "command_id": row["id"],
+                                "spent": True,
+                                "pause_requested": True,
+                                "step_result": bind(
+                                    current, {"status": "blocked", "reason": receipt["reason"]}
+                                ),
+                            },
+                        )
+                        self.store.progress(task_id)
             return
 
     async def poll(

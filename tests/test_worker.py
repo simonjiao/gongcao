@@ -22,6 +22,7 @@ def sdk(monkeypatch):
     }
 
     class Client:
+        response = result
         available = True
         efforts = ["low", "high", "xhigh"]
         actual_model = "gpt-6.1-sol"
@@ -33,7 +34,7 @@ def sdk(monkeypatch):
                 Notification(
                     "item/completed",
                     UnknownNotification(
-                        {"item": {"type": "agentMessage", "text": json.dumps(result)}}
+                        {"item": {"type": "agentMessage", "text": json.dumps(self.response)}}
                     ),
                 ),
                 Notification(
@@ -90,6 +91,27 @@ def sdk(monkeypatch):
 
     monkeypatch.setattr(worker, "AsyncCodexClient", Client)
     return Client, calls
+
+
+async def test_coordinator_worker_has_a_strict_advisory_schema_and_readonly_role(sdk, capsys):
+    client, calls = sdk
+    client.response = {
+        "facts": ["Run 1"],
+        "blockers": ["Conflicting feedback"],
+        "suggestions": [{"action": "Clarify", "owner": "operator", "inputs": []}],
+    }
+    request = {
+        "writable": False,
+        "context": {"role": "coordinator"},
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "xhigh",
+    }
+    await worker.execute(request)
+    assert calls[0][1]["sandbox"] == "read-only"
+    assert set(calls[1][1]["outputSchema"]["properties"]) == {"facts", "blockers", "suggestions"}
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["data"] == client.response
+    with pytest.raises(ValueError, match="read-only"):
+        await worker.execute(request | {"writable": True})
 
 
 @pytest.mark.parametrize("model,effort", [("gpt-6.1-sol", "xhigh"), ("configured-model", "high")])

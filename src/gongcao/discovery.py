@@ -49,6 +49,26 @@ class Discovery:
     def records(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.store.db.execute("SELECT * FROM claims ORDER BY url")]
 
+    def manual(self, task_id: int) -> None:
+        """Explicit registration owns a status anchor, never an intake claim."""
+        task = self.store.task(task_id)
+        data = {
+            "kind": "manual",
+            "repo": task["snapshot"]["repository"],
+            "path": task["repo_path"],
+            "base_sha": task["target_sha"],
+            "mode": task["control"]["mode"],
+            "policy": self.config.policy_hash,
+            "marker": f"<!-- gongcao:controller={self.controller};task={task['url']} -->",
+            "attempted": False,
+        }
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT OR IGNORE INTO claims(url,data,task_id) VALUES(?,?,?)",
+                (task["url"], json.dumps(data), task_id),
+            )
+            self.store.progress(task_id)
+
     def save(self, url: str, **values: Any) -> None:
         assert not values.keys() - {
             "data",
@@ -466,17 +486,28 @@ class Discovery:
     async def _claim(self, row: dict[str, Any]) -> None:
         data = json.loads(row["data"])
         target = Target.parse(row["url"])
+        manual = data.get("kind") == "manual"
+        if manual and "actor" not in data:
+            data["actor"] = (await self.github.read("user"))["login"].lower()
+            self.save(row["url"], data=json.dumps(data))
+            row["data"] = json.dumps(data)
         comments = await self.github.instructions({"url": row["url"]})
         item = await self.owned(row, comments)
         if item is None:
             if data["attempted"]:
                 raise ValueError("Unconfirmed claim POST; refusing replay or Agent execution")
-            if not self.config.discovery.enabled:
+            if not manual and not self.config.discovery.enabled:
                 raise ValueError("Discovery disabled; retaining the planned claim without a POST")
-            await self.eligible(target, data["label"], data["marker"], comments=comments)
+            if not manual:
+                await self.eligible(target, data["label"], data["marker"], comments=comments)
             body = (
                 data["marker"]
-                + f"\nGongcao claim pending confirmation. Mode: {data['mode']}."
+                + (
+                    "\nGongcao 手工登记状态锚点。"
+                    if manual
+                    else "\nGongcao claim pending confirmation."
+                )
+                + f" Mode: {data['mode']}."
                 + f" SHA: `{data['base_sha']}`"
             )
             data["attempted"] = True
@@ -501,6 +532,8 @@ class Discovery:
         if item is None or not expected or item["body"] != expected:
             raise ValueError("Claim content was not confirmed; Agent execution is prohibited")
         self.save(row["url"], comment_id=item["id"], confirmed=item["body"], intent="")
+        if manual:
+            return
         # A confirmed claim survives label removal; lifecycle changes remain a registration gate.
         snapshot = self.github.facts(
             target, await self.github.read(f"repos/{target.repository}/issues/{target.number}")
@@ -555,16 +588,16 @@ class Discovery:
             else "pending"
         )
         action = (
-            "Post a new authorized `/gongcao step` or `/gongcao auto` comment on this Issue"
+            "在本登记对象发新的 /gongcao step，推进一个业务阶段"
             if task["state"] == State.WAITING_INSTRUCTION
-            else "Supply missing inputs, then post a new authorized `/gongcao retry` comment"
+            else "补齐所列材料后，在本登记对象发新的 /gongcao step；高级命令 /gongcao retry 仍可用"
             if task["state"] in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
             and task["snapshot"].get("state") == "open"
             and not task["cancel_requested"]
             and retry_available
-            else "Reconciliation required; retry cannot bypass unverified provenance or cleanup"
+            else "需人工核对来源、进程清理或未知写入；step 不能绕过核验"
             if task["state"] in {State.RECONCILE, State.HUMAN}
-            else "Await human merge"
+            else "已完成自动流程，等待所有者人工合并"
             if task["stage"] == Stage.MERGEABLE
             else task["reason"][:2000] or "Controller will advance within the configured policy"
         )
@@ -580,6 +613,28 @@ class Discovery:
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
+        if step := control.get("step_result"):
+            body += "\n本次 Step：" + (
+                "已推进一个阶段"
+                if step["status"] == "advanced"
+                else "本次仍受阻，需新 Step 才会再尝试"
+            )
+            body += "; " + step["reason"][:1000]
+        from .coordination import current
+
+        advice = event.get("coordination") if event else current(self.store, task["id"])
+        if advice and advice.get("status") == "completed":
+            report = advice["report"]
+            body += "\n协调 Agent 建议（非控制器确认事实，不构成执行授权）："
+            body += "\n依据：" + "; ".join(report["facts"])[:1500]
+            body += "\n阻塞分析：" + "; ".join(report["blockers"])[:1000]
+            body += (
+                "\n建议："
+                + "; ".join(
+                    f"{s['action']}；责任方={s['owner']}；所需输入={s['inputs']}"
+                    for s in report["suggestions"]
+                )[:2000]
+            )
         if event and (corrects := event.get("corrects")):
             body += (
                 f"\nCorrection of event `{corrects['event_id']}`: "
@@ -680,7 +735,20 @@ class Discovery:
         finally:
             background.reset(token)
 
-    async def _publish_locked(self, row: dict[str, Any]) -> None:
+    async def reconcile_status(self, task_id: int) -> None:
+        """Recovery observes uncertain comments without sending any new feedback."""
+        for row in self.records():
+            if row["task_id"] != task_id:
+                continue
+            data = json.loads(row["data"])
+            if (
+                row["intent"]
+                or (data.get("attempted") and not row["confirmed"])
+                or any(e["attempted"] for e in data.get("progress", []))
+            ):
+                await self._publish_locked(row, read_only=True)
+
+    async def _publish_locked(self, row: dict[str, Any], *, read_only: bool = False) -> None:
         # Foreground handoff and the background ticker share one persistent event queue.
         key = hashlib.sha256(row["url"].encode()).hexdigest()
         with (self.store.root / f"status-{key}.lock").open("a") as lock:
@@ -693,18 +761,29 @@ class Discovery:
             current = self.store.db.execute(
                 "SELECT * FROM claims WHERE url=?", (row["url"],)
             ).fetchone()
-            await self._publish(dict(current))
+            if (
+                not read_only
+                and not current["confirmed"]
+                and json.loads(current["data"]).get("kind") == "manual"
+            ):
+                await self.claim(dict(current))
+                current = self.store.db.execute(
+                    "SELECT * FROM claims WHERE url=?", (row["url"],)
+                ).fetchone()
+            await self._publish(dict(current), read_only=read_only)
             self.store.claim_data(row["url"], lambda data: data.pop("status_retry", None))
 
-    async def _publish(self, row: dict[str, Any]) -> None:
+    async def _publish(self, row: dict[str, Any], *, read_only: bool = False) -> None:
         item = await self.owned(row)
         if item is None:
             raise ValueError("Claim comment is missing")
         if row["intent"]:
             if item["body"] != row["intent"]:
                 raise ValueError("Unconfirmed status PATCH; refusing replay")
-            self.save(row["url"], confirmed=item["body"], intent="", reason="")
-            row.update(confirmed=item["body"], intent="")
+            self.save(
+                row["url"], comment_id=item["id"], confirmed=item["body"], intent="", reason=""
+            )
+            row.update(comment_id=item["id"], confirmed=item["body"], intent="")
         if item["body"] != row["confirmed"]:
             raise ValueError("Owned status comment was edited outside the recorded intent")
         while True:
@@ -750,6 +829,8 @@ class Discovery:
             if observed is None:
                 if event["attempted"]:
                     raise ValueError("Unconfirmed progress POST; refusing replay")
+                if read_only:
+                    return
 
                 def attempt(current: dict[str, Any], body: str = body) -> None:
                     current["progress"][0].update(body=body, attempted=True)

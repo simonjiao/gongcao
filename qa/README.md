@@ -29,6 +29,12 @@ Ruff, strict mypy, pytest and beartype include `qa`. Default CI only runs offlin
 checks and tests, without model authorization or GitHub writes. The SDK/GitHub
 protocol substitutes in regression tests are **not** real end-to-end evidence.
 
+The `delivery` scenario also registers its own unmerged PR for status feedback,
+checks both manual Issue/PR anchors and append-only conversation comments,
+consumes a trusted top-level PR pause without starting another Agent, and verifies
+that a repeat changes no comment history. This uses the same Run resources and cleanup.
+Running it against GitHub still requires explicit authorization and `--real`.
+
 Offline checks compare installed dependencies to `uv.lock`, record tool versions
 and exercise actual Bubblewrap mounts, credential isolation and read-only access.
 No pre-existing temporary directory is required. All temporary probe data is

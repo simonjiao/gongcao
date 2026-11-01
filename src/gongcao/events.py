@@ -122,8 +122,13 @@ class Redactor:
 
 
 class Journal:
-    def __init__(self, store: Store, run_id: str, limit: int, redactor: Redactor):
+    def __init__(
+        self, store: Store, run_id: str, limit: int, redactor: Redactor, *, local: bool = False
+    ):
         self.store, self.run_id, self.limit, self.redactor = store, run_id, limit, redactor
+        self.local = local
+        self.execution: dict[str, Any] | None = None
+        self.thread_id: str | None = None
         directory = store.root / "logs"
         directory.mkdir(exist_ok=True, mode=0o700)
         self.path = directory / f"{run_id}.jsonl"
@@ -146,7 +151,8 @@ class Journal:
             self.path.replace(self.path.with_suffix(".jsonl.1"))
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(encoded + "\n")
-        self.store.event(self.run_id, kind, str(record["data"]))
+        if not self.local:
+            self.store.event(self.run_id, kind, str(record["data"]))
         if controller and kind in {"started", "ended"}:
             run = next(r for r in self.store.runs(data["task_id"]) if r["id"] == self.run_id)
             report = json.loads(run["result"]) if run["result"] else {}

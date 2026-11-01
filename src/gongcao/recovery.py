@@ -44,7 +44,7 @@ class Recovery:
         row = self.store.db.execute(
             "SELECT data FROM claims WHERE task_id=?", (task["id"],)
         ).fetchone()
-        if row:
+        if row and json.loads(row["data"]).get("kind") != "manual":
             data = json.loads(row["data"])
             sha = await self.default_base(task)
             if sha != data["base_sha"]:
@@ -151,6 +151,10 @@ class Recovery:
 
     async def reconcile(self, task_id: int, owner: str) -> dict[str, Any]:
         task = self.store.task(task_id)
+        from .config import Config
+        from .discovery import Discovery
+
+        await Discovery(self.store, Config(), self.github).reconcile_status(task_id)
         records = self.store.db.execute(
             "SELECT * FROM processes WHERE task_id=? AND owner!=? AND state!='stopped'",
             (task_id, owner),

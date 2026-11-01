@@ -13,6 +13,7 @@ from gongcao.github import GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
 from gongcao.processes import observer
+from gongcao.recovery import Recovery
 from gongcao.remote import Controlled
 from gongcao.runner import Runner
 from gongcao.scheduler import Scheduler
@@ -87,6 +88,45 @@ async def test_unseen_comment_ids_use_current_facts_even_in_checkpoint_second(
     comments.post("/gongcao step", at=int(store.task(task_id)["control"]["since"]) - age)
     await controls.poll(task_id, copilot, comments)
     assert store.task(task_id)["state"] == State.QUEUED
+
+
+@pytest.mark.parametrize("entry", ["local", "github", "unavailable", "edited"])
+async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permission(
+    store, task_id, copilot, fixture_github, comments, monkeypatch, entry
+):
+    store.halt(task_id, State.HUMAN, "Prior execution blocked")
+    if entry == "unavailable":
+
+        async def unavailable(self, task_id, owner):
+            raise OSError("Verification unavailable")
+
+        monkeypatch.setattr(Recovery, "reconcile", unavailable)
+    if entry == "local":
+        assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
+    else:
+        receipt = comments.post("/gongcao step")
+        if entry == "edited":
+            receipt["updated_at"] += "edited"
+    await Workflow(store, copilot, fixture_github).run(task_id)
+    task = store.task(task_id)
+    if entry in {"local", "github"}:
+        assert (task["stage"], task["state"]) == (Stage.DEVELOPMENT, State.WAITING_INSTRUCTION)
+        assert len(store.runs(task_id)) == 1
+        assert task["control"]["step_result"]["status"] == "advanced"
+    else:
+        assert not store.runs(task_id) and task["state"] == State.HUMAN
+
+    def unchanged():
+        task = store.task(task_id)
+        return (
+            {k: task[k] for k in ("stage", "state", "target_sha", "control", "reason")},
+            store.runs(task_id),
+            list(fixture_github.writes),
+        )
+
+    before = unchanged()
+    await Workflow(store, copilot, fixture_github).run(task_id)
+    assert before == unchanged()
 
 
 async def test_completed_comment_permissions_cannot_reactivate_work(

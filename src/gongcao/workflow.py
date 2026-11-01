@@ -343,6 +343,7 @@ class Workflow:
             progress(self.store, task_id)
 
     async def execute(self, task_id: int) -> list[str]:
+        entry = self.store.task(task_id)["control"]
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             return []
         async with Lease(self.store, task_id) as lease:
@@ -355,6 +356,14 @@ class Workflow:
                 for _ in range(4 * self.config.max_revisions + 10):
                     task = await self.sync(task_id)
                     await controls.poll(task_id, self.config, self.github)
+                    from .discovery import Discovery
+
+                    try:
+                        await Discovery(self.store, self.config, self.github).reconcile_status(
+                            task_id
+                        )
+                    except ValueError as exc:
+                        raise UncertainWrite(str(exc)) from exc
                     if not controls.revalidate(task_id, self.config):
                         break
                     task = self.store.task(task_id)
@@ -439,4 +448,18 @@ class Workflow:
                 self.store.halt(task_id, state, Redactor().text(f"{type(exc).__name__}: {exc}"))
             finally:
                 await self.save_output(task_id)
-            return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]
+                Controls(self.store).finish_step(task_id)
+        from .coordination import Coordinator
+
+        control = self.store.task(task_id)["control"]
+        receipt = self.store.db.execute(
+            "SELECT data FROM instructions WHERE task_id=? AND id=?",
+            (task_id, control.get("command_id")),
+        ).fetchone()
+        if (
+            receipt
+            and json.loads(receipt[0])["mode"] == "step"
+            and (control.get("command_id") != entry.get("command_id") or not entry.get("spent"))
+        ):
+            await Coordinator(self.store, self.config, self.github).run(task_id)
+        return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import closing
 from copy import deepcopy
 
 import pytest
@@ -14,6 +15,28 @@ from gongcao.leases import Lease
 from gongcao.model import Stage, State
 from gongcao.recovery import Recovery
 from gongcao.store import Store
+
+
+@pytest.mark.parametrize("kind", ["issues", "pull"])
+async def test_manual_status_anchor_and_progress_are_append_only_without_discovery(
+    intake, store, repo, sha, snapshot, kind
+):
+    item = snapshot | {"kind": kind, "url": snapshot["url"].replace("/issues/", f"/{kind}/")}
+    task_id = store.register(item["url"], repo, sha, item)
+    publisher = Discovery(store, Config(), intake.github)
+    publisher.manual(task_id)
+    await publisher.refresh(task_id)
+    row = publisher.records()[0]
+    assert json.loads(row["data"])["kind"] == "manual" and row["confirmed"]
+    original = deepcopy(intake.github.comments)
+    store.halt(task_id, State.HUMAN, "缺少验收材料，NOT_RUN")
+    await publisher.refresh(task_id)
+    assert intake.github.comments[: len(original)] == original
+    assert "NOT_RUN" in intake.github.comments[-1]["body"]
+    count = len(intake.github.writes)
+    with closing(Store(store.root)) as restarted:
+        await Discovery(restarted, Config(), intake.github).refresh(task_id)
+    assert len(intake.github.writes) == count
 
 
 async def test_filter_dedupe_backlog_status_and_cross_state_lock(
@@ -77,7 +100,11 @@ async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, s
     restarted = Discovery(store, intake.config if failure == "limited" else Config(), intake.github)
     async with restarted.active(once=True):
         assert bool(store.tasks()) == (failure != "absent")
-    assert intake.github.writes.count("POST") == 1 + (failure == "limited")
+    # A confirmed lost response may publish the newly registered stage, never another anchor.
+    assert intake.github.writes.count("POST") == 1 + (failure in {"limited", "lost"})
+    assert sum(
+        c["body"].startswith("<!-- gongcao:controller=") for c in intake.github.comments
+    ) == (failure != "absent")
     assert not store.db.execute("SELECT 1 FROM runs").fetchone()
     if failure == "absent":
         assert "refusing replay" in restarted.records()[0]["reason"]

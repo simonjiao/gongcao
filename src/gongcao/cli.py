@@ -27,6 +27,12 @@ def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
+def coordination_status(store: Store, task_id: int) -> dict[str, Any] | None:
+    from .coordination import current
+
+    return current(store, task_id)
+
+
 async def logs(
     store: Store,
     task_id: int,
@@ -92,7 +98,11 @@ async def logs(
 async def execute(args: argparse.Namespace, store: Store) -> int:
     github = GitHub()
     github.traffic.restore(store)
-    if args.command == "register":
+    if args.command == "coordinate":
+        from .coordination import Coordinator
+
+        output(await Coordinator(store, Config.load(args.config), github).run(args.task))
+    elif args.command == "register":
         target = Target.parse(args.url)
         repo, sha = await repository(args.repo, target)
         snapshot = await github.snapshot(target)
@@ -106,6 +116,11 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         task_id = store.register(
             target.url, repo, sha, snapshot, mode=config.copilot_mode, policy=config.policy_hash
         )
+        from .discovery import Discovery
+
+        status = Discovery(store, config, github)
+        status.manual(task_id)
+        await status.refresh(task_id)
         output(store.task(task_id))
     elif args.command == "quality":
         config = Config.load(args.config)
@@ -186,6 +201,8 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         accepted = Controls(store).issue(
             args.task, args.mode or "until", args.until, policy=config.policy_hash
         )
+        if accepted and args.mode == "step":
+            await Workflow(store, config, github).run(args.task)
         output(store.task(args.task))
         return 0 if accepted else 1
     elif args.command == "sync":
@@ -218,6 +235,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
                 | {
                     "dependencies": store.dependencies(task["id"]),
                     "runtime": diagnose(store, task["id"]),
+                    "coordination": coordination_status(store, task["id"]),
                 }
                 for task in tasks
             ]
@@ -227,6 +245,7 @@ async def execute(args: argparse.Namespace, store: Store) -> int:
         task["runs"] = store.runs(args.task)
         task["evidence"] = store.evidence(args.task)
         task["runtime"] = diagnose(store, args.task)
+        task["coordination"] = coordination_status(store, args.task)
         output(task)
     elif args.command == "cancel":
         store.cancel(args.task)
@@ -301,6 +320,9 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     commands = cli.add_subparsers(dest="command", required=True)
+    coordinate = commands.add_parser("coordinate", help="Read-only advice for registered tasks")
+    coordinate.add_argument("--task", type=int)
+    coordinate.add_argument("--config", type=Path)
     register = commands.add_parser("register", help="Register exactly one GitHub Issue/PR")
     register.add_argument("url")
     register.add_argument("--repo", type=Path, default=Path.cwd())

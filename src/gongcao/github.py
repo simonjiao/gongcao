@@ -356,8 +356,6 @@ class GitHub:
 
     async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
         target = Target.parse(task["url"])
-        if target.kind != "issues":
-            return []
         return await self.pages(
             f"repos/{target.repository}/issues/{target.number}/comments?per_page=100"
         )
