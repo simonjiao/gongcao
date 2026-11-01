@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import json
 
@@ -12,19 +13,51 @@ from qa.ledger import Run
 from qa.resources import Unconfirmed, action, cleanup, create_issue
 
 
-async def test_manual_feedback_intents_prevent_qa_cleanup(tmp_path, repo, sha, snapshot):
+@pytest.mark.parametrize("kind", ["feedback", "uncertain", "empty", "corrupt", "busy", "stopped"])
+async def test_manual_feedback_intents_prevent_qa_cleanup(tmp_path, repo, sha, snapshot, kind):
     run = new_run(tmp_path, "delivery")
     state = Store(run.root / "state")
+    source = run.root / "source"
+    source.mkdir()
+    auth = state.root / "coordination/session/home/.codex/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("test-only dedicated model auth copy")
+    lock = None
     try:
         task_id = state.register(snapshot["url"], repo, sha, snapshot)
-        Discovery(state, Config(), GitHub()).manual(task_id)
-        state.db.execute("UPDATE claims SET intent='unconfirmed comment'")
-        state.db.commit()
-        with pytest.raises(Unconfirmed, match="feedback needs reconciliation"):
+        if kind == "feedback":
+            Discovery(state, Config(), GitHub()).manual(task_id)
+            state.db.execute("UPDATE claims SET intent='unconfirmed comment'")
+            state.db.commit()
+        else:
+            reservation = state.root / "coordination-process.json"
+            reservation.write_text(
+                "{}"
+                if kind == "empty"
+                else "invalid"
+                if kind == "corrupt"
+                else json.dumps(
+                    {"state": "stopped" if kind in {"stopped", "busy"} else "uncertain"}
+                )
+            )
+        if kind == "busy":
+            lock = (state.root / "coordination.lock").open("a")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if kind == "stopped":
             await cleanup(run, None, GitHub())
-        assert state.db.execute("SELECT intent FROM claims").fetchone()[0] == "unconfirmed comment"
+            assert run.value["cleaned"] and not auth.exists() and not source.exists()
+            return
+        with pytest.raises(Unconfirmed):
+            await cleanup(run, None, GitHub())
+        if kind == "feedback":
+            assert (
+                state.db.execute("SELECT intent FROM claims").fetchone()[0] == "unconfirmed comment"
+            )
+        assert auth.exists() and source.exists()
         assert not run.value["cleaned"] and (run.root / "state/gongcao.sqlite3").exists()
     finally:
+        if lock:
+            lock.close()
         state.close()
 
 

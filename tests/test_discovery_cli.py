@@ -131,7 +131,14 @@ def test_discovery_cli_claims_pauses_and_restarts_without_duplicates(
     assert data.get("clones", 0) == (0 if continuous else 1)
     claims = [c for c in data["status_comments"] if "<!-- gongcao:" in c["body"]]
     progress = [c for c in data["status_comments"] if "<!-- gongcao-progress:" in c["body"]]
-    assert len(claims) == len(progress) == len(issues) and not data.get("pull")
+    assert len(claims) == len(issues) and not data.get("pull")
+    assert len(progress) == 2 * len(issues)  # Registered stage, then completed Step.
+    assert len({c["body"].splitlines()[0] for c in progress}) == len(progress)
+    for issue in issues:
+        history = [c["body"] for c in progress if c["issue"] == issue["number"]]
+        assert len(history) == 2
+        assert "pending_analysis" in history[0] and "queued" in history[0]
+        assert "pending_development" in history[1] and "已推进一个阶段" in history[1]
     assert all("claim pending confirmation" in c["body"] for c in claims)
     assert all(w["method"] == "POST" for w in data["writes"])
     assert all(t["control"]["source"] == "discovery" and not t["runtime"]["lease"] for t in after)

@@ -1,6 +1,7 @@
 """Run-owned GitHub resources: persist intent, observe, and never replay an unknown write."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import shutil
@@ -8,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode
 
+from gongcao.coordination import AdvisoryProcesses
 from gongcao.events import Redactor
 from gongcao.github import GitHub, Target, command
 from gongcao.workspace import repository as validate_repository
@@ -187,10 +189,23 @@ def cleanup_local(run: Run) -> None:
 
 async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None:
     try:
-        await _cleanup(run, task, github)
-    except Unconfirmed as exc:
-        run.value.update(status="needs_reconciliation", cleanup_failure=str(exc))
+        state = run.root / "state"
+        if state.is_symlink() or state.resolve() != state:
+            raise Unconfirmed("QA state path has been redirected")
+        state.mkdir(exist_ok=True, mode=0o700)
+        with (state / "coordination.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Unconfirmed("Coordination is still active; retain QA resources") from None
+            if AdvisoryProcesses.unresolved(state / "coordination-process.json") is not None:
+                raise Unconfirmed("Coordination cleanup is unconfirmed; retain QA resources")
+            await _cleanup(run, task, github)
+    except (Unconfirmed, OSError) as exc:
+        run.value.update(status="needs_reconciliation", cleaned=False, cleanup_failure=str(exc))
         run.event("cleanup-blocked", reason=str(exc))
+        if not isinstance(exc, Unconfirmed):
+            raise Unconfirmed("Cleanup access cannot be confirmed; retain QA resources") from exc
         raise
 
 

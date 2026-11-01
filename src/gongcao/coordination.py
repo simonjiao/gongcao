@@ -31,6 +31,18 @@ class AdvisoryProcesses:
         self.path = path
         self.data: dict[str, Any] = {}
 
+    @staticmethod
+    def unresolved(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (ValueError, OSError):
+            data = {"state": "unknown"}
+        if isinstance(data, dict) and data.get("state") == "stopped":
+            return None
+        return (data or {"state": "unknown"}) if isinstance(data, dict) else {"state": "unknown"}
+
     def save(self, **values: Any) -> None:
         self.data.update(values)
         temporary = self.path.with_suffix(".tmp")
@@ -229,18 +241,13 @@ class Coordinator:
             except BlockingIOError:
                 return {"source": "controller", "status": "busy"}
             reservation = self.store.root / "coordination-process.json"
-            if reservation.exists():
-                try:
-                    process = json.loads(reservation.read_text())
-                except ValueError:
-                    process = {"state": "unknown"}
-                if process.get("state") != "stopped":
-                    return {
-                        "source": "controller",
-                        "status": "needs_reconciliation",
-                        "process": process,
-                        "suggestion": "协调子进程清理不明，需人工核对；保留占用。",
-                    }
+            if process := AdvisoryProcesses.unresolved(reservation):
+                return {
+                    "source": "controller",
+                    "status": "needs_reconciliation",
+                    "process": process,
+                    "suggestion": "协调子进程清理不明，需人工核对；保留占用。",
+                }
             previous = current(self.store, task["id"])
             if previous:
                 return previous  # Failed/interrupted analyses also do not loop on the same facts.
