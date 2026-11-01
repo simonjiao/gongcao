@@ -27,6 +27,8 @@ class Workflow:
         self.remote = Controlled(store, config, github)
         self.lease: Lease | None = None
         self.watch_instructions = True
+        self.coordinate_advice = True
+        self.advice_pending = False
 
     async def sync(self, task_id: int) -> dict[str, Any]:
         task = self.store.task(task_id)
@@ -329,7 +331,13 @@ class Workflow:
         try:
             if self.watch_instructions:
                 async with Controls(self.store).listen(self.config, self.github, task_id):
-                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                    if self.store.task(task_id)["state"] in {
+                        State.WAITING_INSTRUCTION,
+                        State.RECONCILE,
+                        State.HUMAN,
+                        State.FAILED,
+                        State.WAITING_ENVIRONMENT,
+                    }:
                         await Controls(self.store).poll(task_id, self.config, self.github)
                     return await self.execute(task_id)
             return await self.execute(task_id)
@@ -346,7 +354,14 @@ class Workflow:
         entry = self.store.task(task_id)["control"]
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             return []
-        async with Lease(self.store, task_id) as lease:
+        recovering = bool(
+            self.store.db.execute(
+                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending' AND reason='' "
+                "AND json_extract(data,'$.recovery')=1",
+                (task_id,),
+            ).fetchone()
+        )
+        async with Lease(self.store, task_id, recovery=recovering) as lease:
             self.lease = lease
             if not lease.acquired:
                 return []
@@ -456,10 +471,11 @@ class Workflow:
             "SELECT data FROM instructions WHERE task_id=? AND id=?",
             (task_id, control.get("command_id")),
         ).fetchone()
-        if (
+        self.advice_pending = bool(
             receipt
             and json.loads(receipt[0])["mode"] == "step"
             and (control.get("command_id") != entry.get("command_id") or not entry.get("spent"))
-        ):
+        )
+        if self.advice_pending and self.coordinate_advice:
             await Coordinator(self.store, self.config, self.github).run(task_id)
         return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]

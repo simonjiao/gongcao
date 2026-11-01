@@ -29,6 +29,36 @@ class Scheduler:
         self.concurrency = concurrency
         self.config_path: Path | None = None
         self.next_check: dict[int, float] = {}
+        self.advisory: asyncio.Task[dict[str, Any]] | None = None
+        self.coordination_next = 0.0
+        self.coordination_failures = 0
+
+    def coordinate(self, task_id: int | None = None) -> None:
+        from .coordination import Coordinator
+
+        if self.advisory is not None:
+            if not self.advisory.done():
+                return
+            if not self.advisory.cancelled():
+                self.advisory.result()
+        if task_id is None and time.monotonic() < self.coordination_next:
+            return
+
+        async def analyze() -> dict[str, Any]:
+            try:
+                return await Coordinator(self.store, self.config, self.github).run(task_id)
+            except Exception as exc:
+                self.coordination_failures += 1
+                self.coordination_next = time.monotonic() + min(
+                    300, 5 * 2 ** min(6, self.coordination_failures)
+                )
+                message = Redactor().text(
+                    f"协调准备失败，业务任务继续：{type(exc).__name__}: {exc}"
+                )
+                LOG.warning(message)
+                return {"source": "controller", "status": "failed", "reason": message}
+
+        self.advisory = asyncio.create_task(analyze())
 
     def failed(self, task_id: int) -> None:
         task = self.store.task(task_id)
@@ -169,6 +199,7 @@ class Scheduler:
                 return
             workflow = Workflow(self.store, self.config, self.github)
             workflow.watch_instructions = False
+            workflow.coordinate_advice = False
             self.workflows.append(workflow)
             try:
                 await workflow.run(task_id)
@@ -188,6 +219,9 @@ class Scheduler:
             }:
                 with self.store.db:
                     self.store.db.execute("DELETE FROM retries WHERE task_id=?", (task_id,))
+
+        if workflow.advice_pending:
+            self.coordinate(task_id)
 
     async def serve(self, *, once: bool = False, poll: float = 5.0) -> None:
         async with Controls(self.store).listen(self.config, self.github):
@@ -231,7 +265,6 @@ class Scheduler:
 
     async def schedule(self, *, once: bool, poll: float) -> None:
         pending: dict[int, asyncio.Task[None]] = {}
-        advisory: asyncio.Task[dict[str, Any]] | None = None
         group = None
         try:
             while True:
@@ -245,19 +278,13 @@ class Scheduler:
                         pending[task["id"]] = asyncio.create_task(
                             self.advance(task["id"], immediate=once)
                         )
-                if self.config.coordination_enabled and (advisory is None or advisory.done()):
-                    from .coordination import Coordinator
-
-                    if advisory is not None:
-                        advisory.result()
-                    advisory = asyncio.create_task(
-                        Coordinator(self.store, self.config, self.github).run()
-                    )
+                if self.config.coordination_enabled:
+                    self.coordinate()
                 if once:
                     group = asyncio.gather(*pending.values())
                     await asyncio.shield(group)
-                    if advisory is not None:
-                        await advisory
+                    if self.advisory is not None:
+                        await asyncio.gather(self.advisory, return_exceptions=True)
                     self.github.report()
                     return
                 self.github.report()
@@ -268,9 +295,9 @@ class Scheduler:
                     self.store.last_activity = time.monotonic()
                 await asyncio.sleep(poll)
         except BaseException:
-            if advisory is not None:
-                advisory.cancel()
-                await asyncio.gather(advisory, return_exceptions=True)
+            if self.advisory is not None:
+                self.advisory.cancel()
+                await asyncio.gather(self.advisory, return_exceptions=True)
             for workflow in self.workflows:
                 if workflow.lease:
                     workflow.lease.lost = True

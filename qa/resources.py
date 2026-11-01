@@ -198,6 +198,28 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     """Caller owns Run.lock; archive first, then verify all ownership before any mutation."""
     run.value["cleaned"] = False
     run.save()
+    if (run.root / "state/gongcao.sqlite3").exists():
+        from gongcao.recovery import diagnose
+        from gongcao.store import Store
+
+        state = Store(run.root / "state")
+        try:
+            if state.db.execute(
+                "SELECT 1 FROM claims WHERE intent!='' OR confirmed='' "
+                "OR COALESCE(json_array_length(data,'$.progress'),0)>0"
+            ).fetchone():
+                raise Unconfirmed("Controller feedback needs reconciliation before cleanup")
+            for peer in state.tasks():
+                settled(
+                    peer
+                    | {
+                        "runs": state.runs(peer["id"]),
+                        "evidence": state.evidence(peer["id"]),
+                        "runtime": diagnose(state, peer["id"]),
+                    }
+                )
+        finally:
+            state.close()
     if task:
         settled(task)
         if not (run.root / "cleanup-task.json").exists():
@@ -404,6 +426,18 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
 
 async def reconcile(run: Run, github: GitHub) -> None:
     """An explicit read-only reconciliation never resends a pending write."""
+    if (run.root / "state/gongcao.sqlite3").exists():
+        from gongcao.config import Config
+        from gongcao.discovery import Discovery
+        from gongcao.store import Store
+
+        state = Store(run.root / "state")
+        try:
+            publisher = Discovery(state, Config(), github)
+            for task in state.tasks():
+                await publisher.reconcile_status(task["id"])
+        finally:
+            state.close()
     for key, record in list(run.value["actions"].items()):
         intent = record["intent"]
         if key == "create-issue":

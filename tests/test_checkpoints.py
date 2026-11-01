@@ -11,6 +11,7 @@ from _support.worker import install_worker
 from gongcao.control import Controls
 from gongcao.github import command
 from gongcao.model import Stage, State
+from gongcao.recovery import Recovery
 from gongcao.store import Store
 from gongcao.workflow import Workflow
 
@@ -118,7 +119,7 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
     )
 
 
-@pytest.mark.parametrize("resume", ["step", "retry"])
+@pytest.mark.parametrize("resume", ["step", "retry", "cli"])
 async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_at_review(
     store, task_id, blocked, caplog, resume
 ):
@@ -134,7 +135,12 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
     assert saved["sha"] in status()["body"] and "NOT_RUN" in status()["body"]
     assert "/gongcao retry" in status()["body"] and "original/r1" in status()["body"]
     assert store.task(task_id)["status_sync"]["dirty"] == 0
-    retry = post("/gongcao " + resume)
+    if resume == "cli":
+        assert (await Recovery(store, github).retry(task_id))["recovered"]
+        command_id = store.task(task_id)["control"]["command_id"]
+    else:
+        retry = post("/gongcao " + resume)
+        command_id = f"github:{retry['id']}"
     restarted = Store(store.root)
     try:
         await Workflow(restarted, config, github).run(task_id)
@@ -156,8 +162,10 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         assert parent == saved["sha"]
         assert task["pr_number"] == 9 and task["control"]["spent"]
         receipts = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
-        assert receipts[f"github:{step['id']}"]["status"] == "superseded"
-        assert receipts[f"github:{retry['id']}"]["status"] == "consumed"
+        assert receipts[f"github:{step['id']}"]["status"] == (
+            "blocked" if resume == "cli" else "superseded"
+        )
+        assert receipts[command_id]["status"] == "consumed"
         count = len(runs)
         await Workflow(restarted, config, github).run(task_id)
         assert len(restarted.runs(task_id)) == count
@@ -166,9 +174,10 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
 
 
 @pytest.mark.parametrize("bad", ["unauthorized", "edited", "stale", "changed", "remote", "process"])
-async def test_retry_rejects_unsafe_or_stale_permission(store, task_id, blocked, bad):
+@pytest.mark.parametrize("resume", ["step", "retry"])
+async def test_retry_rejects_unsafe_or_stale_permission(store, task_id, blocked, bad, resume):
     config, github, post, status, step = blocked
-    receipt = post("/gongcao retry", actor="stranger" if bad == "unauthorized" else "owner")
+    receipt = post("/gongcao " + resume, actor="stranger" if bad == "unauthorized" else "owner")
     if bad == "edited":
         receipt["updated_at"] = "2099-01-01T00:00:00Z"
     if bad == "stale":

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from _support.cli import GONGCAO, cli_env, events, run_cli
-from _support.github import RegisteredGitHub
+from _support.github import RegisteredGitHub, StatusGitHub
 from _support.tasks import analysis_ready, register_more, wait_for
 from _support.worker import SUCCESS, install_worker
 
@@ -58,7 +58,7 @@ async def test_parallel_developers_write_distinct_worktrees_and_leave_source_unc
 
     monkeypatch.setattr(Controlled, "publish", publish)
     config = Config(auth_file=auth_file)
-    scheduler = Scheduler(store, config, RegisteredGitHub(store), 2)
+    scheduler = Scheduler(store, config, StatusGitHub(store), 2)
     running = asyncio.create_task(scheduler.serve(once=True))
     try:
         await wait_for(lambda: len(at_publish) == 2)
@@ -76,7 +76,7 @@ async def test_scheduler_stops_after_three_failures_and_manual_retry_preserves_h
     store, task_id, auth_file, monkeypatch
 ):
     install_worker(monkeypatch, "import sys;sys.stdin.readline();raise SystemExit(7)")
-    github = RegisteredGitHub(store)
+    github = StatusGitHub(store)
     scheduler = Scheduler(store, Config(auth_file=auth_file), github)
     for _ in range(3):
         await scheduler.serve(once=True)
@@ -114,6 +114,43 @@ async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, rep
         assert not store.runs(task_id)
         assert store.artifact(task_id, "github-cooldown", "")["recovery"]
         assert store.task(task_id)["state"] == State.WAITING_DEPENDENCY
+
+
+@pytest.mark.parametrize("advisory", ["slow", "failed", "cancelled"])
+async def test_step_advice_does_not_hold_a_business_slot_or_cancel_other_tasks(
+    store, task_id, repo, sha, snapshot, monkeypatch, advisory
+):
+    second = register_more(store, repo, sha, snapshot, 1)[0]
+    entered, release = asyncio.Event(), asyncio.Event()
+    completed = []
+
+    async def execute(self, task_id):
+        async with Lease(store, task_id) as lease:
+            self.lease = lease
+            self.advice_pending = task_id != second
+            completed.append(task_id)
+
+    async def analyze(*args):
+        entered.set()
+        if advisory == "failed":
+            raise OSError("advisory directory unavailable")
+        await release.wait()
+        return {"status": "completed"}
+
+    monkeypatch.setattr(Workflow, "run", execute)
+    monkeypatch.setattr("gongcao.coordination.Coordinator.run", analyze)
+    scheduler = Scheduler(store, Config(), RegisteredGitHub(store), 1)
+    try:
+        await scheduler.advance(task_id)
+        await asyncio.wait_for(entered.wait(), 1)
+        if advisory == "cancelled":
+            scheduler.advisory.cancel()
+        await asyncio.wait_for(scheduler.advance(second), 1)
+        assert completed == [task_id, second] and not store.runs(second)
+        assert all(t["state"] == State.QUEUED for t in store.tasks())
+    finally:
+        release.set()
+        await asyncio.gather(scheduler.advisory, return_exceptions=True)
 
 
 def test_offline_serve_cli_enforces_1_to_3_slots_and_queues(offline_checkout, tmp_path):

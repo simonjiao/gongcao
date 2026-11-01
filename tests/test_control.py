@@ -9,7 +9,7 @@ import pytest
 
 from gongcao.config import Config
 from gongcao.control import Controls
-from gongcao.github import GitHub
+from gongcao.github import Deferred, GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
 from gongcao.processes import observer
@@ -90,17 +90,38 @@ async def test_unseen_comment_ids_use_current_facts_even_in_checkpoint_second(
     assert store.task(task_id)["state"] == State.QUEUED
 
 
-@pytest.mark.parametrize("entry", ["local", "github", "unavailable", "edited"])
+@pytest.mark.parametrize(
+    "entry", ["local", "github", "unavailable", "limited", "observe", "observe_edited", "edited"]
+)
 async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permission(
     store, task_id, copilot, fixture_github, comments, monkeypatch, entry
 ):
-    store.halt(task_id, State.HUMAN, "Prior execution blocked")
-    if entry == "unavailable":
+    store.halt(
+        task_id,
+        State.RECONCILE
+        if entry.startswith("observe")
+        else State.WAITING_ENVIRONMENT
+        if entry == "limited"
+        else State.HUMAN,
+        "Prior execution blocked",
+    )
+    if entry in {"unavailable", "limited"}:
 
         async def unavailable(self, task_id, owner):
-            raise OSError("Verification unavailable")
+            raise (
+                Deferred("limited") if entry == "limited" else OSError("Verification unavailable")
+            )
 
         monkeypatch.setattr(Recovery, "reconcile", unavailable)
+    if entry == "observe_edited":
+        original = Recovery.reconcile
+
+        async def edited_after_observation(self, task_id, owner):
+            result = await original(self, task_id, owner)
+            comments.comments[-1].update(body="/gongcao auto", updated_at="2099-01-01T00:00:00Z")
+            return result
+
+        monkeypatch.setattr(Recovery, "reconcile", edited_after_observation)
     if entry == "local":
         assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
     else:
@@ -113,8 +134,17 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
         assert (task["stage"], task["state"]) == (Stage.DEVELOPMENT, State.WAITING_INSTRUCTION)
         assert len(store.runs(task_id)) == 1
         assert task["control"]["step_result"]["status"] == "advanced"
+        assert task["control"]["explicit"]
+    elif entry == "observe":
+        assert not store.runs(task_id) and task["state"] == State.WAITING_INSTRUCTION
+        assert task["control"]["step_result"]["status"] == "checked"
+    elif entry == "observe_edited":
+        assert not store.runs(task_id) and task["state"] == State.WAITING_INSTRUCTION
+        assert task["control"]["spent"] and task["control"]["explicit"]
     else:
-        assert not store.runs(task_id) and task["state"] == State.HUMAN
+        assert not store.runs(task_id) and task["state"] == (
+            State.WAITING_ENVIRONMENT if entry == "limited" else State.HUMAN
+        )
 
     def unchanged():
         task = store.task(task_id)
@@ -127,6 +157,41 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
     before = unchanged()
     await Workflow(store, copilot, fixture_github).run(task_id)
     assert before == unchanged()
+    if entry == "limited":
+        store.sync(task_id, store.task(task_id)["snapshot"] | {"body": "new requirements"})
+        assert store.task(task_id)["control"]["explicit"]
+        assert not Controls(store).checkpoint(task_id)
+
+
+async def test_recovery_step_cannot_take_an_active_owners_os_lock(
+    store, task_id, copilot, fixture_github
+):
+    async with Lease(store, task_id) as owner:
+        store.halt(task_id, State.RECONCILE, "owner must settle")
+        with closing(Store(store.root)) as other:
+            assert Controls(other).issue(task_id, "step", policy=copilot.policy_hash)
+            await Workflow(other, copilot, fixture_github).run(task_id)
+        assert (
+            store.db.execute("SELECT owner FROM leases WHERE task_id=?", (task_id,)).fetchone()[0]
+            == owner.owner
+        )
+        assert not store.runs(task_id)
+
+
+async def test_failed_step_feedback_commits_before_releasing_its_lease(
+    store, task_id, copilot, fixture_github, monkeypatch
+):
+    async def unavailable(self, task_id, owner):
+        raise OSError("verification unavailable")
+
+    monkeypatch.setattr(Recovery, "reconcile", unavailable)
+    store.halt(task_id, State.HUMAN, "blocked")
+    assert Controls(store).issue(task_id, "step", policy=copilot.policy_hash)
+    async with Lease(store, task_id):
+        await Controls(store).poll(task_id, copilot, fixture_github)
+        assert not store.db.in_transaction
+        with closing(Store(store.root)) as reader:
+            assert reader.task(task_id)["control"]["step_result"]["status"] == "blocked"
 
 
 async def test_completed_comment_permissions_cannot_reactivate_work(

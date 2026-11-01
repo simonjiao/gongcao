@@ -3,11 +3,12 @@
 import hashlib
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from .control import Controls, InstructionChanged
+from .control import Controls, InstructionChanged, bind
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
 from .leases import Lease, identity, session_alive
@@ -340,6 +341,36 @@ class Recovery:
         """Caller holds the same lease throughout reconciliation and authorization."""
         task = self.store.task(task_id)
         with Controls(self.store).transaction():
+            controls = Controls(self.store)
+            control = task["control"]
+            if control.get("mode") == "step" and control.get("spent"):
+                command_id = "local:" + uuid.uuid4().hex
+                data = bind(
+                    task,
+                    {
+                        "mode": "retry",
+                        "target": None,
+                        "actor": "local",
+                        "created": time.time(),
+                        "policy": control.get("policy"),
+                        "feedback": "",
+                    },
+                )
+                controls.record(task_id, command_id, data, "accepted")
+                controls.save(
+                    task_id,
+                    control
+                    | {
+                        "command_id": command_id,
+                        "explicit": True,
+                        "spent": False,
+                        "pause_requested": False,
+                        "pause_reason": "",
+                        "step_result": None,
+                        "since": data["created"],
+                        "baseline": data["baseline"],
+                    },
+                )
             if refreshed_sha != task["target_sha"]:
                 self.store.refresh_base(task_id, refreshed_sha)
             self.store.db.execute(

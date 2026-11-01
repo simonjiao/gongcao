@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -13,11 +14,50 @@ from .config import Config
 from .control import Controls, baseline
 from .events import Journal, Redactor
 from .github import GitHub
+from .leases import identity
 from .model import CoordinationReport, Role, State
 from .processes import observer
 from .runner import Runner
 from .sandbox import Sandbox
 from .store import Store
+
+
+class AdvisoryProcesses:
+    """One durable reservation for the existing subprocess observer protocol."""
+
+    lost = False
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict[str, Any] = {}
+
+    def save(self, **values: Any) -> None:
+        self.data.update(values)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.data))
+        temporary.replace(self.path)
+
+    def intent(self, label: str) -> str:
+        self.save(
+            label=label,
+            pid=None,
+            owner_pid=os.getpid(),
+            owner_identity=identity(os.getpid()),
+            state="pending",
+        )
+        return label
+
+    def attached(self, key: str, pid: int) -> None:
+        self.save(pid=pid, identity=identity(pid), state="running")
+
+    def aborted(self, key: str) -> None:
+        self.save(state="stopped")
+
+    def stopped(self, pid: int) -> None:
+        self.save(state="stopped")
+
+    def uncertain(self, pid: int) -> None:
+        self.save(state="uncertain")
 
 
 def facts(store: Store, task_id: int) -> dict[str, Any]:
@@ -43,6 +83,8 @@ def facts(store: Store, task_id: int) -> dict[str, Any]:
                 "id": r["id"],
                 "role": r["role"],
                 "state": r["state"],
+                "target_sha": r["target_sha"],
+                "evidence_valid": bool(r["evidence_valid"]),
                 "source": r["details"].get("source", {}).get("sha"),
                 "summary": (json.loads(r["result"] or "{}").get("summary") or r["error"] or "")[
                     :1200
@@ -56,10 +98,24 @@ def facts(store: Store, task_id: int) -> dict[str, Any]:
             (task_id,),
         ).fetchone()[0],
         "evidence": [
-            {"kind": a["kind"], "sha": a["sha"], "id": a["id"]}
+            {
+                "kind": a["kind"],
+                "sha": a["sha"],
+                "id": a["id"],
+                "checks": [
+                    {
+                        "category": item.get("category"),
+                        "status": item.get("status"),
+                        "reason": item.get("reason", "")[:200],
+                    }
+                    for item in a["data"].get("items", [])[:6]
+                ],
+            }
             for a in store.evidence(task_id)["artifacts"]
-            if a["valid"] and a["kind"] in {"quality-results", "validation"}
-        ],
+            if a["valid"]
+            and a["sha"] == task["target_sha"]
+            and a["kind"] in {"quality-results", "validation"}
+        ][-4:],
     }
 
 
@@ -92,17 +148,39 @@ def complex_block(store: Store, task_id: int) -> bool:
         return False
     if store.db.execute("SELECT 1 FROM leases WHERE task_id=?", (task_id,)).fetchone():
         return False
+    if store.db.execute(
+        "SELECT 1 FROM processes WHERE task_id=? AND state!='stopped' "
+        "UNION SELECT 1 FROM operations WHERE task_id=? AND state!='succeeded'",
+        (task_id, task_id),
+    ).fetchone():
+        return False
     dependencies = store.dependencies(task_id)
     conflict = any(word in task["reason"].casefold() for word in ("conflict", "冲突"))
     if conflict and (len(dependencies) > 1 or len(task["control"].get("feedback", [])) > 1):
         return True
     runs = store.runs(task_id)[-3:]
+    simple = any(
+        word in (task["reason"] + " ".join(r["error"] or "" for r in runs)).casefold()
+        for word in (
+            "missing package",
+            "missing acceptance",
+            "authentication missing",
+            "cleanup",
+            "unconfirmed",
+            "缺少制品",
+            "缺少材料",
+        )
+    )
     return (
-        len(runs) == 3
+        not simple
+        and len(runs) == 3
         and len({r["details"].get("source", {}).get("sha") for r in runs}) == 1
         and all(
             r["target_sha"] == task["target_sha"]
-            and json.loads(r["result"] or "{}").get("conclusion") in {"blocked", "failed"}
+            and (
+                r["state"] == State.FAILED
+                or json.loads(r["result"] or "{}").get("conclusion") in {"blocked", "failed"}
+            )
             for r in runs
         )
     )
@@ -121,8 +199,27 @@ class Coordinator:
                 "status": "no_complex_block",
                 "tasks": [t["id"] for t in selected],
                 "suggestion": "补齐所列材料或等待依赖/检查，随后发新的 /gongcao step。",
+                "report": {
+                    "facts": [
+                        f"任务 {t['id']}：{t['stage']}/{t['state']}，SHA {t['target_sha']}"
+                        for t in selected[:8]
+                    ],
+                    "blockers": [t["reason"][:1000] for t in selected[:8]],
+                    "suggestions": [
+                        {
+                            "action": "人工核对合并/关闭结果"
+                            if t["stage"] in {"mergeable", "merged"}
+                            or t["snapshot"].get("state") != "open"
+                            else "按所列原因补齐条件后发新 Step",
+                            "owner": "任务所有者",
+                            "inputs": [t["reason"][:1000]],
+                        }
+                        for t in selected[:8]
+                    ],
+                },
             }
-        task = candidates[0]  # At most one advisory session per invocation/event.
+        uncached = [t for t in candidates if current(self.store, t["id"]) is None]
+        task = (uncached or candidates)[0]  # One session; changed sibling tasks do not starve.
         raw = facts(self.store, task["id"])
         data = Redactor().clean(raw)
         key = fingerprint(raw)
@@ -131,6 +228,19 @@ class Coordinator:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"source": "controller", "status": "busy"}
+            reservation = self.store.root / "coordination-process.json"
+            if reservation.exists():
+                try:
+                    process = json.loads(reservation.read_text())
+                except ValueError:
+                    process = {"state": "unknown"}
+                if process.get("state") != "stopped":
+                    return {
+                        "source": "controller",
+                        "status": "needs_reconciliation",
+                        "process": process,
+                        "suggestion": "协调子进程清理不明，需人工核对；保留占用。",
+                    }
             previous = current(self.store, task["id"])
             if previous:
                 return previous  # Failed/interrupted analyses also do not loop on the same facts.
@@ -164,10 +274,12 @@ class Coordinator:
                         self.store.progress(task["id"])
 
             save()
+            if result["status"] == "stale":
+                return result
             journal = Journal(
                 self.store, run_dir.name, self.config.max_log_bytes, Redactor(), local=True
             )
-            token = observer.set(None)  # Never attach advice subprocesses to another task's lease.
+            token = observer.set(AdvisoryProcesses(reservation))
             started = time.monotonic()
             try:
                 sandbox = Sandbox(workspace, run_dir, Role.REVIEWER)

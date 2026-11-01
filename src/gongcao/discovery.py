@@ -169,6 +169,8 @@ class Discovery:
             try:
                 if row["task_id"] is None:
                     await self.claim(row)
+                elif not row["confirmed"]:
+                    await self.publish(row)
                 else:
                     if facts_due:
                         await self.lifecycle(row["task_id"])
@@ -489,7 +491,7 @@ class Discovery:
         manual = data.get("kind") == "manual"
         if manual and "actor" not in data:
             data["actor"] = (await self.github.read("user"))["login"].lower()
-            self.save(row["url"], data=json.dumps(data))
+            self.store.claim_data(row["url"], lambda current: current.update(actor=data["actor"]))
             row["data"] = json.dumps(data)
         comments = await self.github.instructions({"url": row["url"]})
         item = await self.owned(row, comments)
@@ -511,7 +513,9 @@ class Discovery:
                 + f" SHA: `{data['base_sha']}`"
             )
             data["attempted"] = True
-            self.save(row["url"], data=json.dumps(data), intent=body)
+            with Controls(self.store).transaction():
+                self.store.claim_data(row["url"], lambda current: current.update(attempted=True))
+                self.store.db.execute("UPDATE claims SET intent=? WHERE url=?", (body, row["url"]))
             try:
                 response = await self.github.mutate(
                     f"repos/{target.repository}/issues/{target.number}/comments", {"body": body}
@@ -520,7 +524,11 @@ class Discovery:
                 row["comment_id"] = response["id"]
             except Deferred:
                 data["attempted"] = False
-                self.save(row["url"], data=json.dumps(data), intent="")
+                with Controls(self.store).transaction():
+                    self.store.claim_data(
+                        row["url"], lambda current: current.update(attempted=False)
+                    )
+                    self.store.db.execute("UPDATE claims SET intent='' WHERE url=?", (row["url"],))
                 raise
             except Exception:
                 item = await self.owned(row)
@@ -614,10 +622,13 @@ class Discovery:
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
         if step := control.get("step_result"):
-            body += "\n本次 Step：" + (
-                "已推进一个阶段"
-                if step["status"] == "advanced"
-                else "本次仍受阻，需新 Step 才会再尝试"
+            body += (
+                "\n本次 Step："
+                + {
+                    "advanced": "已推进一个阶段",
+                    "checked": "只读核对完成，未推进阶段",
+                    "blocked": "本次仍受阻，需新 Step 才会再尝试",
+                }[step["status"]]
             )
             body += "; " + step["reason"][:1000]
         from .coordination import current

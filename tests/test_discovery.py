@@ -19,13 +19,23 @@ from gongcao.store import Store
 
 @pytest.mark.parametrize("kind", ["issues", "pull"])
 async def test_manual_status_anchor_and_progress_are_append_only_without_discovery(
-    intake, store, repo, sha, snapshot, kind
+    intake, store, repo, sha, snapshot, kind, monkeypatch
 ):
     item = snapshot | {"kind": kind, "url": snapshot["url"].replace("/issues/", f"/{kind}/")}
     task_id = store.register(item["url"], repo, sha, item)
     publisher = Discovery(store, Config(), intake.github)
     publisher.manual(task_id)
+    read = intake.github.read
+
+    async def with_concurrent_progress(path):
+        if path == "user":
+            with closing(Store(store.root)) as writer:
+                writer.halt(task_id, State.HUMAN, "并发到达的变化")
+        return await read(path)
+
+    monkeypatch.setattr(intake.github, "read", with_concurrent_progress)
     await publisher.refresh(task_id)
+    assert any("并发到达的变化" in c["body"] for c in intake.github.comments)
     row = publisher.records()[0]
     assert json.loads(row["data"])["kind"] == "manual" and row["confirmed"]
     original = deepcopy(intake.github.comments)

@@ -9,10 +9,10 @@ from _support.worker import install_worker
 
 from gongcao.coordination import Coordinator, current
 from gongcao.model import Role, Stage, State
+from gongcao.processes import CleanupError, observer, stop
 
 
-@pytest.fixture
-def complex_task(store, task_id, sha):
+def seed_complex(store, task_id, sha, failed=False):
     store.transition(store.task(task_id), Stage.DEVELOPMENT, State.QUEUED, "analysis confirmed")
     for _ in range(3):
         store.halt(task_id, State.QUEUED, "retry")
@@ -20,11 +20,13 @@ def complex_task(store, task_id, sha):
         store.run_details(run, source={"sha": sha})
         store.finish(
             run,
-            State.COMPLETED,
+            State.FAILED if failed else State.COMPLETED,
             Stage.DEVELOPMENT,
             State.HUMAN,
             "No progress",
-            json.dumps(
+            None
+            if failed
+            else json.dumps(
                 {
                     "conclusion": "blocked",
                     "summary": "Repeated acceptance conflict",
@@ -35,6 +37,11 @@ def complex_task(store, task_id, sha):
             ),
         )
     return task_id
+
+
+@pytest.fixture
+def complex_task(store, task_id, sha, request):
+    return seed_complex(store, task_id, sha, getattr(request, "param", False))
 
 
 ADVICE = """
@@ -55,8 +62,9 @@ print(json.dumps({'kind':'result','data':{
 """
 
 
+@pytest.mark.parametrize("complex_task", [False, True], indirect=True)
 async def test_coordination_isolated_advice_is_deduplicated_and_expires(
-    store, task_id, complex_task, fixture_github, policy, monkeypatch
+    store, task_id, complex_task, fixture_github, policy, monkeypatch, repo, sha, snapshot
 ):
     install_worker(
         monkeypatch, ADVICE.replace("HOST_STATE", repr(str(store.root / "gongcao.sqlite3")))
@@ -69,9 +77,32 @@ async def test_coordination_isolated_advice_is_deduplicated_and_expires(
     assert before == (store.task(task_id), store.runs(task_id), fixture_github.writes)
     assert await coordinator.run(task_id) == result
     assert current(store, task_id) == result
+    other = snapshot | {"number": 2, "url": snapshot["url"][:-1] + "2"}
+    sibling = store.register(other["url"], repo, sha, other)
+    seed_complex(store, sibling, sha)
+    assert (await coordinator.run())["binding"]["task"] == sibling
     store.sync(task_id, store.task(task_id)["snapshot"] | {"body": "Changed requirements"})
     assert current(store, task_id) is None
     assert (await coordinator.run(task_id))["fingerprint"] != result["fingerprint"]
+
+
+async def test_uncertain_advisory_cleanup_keeps_its_reservation_across_fact_changes(
+    store, task_id, complex_task, fixture_github, policy, monkeypatch
+):
+    install_worker(
+        monkeypatch, ADVICE.replace("HOST_STATE", repr(str(store.root / "gongcao.sqlite3")))
+    )
+
+    async def uncertain(process, readers):
+        await stop(process, readers)
+        observer.get().uncertain(process.pid)
+        raise CleanupError("uncertain descendants")
+
+    monkeypatch.setattr("gongcao.runner.stop", uncertain)
+    coordinator = Coordinator(store, policy, fixture_github)
+    assert (await coordinator.run(task_id))["status"] == "failed"
+    store.sync(task_id, store.task(task_id)["snapshot"] | {"body": "changed request"})
+    assert (await coordinator.run(task_id))["status"] == "needs_reconciliation"
 
 
 @pytest.mark.parametrize("failure", ["invalid", "timeout", "cancel"])
@@ -98,10 +129,13 @@ async def test_advisory_failure_or_cancellation_does_not_change_business_state(
         assert (await pending)["status"] == "failed"
     assert before == (store.task(task_id), store.runs(task_id))
     assert current(store, task_id)["status"] in {"failed", "cancelled"}
-    assert (await Coordinator(store, policy, fixture_github).run(task_id))["status"] in {
-        "failed",
-        "cancelled",
-    }
+    reservation = json.loads((store.root / "coordination-process.json").read_text())
+    expected = (
+        current(store, task_id)["status"]
+        if reservation["state"] == "stopped"
+        else "needs_reconciliation"
+    )
+    assert (await Coordinator(store, policy, fixture_github).run(task_id))["status"] == expected
 
 
 async def test_simple_blocks_do_not_launch_advisory_models(

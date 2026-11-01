@@ -72,7 +72,8 @@ def rejection(
         target not in TARGETS if mode == "until" else target is not None
     ):
         return "Invalid instruction or target"
-    recovering = mode == "retry" or (mode == "step" and data.get("recovery"))
+    observing = mode == "step" and data.get("observe_only")
+    recovering = mode == "retry" or (mode == "step" and data.get("recovery") and not observing)
     if mode == "step" and (task["cancel_requested"] or task["snapshot"].get("state") != "open"):
         return "Closed or cancelled tasks cannot advance; confirm the object lifecycle first"
     if recovering:
@@ -88,7 +89,12 @@ def rejection(
     if (
         task["stage"] == Stage.MERGED
         or task["state"] == State.COMPLETED
-        or (task["state"] in UNSAFE and not recovering and (mode != "pause" or data["feedback"]))
+        or (
+            task["state"] in UNSAFE
+            and not recovering
+            and not observing
+            and (mode != "pause" or data["feedback"])
+        )
     ):
         return "Task requires manual recovery or is terminal"
     if received and (
@@ -226,7 +232,8 @@ class Controls:
                     "created": created,
                     "policy": policy,
                     "feedback": feedback,
-                    "recovery": mode == "step" and task["state"] in RECOVERABLE,
+                    "recovery": mode == "step" and task["state"] in RECOVERABLE | {State.RECONCILE},
+                    "observe_only": mode == "step" and task["state"] == State.RECONCILE,
                     "fingerprint": (received or {}).get("fingerprint")
                     or hashlib.sha256(json.dumps([mode, target, feedback]).encode()).hexdigest(),
                 },
@@ -235,7 +242,7 @@ class Controls:
             occupied = self.db.execute(
                 "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
             ).fetchone()
-            if not reason and not safe and mode != "pause" and occupied:
+            if not reason and not safe and mode != "pause" and occupied and not data["recovery"]:
                 reason = "Task is occupied; pause first and wait for a safe checkpoint"
             if not reason and mode != "pause" and policy:
                 self.check_policy(task_id, policy)
@@ -725,7 +732,12 @@ class Controls:
                         "fingerprint": fingerprint,
                         "mode": words[0] if words else "",
                         "recovery": bool(
-                            words and words[0] == "step" and task["state"] in RECOVERABLE
+                            words
+                            and words[0] == "step"
+                            and task["state"] in RECOVERABLE | {State.RECONCILE}
+                        ),
+                        "observe_only": bool(
+                            words and words[0] == "step" and task["state"] == State.RECONCILE
                         ),
                         "target": words[1] if len(words) == 2 else None,
                         "feedback": Redactor().text(feedback.strip())
@@ -810,20 +822,48 @@ class Controls:
             from .remote import Controlled, UncertainWrite
 
             recovery = Recovery(self.store, github)
+            if data.get("recovery"):
+                with self.transaction():
+                    current = self.store.task(task_id)
+                    self.save(
+                        task_id,
+                        current["control"]
+                        | {
+                            "mode": "step",
+                            "explicit": True,
+                            "policy": config.policy_hash,
+                            "spent": True,
+                            "pause_requested": True,
+                            "step_result": bind(
+                                current, {"status": "blocked", "reason": "恢复核验尚未完成"}
+                            ),
+                        },
+                    )
             try:
-                await recovery.sync(task)
+                if not data.get("observe_only"):
+                    await recovery.sync(task)
                 runs = self.store.runs(task_id)
-                if runs and runs[-1]["details"].get("source", {}).get("baseline") != baseline(task):
+                if (
+                    not data.get("observe_only")
+                    and runs
+                    and runs[-1]["details"].get("source", {}).get("baseline") != baseline(task)
+                ):
                     raise ValueError(
                         "Previous execution belongs to unverified/changed requirements"
                     )
-                if baseline(self.store.task(task_id)) != data["baseline"]:
+                if (
+                    not data.get("observe_only")
+                    and baseline(self.store.task(task_id)) != data["baseline"]
+                ):
                     raise ValueError(
                         "Requirements/SHA changed; renew authorization after reconciliation"
                     )
                 await recovery.reconcile(task_id, owner)
                 remote = Controlled(self.store, config, github)
-                if task["stage"] in {Stage.DEVELOPMENT, Stage.REVISION}:
+                if not data.get("observe_only") and task["stage"] in {
+                    Stage.DEVELOPMENT,
+                    Stage.REVISION,
+                }:
                     runs = self.store.runs(task_id)
                     if runs and runs[-1]["role"] == "developer":
                         await remote.checkpoint(self.store.task(task_id), runs[-1])
@@ -853,6 +893,29 @@ class Controls:
                         self.mark(task_id, row["id"], "rejected", reason)
                         return
                     old = current["control"]
+                    if data.get("observe_only"):
+                        message = "只读核验完成，未推进阶段；发新的 /gongcao step 继续"
+                        self.mark(task_id, row["id"], "observed", message)
+                        self.save(
+                            task_id,
+                            old
+                            | {
+                                "mode": "step",
+                                "explicit": True,
+                                "command_id": row["id"],
+                                "spent": True,
+                                "pause_requested": True,
+                                "step_result": bind(
+                                    current, {"status": "checked", "reason": message}
+                                ),
+                            },
+                        )
+                        self.db.execute(
+                            "UPDATE tasks SET state=?,reason=? WHERE id=?",
+                            (State.WAITING_INSTRUCTION, message, task_id),
+                        )
+                        self.store.progress(task_id)
+                        return
                     self.db.execute(
                         "UPDATE instructions SET status='superseded',reason=? WHERE task_id=? "
                         "AND status='pending' AND id LIKE 'github:%' "
@@ -891,6 +954,9 @@ class Controls:
                             "since": data["created"],
                             "policy": config.policy_hash,
                             "step_result": None,
+                            "explicit": True
+                            if data.get("recovery")
+                            else old.get("explicit", False),
                         },
                     )
                     recovery.reset_retry(task_id, task["target_sha"])
@@ -911,7 +977,10 @@ class Controls:
                 with self.transaction():
                     self.mark(task_id, row["id"], "rejected", Redactor().text(str(exc)))
                 self.store.halt(task_id, State.RECONCILE, Redactor().text(str(exc)))
-            except Deferred:
+            except Deferred as exc:
+                if data.get("recovery"):
+                    with self.transaction():
+                        self.mark(task_id, row["id"], "blocked", "恢复核验限流：" + str(exc))
                 raise
             except (OSError, RuntimeError) as exc:
                 failures = (
@@ -931,26 +1000,50 @@ class Controls:
                 self.store.halt(task_id, State.HUMAN, message)
             finally:
                 if data.get("recovery"):
-                    receipt = self.db.execute(
-                        "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
-                        (task_id, row["id"]),
-                    ).fetchone()
-                    if receipt["status"] in {"rejected", "blocked"}:
+                    with self.transaction():
+                        receipt = self.db.execute(
+                            "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
+                            (task_id, row["id"]),
+                        ).fetchone()
+                        if receipt["status"] == "pending":
+                            self.mark(
+                                task_id,
+                                row["id"],
+                                "blocked",
+                                receipt["reason"] or "核验未完成，请发新 Step",
+                            )
+                            receipt = self.db.execute(
+                                "SELECT status,reason FROM instructions WHERE task_id=? AND id=?",
+                                (task_id, row["id"]),
+                            ).fetchone()
                         current = self.store.task(task_id)
-                        self.save(
-                            task_id,
-                            current["control"]
-                            | {
-                                "mode": "step",
-                                "command_id": row["id"],
-                                "spent": True,
-                                "pause_requested": True,
-                                "step_result": bind(
-                                    current, {"status": "blocked", "reason": receipt["reason"]}
-                                ),
-                            },
-                        )
-                        self.store.progress(task_id)
+                        if (
+                            receipt["status"] in {"rejected", "blocked", "stale"}
+                            and self.owns_checkpoint(task_id)
+                            and current["control"].get("command_id")
+                            in {row["id"], task["control"].get("command_id")}
+                        ):
+                            self.save(
+                                task_id,
+                                current["control"]
+                                | {
+                                    "mode": "step",
+                                    "explicit": True,
+                                    "policy": config.policy_hash,
+                                    "command_id": row["id"],
+                                    "spent": True,
+                                    "pause_requested": True,
+                                    "step_result": bind(
+                                        current, {"status": "blocked", "reason": receipt["reason"]}
+                                    ),
+                                },
+                            )
+                            if data.get("observe_only") and current["state"] == State.QUEUED:
+                                self.db.execute(
+                                    "UPDATE tasks SET state=?,reason=? WHERE id=?",
+                                    (State.WAITING_INSTRUCTION, receipt["reason"], task_id),
+                                )
+                            self.store.progress(task_id)
             return
 
     async def poll(

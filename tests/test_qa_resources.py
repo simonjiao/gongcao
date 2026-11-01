@@ -4,9 +4,28 @@ import json
 import pytest
 from _support.qa import base_response, new_run
 
+from gongcao.config import Config
+from gongcao.discovery import Discovery
 from gongcao.github import GitHub, command
+from gongcao.store import Store
 from qa.ledger import Run
 from qa.resources import Unconfirmed, action, cleanup, create_issue
+
+
+async def test_manual_feedback_intents_prevent_qa_cleanup(tmp_path, repo, sha, snapshot):
+    run = new_run(tmp_path, "delivery")
+    state = Store(run.root / "state")
+    try:
+        task_id = state.register(snapshot["url"], repo, sha, snapshot)
+        Discovery(state, Config(), GitHub()).manual(task_id)
+        state.db.execute("UPDATE claims SET intent='unconfirmed comment'")
+        state.db.commit()
+        with pytest.raises(Unconfirmed, match="feedback needs reconciliation"):
+            await cleanup(run, None, GitHub())
+        assert state.db.execute("SELECT intent FROM claims").fetchone()[0] == "unconfirmed comment"
+        assert not run.value["cleaned"] and (run.root / "state/gongcao.sqlite3").exists()
+    finally:
+        state.close()
 
 
 async def test_unknown_write_is_not_replayed_even_after_restart(tmp_path, monkeypatch):
