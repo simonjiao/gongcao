@@ -77,6 +77,18 @@ async def test_coordination_isolated_advice_is_deduplicated_and_expires(
     assert before == (store.task(task_id), store.runs(task_id), fixture_github.writes)
     assert await coordinator.run(task_id) == result
     assert current(store, task_id) == result
+    row = store.db.execute(
+        "SELECT id,data FROM artifacts WHERE task_id=? AND kind='coordination' AND valid=1",
+        (task_id,),
+    ).fetchone()
+    with store.db:
+        store.db.execute(
+            "UPDATE artifacts SET data=? WHERE id=?",
+            (json.dumps(result | {"status": "running"}), row["id"]),
+        )
+    assert current(store, task_id) is None  # Legacy pre-spawn result is not reusable.
+    with store.db:
+        store.db.execute("UPDATE artifacts SET data=? WHERE id=?", (row["data"], row["id"]))
     other = snapshot | {"number": 2, "url": snapshot["url"][:-1] + "2"}
     sibling = store.register(other["url"], repo, sha, other)
     seed_complex(store, sibling, sha)
