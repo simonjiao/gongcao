@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import closing
 from contextvars import Context
 from dataclasses import replace
@@ -9,6 +10,7 @@ import pytest
 
 from gongcao.config import Config
 from gongcao.control import Controls
+from gongcao.discovery import Discovery
 from gongcao.github import Deferred, GitHub
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
@@ -118,6 +120,21 @@ async def test_unseen_comment_ids_use_current_facts_even_in_checkpoint_second(
 async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permission(
     store, task_id, copilot, fixture_github, comments, monkeypatch, entry
 ):
+    publisher = Discovery(store, copilot, fixture_github)
+    publisher.manual(task_id)
+    original_sync = Recovery.sync
+
+    async def check_inflight(self, task):
+        result = await original_sync(self, task)
+        receipt = store.evidence(task_id)["instructions"][-1]
+        if receipt["status"] == "accepted" and store.task(task_id)["control"]["spent"]:
+            assert Controls(store).step_result(task_id) is None
+            event = json.loads(publisher.records()[0]["data"])["progress"][-1]
+            assert event["step"] is None  # Sync freezes facts while recovery is still in flight.
+            assert "本次仍受阻" not in publisher.render(publisher.records()[0], event)
+        return result
+
+    monkeypatch.setattr(Recovery, "sync", check_inflight)
     store.halt(
         task_id,
         State.RECONCILE
@@ -200,6 +217,15 @@ async def test_blocked_step_uses_existing_recovery_and_never_retries_its_permiss
         store.sync(task_id, store.task(task_id)["snapshot"] | {"body": "new requirements"})
         assert store.task(task_id)["control"]["explicit"]
         assert not Controls(store).checkpoint(task_id)
+    steps = [
+        event["step"]["status"]
+        for event in json.loads(publisher.records()[0]["data"])["progress"]
+        if event["step"]
+    ]
+    if entry in {"local", "github", "environment"}:
+        assert steps == ["advanced"]
+    elif entry in {"unavailable", "limited"}:
+        assert steps and set(steps) == {"blocked"}
 
 
 async def test_recovery_step_cannot_take_an_active_owners_os_lock(

@@ -72,11 +72,28 @@ class AdvisoryProcesses:
         self.save(state="uncertain")
 
 
+def request_facts(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": task["snapshot"].get("title", "")[:300],
+        "body": task["snapshot"].get("body", "")[:2000],
+        "feedback": [
+            {key: item[key][:1000] for key in ("source", "actor", "feedback")}
+            for item in task["control"].get("feedback", [])
+            if item["sha"] == task["target_sha"]
+        ][-6:],
+    }
+
+
 def facts(store: Store, task_id: int) -> dict[str, Any]:
     task = store.task(task_id)
     runs = store.runs(task_id)[-3:]
     dependencies = [
-        d | {"sha": store.task(d["id"])["target_sha"], "request": baseline(store.task(d["id"]))}
+        d
+        | {
+            "sha": (dependency := store.task(d["id"]))["target_sha"],
+            "request": baseline(dependency),
+            "requirements": request_facts(dependency),
+        }
         for d in store.dependencies(task_id)
     ]
     return {
@@ -85,6 +102,7 @@ def facts(store: Store, task_id: int) -> dict[str, Any]:
         "state": task["state"],
         "sha": task["target_sha"],
         "request": baseline(task),
+        "requirements": request_facts(task),
         "policy": task["control"].get("policy"),
         "reason": task["reason"][:2000],
         "dependencies": [d | {"reason": d["reason"][:500]} for d in dependencies[:24]],
@@ -98,9 +116,10 @@ def facts(store: Store, task_id: int) -> dict[str, Any]:
                 "target_sha": r["target_sha"],
                 "evidence_valid": bool(r["evidence_valid"]),
                 "source": r["details"].get("source", {}).get("sha"),
-                "summary": (json.loads(r["result"] or "{}").get("summary") or r["error"] or "")[
-                    :1200
-                ],
+                "conclusion": (report := json.loads(r["result"] or "{}")).get("conclusion"),
+                "summary": (report.get("summary") or r["error"] or "")[:1200],
+                "basis": [s[:500] for s in report.get("basis", [])[:6]],
+                "next_steps": [s[:500] for s in report.get("next_steps", [])[:6]],
             }
             for r in runs
         ],
@@ -143,12 +162,27 @@ def current(store: Store, task_id: int) -> dict[str, Any] | None:
     ).fetchone()
     result: dict[str, Any] | None = json.loads(row[0]) if row else None
     if result and result["fingerprint"] == fingerprint(facts(store, task_id)):
-        return result  # Only settled advice at current facts is reusable.
+        return result  # Settled result for display; retry eligibility is checked separately.
     return None
 
 
-def complex_block(store: Store, task_id: int) -> bool:
-    task = store.task(task_id)
+def simple_block(reason: str) -> bool:
+    return any(
+        word in reason.casefold()
+        for word in (
+            "missing package",
+            "missing acceptance",
+            "authentication missing",
+            "cleanup",
+            "unconfirmed",
+            "缺少制品",
+            "缺少材料",
+        )
+    )
+
+
+def analyzable(store: Store, task: dict[str, Any]) -> bool:
+    task_id = task["id"]
     if task["state"] not in {
         State.HUMAN,
         State.FAILED,
@@ -166,31 +200,36 @@ def complex_block(store: Store, task_id: int) -> bool:
         (task_id, task_id),
     ).fetchone():
         return False
+    return not simple_block(
+        task["reason"] + " ".join(r["error"] or "" for r in store.runs(task_id)[-3:])
+    )
+
+
+def complex_block(store: Store, task_id: int) -> bool:
+    task = store.task(task_id)
+    if not analyzable(store, task):
+        return False
+    runs = store.runs(task_id)[-3:]
     dependencies = store.dependencies(task_id)
+    blocked_dependencies = [
+        d
+        for d in dependencies
+        if d["state"] in {State.HUMAN, State.FAILED} and analyzable(store, store.task(d["id"]))
+    ]
+    if len(blocked_dependencies) > 1:
+        return True  # Multiple unresolved decisions, rather than ordinary dependency waits.
     conflict = any(word in task["reason"].casefold() for word in ("conflict", "冲突"))
-    if conflict and (len(dependencies) > 1 or len(task["control"].get("feedback", [])) > 1):
+    feedback = request_facts(task)["feedback"]
+    if conflict and len({item["feedback"] for item in feedback}) > 1:
         return True
     if task["state"] == State.WAITING_DEPENDENCY:
         return False
-    runs = store.runs(task_id)[-3:]
-    simple = any(
-        word in (task["reason"] + " ".join(r["error"] or "" for r in runs)).casefold()
-        for word in (
-            "missing package",
-            "missing acceptance",
-            "authentication missing",
-            "cleanup",
-            "unconfirmed",
-            "缺少制品",
-            "缺少材料",
-        )
-    )
     return (
-        not simple
-        and len(runs) == 3
+        len(runs) == 3
         and len({r["details"].get("source", {}).get("sha") for r in runs}) == 1
         and all(
-            r["target_sha"] == task["target_sha"]
+            r["details"].get("source", {}).get("sha")
+            and r["target_sha"] == task["target_sha"]
             and (
                 r["state"] == State.FAILED
                 or json.loads(r["result"] or "{}").get("conclusion") in {"blocked", "failed"}
@@ -232,7 +271,16 @@ class Coordinator:
                     ],
                 },
             }
-        uncached = [t for t in candidates if current(self.store, t["id"]) is None]
+
+        def reusable(task_id: int) -> dict[str, Any] | None:
+            previous = current(self.store, task_id)
+            if previous and (
+                previous["status"] == "completed" or previous["retry_at"] > time.time()
+            ):
+                return previous
+            return None
+
+        uncached = [t for t in candidates if reusable(t["id"]) is None]
         task = (uncached or candidates)[0]  # One session; changed sibling tasks do not starve.
         raw = facts(self.store, task["id"])
         data = Redactor().clean(raw)
@@ -251,8 +299,8 @@ class Coordinator:
                     "suggestion": "协调子进程清理不明，需人工核对；保留占用。",
                 }
             previous = current(self.store, task["id"])
-            if previous:
-                return previous  # Failed/interrupted analyses also do not loop on the same facts.
+            if cached := reusable(task["id"]):
+                return cached
             run_dir = self.store.root / "coordination" / uuid.uuid4().hex
             workspace = run_dir / "workspace"
             workspace.mkdir(parents=True, mode=0o700)
@@ -304,6 +352,9 @@ class Coordinator:
             finally:
                 observer.reset(token)
                 result["duration_seconds"] = round(time.monotonic() - started, 3)
+                if result["status"] in {"failed", "cancelled"}:
+                    result["failures"] = (previous or {}).get("failures", 0) + 1
+                    result["retry_at"] = time.time() + min(300, 5 * 2 ** min(6, result["failures"]))
                 with Controls(self.store).transaction():
                     if fingerprint(facts(self.store, task["id"])) != key:
                         result["status"] = "stale"

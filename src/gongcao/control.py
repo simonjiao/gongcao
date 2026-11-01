@@ -437,7 +437,6 @@ class Controls:
                 "consumed": "advanced",
                 "observed": "checked",
                 "blocked": "blocked",
-                "accepted": "blocked",
                 "rejected": "blocked",
                 "stale": "blocked",
             }.get(row["status"])
