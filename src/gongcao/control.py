@@ -242,7 +242,7 @@ class Controls:
             occupied = self.db.execute(
                 "SELECT 1 FROM leases WHERE task_id=?", (task_id,)
             ).fetchone()
-            if not reason and not safe and mode != "pause" and occupied:
+            if not reason and not safe and mode != "pause" and occupied and not data["recovery"]:
                 reason = "Task is occupied; pause first and wait for a safe checkpoint"
             if not reason and mode != "pause" and policy:
                 self.check_policy(task_id, policy)
