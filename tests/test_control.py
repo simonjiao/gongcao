@@ -169,8 +169,11 @@ async def test_recovery_step_cannot_take_an_active_owners_os_lock(
     async with Lease(store, task_id) as owner:
         store.halt(task_id, State.RECONCILE, "owner must settle")
         with closing(Store(store.root)) as other:
-            assert Controls(other).issue(task_id, "step", policy=copilot.policy_hash)
-            await Workflow(other, copilot, fixture_github).run(task_id)
+            assert not Controls(other).issue(task_id, "step", policy=copilot.policy_hash)
+            assert not other.db.execute(
+                "SELECT 1 FROM instructions WHERE task_id=? AND status='pending'",
+                (task_id,),
+            ).fetchone()
         assert (
             store.db.execute("SELECT owner FROM leases WHERE task_id=?", (task_id,)).fetchone()[0]
             == owner.owner
