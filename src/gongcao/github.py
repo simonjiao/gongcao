@@ -23,7 +23,7 @@ traffic: ContextVar["Traffic | None"] = ContextVar("github_traffic", default=Non
 
 
 class Deferred(RuntimeError):
-    """Request was not sent or was rejected by GitHub's rate limiter."""
+    """Work waits for GitHub transport limits or confirmed synchronization."""
 
 
 def response(raw: str) -> tuple[dict[str, str], str]:

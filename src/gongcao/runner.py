@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -49,11 +50,48 @@ class Runner:
         }.get(Stage(task["stage"]))
         if role is None:
             raise ValueError("This stage does not execute an agent")
+        stage = Stage(task["stage"])
+        analysis = None
+        if role == Role.DEVELOPER and stage == Stage.DEVELOPMENT:
+            candidates = [
+                r
+                for r in self.store.runs(task_id)
+                if r["role"] == Role.ANALYST
+                and r["state"] == State.COMPLETED
+                and r["evidence_valid"]
+                and r["target_sha"] == task["target_sha"]
+            ]
+            if not candidates:
+                raise ValueError("No confirmed analysis for the target revision")
+            analysis = json.loads(candidates[-1]["result"])
+        if stage == Stage.REVISION and (
+            not evidence or evidence.get("target_sha") != task["target_sha"]
+        ):
+            raise ValueError("Revision requires confirmed findings for the current SHA")
+        handoff_files = {}
+        if role == Role.DEVELOPER:
+            from .discovery import Discovery
+
+            publisher = Discovery(self.store, self.config, self.github)
+            with tempfile.TemporaryDirectory(dir=self.store.root) as prepared:
+                directory = Path(prepared)
+                analysis = await publisher.report_context(task, analysis, directory)
+                evidence = await publisher.report_context(task, evidence, directory)
+                handoff_files = {
+                    path.name: path.read_text()
+                    for path in (directory / "home").glob("handoff-*.txt")
+                }
+            controls.apply_pending(task_id, self.config)
+            if not controls.revalidate(task_id, self.config):
+                raise Paused("Waiting for instruction after handoff preparation")
+            current = self.store.task(task_id)
+            if controls_baseline(current) != controls_baseline(task) or current["stage"] != stage:
+                raise ValueError("Task version changed during handoff preparation")
+            task = current
         run_id = self.store.begin_run(task_id, role, expected_snapshot=task["snapshot"])
         run_dir = self.store.root / "runs" / run_id
         journal: Journal | None = None
         started = time.monotonic()
-        stage = Stage(task["stage"])
         result: AgentResult | None = None
         outcome: tuple[State, Stage, State, str, str | None] = (
             State.FAILED,
@@ -64,6 +102,10 @@ class Runner:
         )
         try:
             run_dir.mkdir(parents=True, mode=0o700)
+            if handoff_files:
+                (run_dir / "home").mkdir(mode=0o700)
+                for name, body in handoff_files.items():
+                    (run_dir / "home" / name).write_text(body)
             journal = Journal(self.store, run_id, self.config.max_log_bytes, Redactor())
             journal.emit(
                 "started",
@@ -94,29 +136,6 @@ class Runner:
             self.store.run_details(run_id, requested_execution=self.config.execution)
             await worktree(repo, workspace, source["sha"], role, run_id)
             self.store.run_metadata(run_id, worktree=str(workspace))
-            analysis = None
-            if role == Role.DEVELOPER and stage == Stage.DEVELOPMENT:
-                candidates = [
-                    r
-                    for r in self.store.runs(task_id)
-                    if r["role"] == Role.ANALYST
-                    and r["state"] == State.COMPLETED
-                    and r["evidence_valid"]
-                    and r["target_sha"] == task["target_sha"]
-                ]
-                if not candidates:
-                    raise ValueError("No confirmed analysis for the target revision")
-                analysis = json.loads(candidates[-1]["result"])
-            if stage == Stage.REVISION and (
-                not evidence or evidence.get("target_sha") != task["target_sha"]
-            ):
-                raise ValueError("Revision requires confirmed findings for the current SHA")
-            if role == Role.DEVELOPER:
-                from .discovery import Discovery
-
-                publisher = Discovery(self.store, self.config, self.github)
-                analysis = await publisher.report_context(task, analysis, run_dir)
-                evidence = await publisher.report_context(task, evidence, run_dir)
             data, digest = await context(repo, task, role, self.config, analysis, evidence, source)
             (run_dir / "context.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
             self.store.run_metadata(run_id, context_hash=digest)

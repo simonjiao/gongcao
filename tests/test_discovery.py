@@ -12,11 +12,12 @@ from gongcao.config import Config
 from gongcao.control import Controls, InstructionChanged, baseline
 from gongcao.coordination import Coordinator
 from gongcao.discovery import Discovery
-from gongcao.github import command
+from gongcao.github import Deferred, command
 from gongcao.leases import Lease
 from gongcao.model import Role, Stage, State
 from gongcao.recovery import Recovery
 from gongcao.runner import Runner
+from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 
 
@@ -27,6 +28,7 @@ async def test_long_handoff_requires_confirmed_readback_and_reaches_isolated_wor
     task = store.tasks()[0]
     task_id = task["id"]
     store.halt(task_id, State.QUEUED, "Analyze current request")
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
     run = store.begin_run(task_id, Role.ANALYST)
     store.run_details(run, source={"sha": sha, "baseline": baseline(task)})
     publisher = Discovery(store, policy, intake.github)
@@ -42,11 +44,31 @@ async def test_long_handoff_requires_confirmed_readback_and_reaches_isolated_wor
         run,
         State.COMPLETED,
         Stage.DEVELOPMENT,
-        State.WAITING_INSTRUCTION,
+        State.QUEUED,
         "Analysis ready",
         json.dumps(report),
     )
     mutate = intake.github.mutate
+
+    async def unavailable(*args, **kwargs):
+        raise ConnectionError("Publication unavailable before first POST")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("An unconfirmed handoff cannot start the next Agent")
+
+    count = len(store.runs(task_id))
+    writes = len(intake.github.writes)
+    with monkeypatch.context() as pending:
+        pending.setattr(Discovery, "owned", unavailable)
+        pending.setattr(Runner, "session", forbidden)
+        scheduler = Scheduler(store, policy, intake.github)
+        for _ in range(3):
+            await scheduler.advance(task_id)
+        assert len(store.runs(task_id)) == count
+        assert not (store.root / "worktrees").exists()
+        assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
+        assert store.task(task_id)["state"] == State.QUEUED
+        assert len(intake.github.writes) == writes
 
     async def lost_response(*args, **kwargs):
         await mutate(*args, **kwargs)
@@ -57,7 +79,7 @@ async def test_long_handoff_requires_confirmed_readback_and_reaches_isolated_wor
     with pytest.raises(PermissionError):
         await publisher.publish(publisher.records()[0])
     run_dir = store.root / "runs" / "pending-handoff"
-    with pytest.raises(PermissionError):
+    with pytest.raises(Deferred, match="handoff"):
         await publisher.report_context(task, report, run_dir)
     assert not run_dir.exists()  # An unknown POST is never a confirmed handoff.
     writes = len(intake.github.writes)
@@ -99,6 +121,29 @@ async def test_long_handoff_requires_confirmed_readback_and_reaches_isolated_wor
         assert intake.github.comments == before
 
     # Both existing SDK paths consume the actual file inside their existing OS sandbox.
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    read, denied = intake.github.read, 0
+
+    async def unauthorized(path):
+        nonlocal denied
+        if path.endswith(f"/comments/{published['id']}"):
+            denied += 1
+            raise PermissionError("HTTP 403: handoff read access denied")
+        return await read(path)
+
+    with monkeypatch.context() as pending:
+        pending.setattr(intake.github, "read", unauthorized)
+        pending.setattr(Runner, "session", forbidden)
+        scheduler = Scheduler(store, policy, intake.github)
+        for _ in range(3):
+            await scheduler.advance(task_id)
+        assert denied == 1  # Persisted sync backoff also applies across Runner instances.
+        assert len(store.runs(task_id)) == count
+        assert not (store.root / "worktrees").exists()
+        assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
+        assert store.task(task_id)["state"] == State.QUEUED
+    await publisher.publish(publisher.records()[0])
+
     install_worker(
         monkeypatch,
         """

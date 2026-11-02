@@ -9,9 +9,10 @@ from _support.checkpoint_fixture import BLOCKED_AGAIN, WORKER
 from _support.worker import install_worker
 
 from gongcao.control import Controls
-from gongcao.github import command
+from gongcao.github import Deferred, command
 from gongcao.model import Stage, State
 from gongcao.recovery import Recovery
+from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 from gongcao.workflow import Workflow
 
@@ -501,9 +502,18 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
     with pytest.raises(ConnectionError):
         await publisher.publish(publisher.records()[0])
     run_dir = store.root / "runs" / "large-handoff"
-    with pytest.raises(ConnectionError):
+    with pytest.raises(Deferred, match="handoff"):
         await publisher.report_context(store.task(task_id), result, run_dir)
     assert not run_dir.exists()
+    post("/gongcao step")
+    count = len(store.runs(task_id))
+    worktrees = sorted((store.root / "worktrees").iterdir())
+    scheduler = Scheduler(store, config, github)
+    for _ in range(3):
+        await scheduler.advance(task_id)
+    assert len(store.runs(task_id)) == count
+    assert sorted((store.root / "worktrees").iterdir()) == worktrees
+    assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
     history = await instructions(store.task(task_id))
     offline = False
     monkeypatch.setattr(github, "mutate", mutate)

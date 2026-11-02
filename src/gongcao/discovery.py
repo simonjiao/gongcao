@@ -51,9 +51,13 @@ def detailed_reports(event: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
-def handoff_records(event: dict[str, Any], body: str) -> dict[str, Any]:
+def handoff_records(event: dict[str, Any], body: str | None = None) -> dict[str, Any]:
     try:
-        published = json.JSONDecoder().raw_decode(body.rsplit(HANDOFF_MARKER, 1)[1])[0]
+        published = (
+            json.JSONDecoder().raw_decode(body.rsplit(HANDOFF_MARKER, 1)[1])[0]
+            if body is not None
+            else detailed_reports(event)
+        )
     except (IndexError, ValueError):
         return {}
     if not isinstance(published, dict):
@@ -807,8 +811,9 @@ class Discovery:
         if report is None:
             return None
         if len(json.dumps(report, ensure_ascii=False)) > 4000:
+            with self.store.db:
+                self.store.progress(task["id"])
             await self.handoff(task["id"])
-            await self.reconcile_status(task["id"])
         row = self.store.db.execute(
             "SELECT data FROM claims WHERE task_id=?", (task["id"],)
         ).fetchone()
@@ -816,10 +821,12 @@ class Discovery:
         report_hash = digest(Redactor().clean(report))
         if any(
             value["report_hash"] == report_hash
+            and value["sha"] == task["target_sha"]
+            and value["request"] == baseline(task)
             for event in data.get("progress", [])
-            for value in event.get("handoff_records", {}).values()
+            for value in event.get("handoff_records", handoff_records(event)).values()
         ):
-            raise ValueError("GitHub handoff parts are not fully confirmed")
+            raise Deferred("GitHub handoff is pending confirmed publication/readback")
         references = data.get("handoffs", {}).values()
         for ref in references:
             if (
@@ -828,12 +835,18 @@ class Discovery:
                 or ref["request"] != baseline(task)
             ):
                 continue
+            if data.get("status_retry", {}).get("next_at", 0) > time.time():
+                raise Deferred("GitHub handoff readback is waiting for synchronization backoff")
             target = Target.parse(task["url"])
             text = []
             for part in ref["parts"]:
-                item = await self.github.read(
-                    f"repos/{target.repository}/issues/comments/{part['comment_id']}"
-                )
+                try:
+                    item = await self.github.read(
+                        f"repos/{target.repository}/issues/comments/{part['comment_id']}"
+                    )
+                except (ConnectionError, TimeoutError, PermissionError) as exc:
+                    self.warning(task["url"], exc)
+                    raise Deferred("GitHub handoff readback is unavailable; verify access") from exc
                 if (
                     item["id"] != part["comment_id"]
                     or item["user"].get("id") != part["actor_id"]
