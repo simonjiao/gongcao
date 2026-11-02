@@ -111,6 +111,12 @@ class Runner:
                 not evidence or evidence.get("target_sha") != task["target_sha"]
             ):
                 raise ValueError("Revision requires confirmed findings for the current SHA")
+            if role == Role.DEVELOPER:
+                from .discovery import Discovery
+
+                publisher = Discovery(self.store, self.config, self.github)
+                analysis = await publisher.report_context(task, analysis, run_dir)
+                evidence = await publisher.report_context(task, evidence, run_dir)
             data, digest = await context(repo, task, role, self.config, analysis, evidence, source)
             (run_dir / "context.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
             self.store.run_metadata(run_id, context_hash=digest)

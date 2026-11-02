@@ -315,6 +315,21 @@ class Coordinator:
                 if fingerprint(facts(self.store, task["id"])) != key:
                     result["status"] = "stale"
                     return result
+                from .discovery import Discovery
+
+                publisher = Discovery(self.store, self.config, self.github)
+                for run, original in zip(
+                    data["runs"], self.store.runs(task["id"])[-3:], strict=True
+                ):
+                    report_context = await publisher.report_context(
+                        task, json.loads(original["result"] or "null"), run_dir
+                    )
+                    if (
+                        report_context
+                        and report_context.get("source") == "confirmed_github_comment"
+                    ):
+                        run.update(summary=report_context["summary"], basis=[], next_steps=[])
+                        run["handoff"] = report_context
                 context = {"role": "coordinator", "facts": data, "fingerprint": key}
                 (run_dir / "context.json").write_text(json.dumps(context, ensure_ascii=False))
                 report = await Runner(self.store, self.config, self.github).session(
