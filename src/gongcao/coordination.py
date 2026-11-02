@@ -78,8 +78,10 @@ def request_facts(task: dict[str, Any]) -> dict[str, Any]:
         "body": task["snapshot"].get("body", "")[:2000],
         "feedback": [
             {key: item[key][:1000] for key in ("source", "actor", "feedback")}
-            for item in task["control"].get("feedback", [])
+            for index, item in enumerate(task["control"].get("feedback", []))
             if item["sha"] == task["target_sha"]
+            and item["baseline"]
+            == baseline(task | {"control": {"feedback": task["control"]["feedback"][:index]}})
         ][-6:],
     }
 
@@ -116,6 +118,7 @@ def facts(store: Store, task_id: int) -> dict[str, Any]:
                 "target_sha": r["target_sha"],
                 "evidence_valid": bool(r["evidence_valid"]),
                 "source": r["details"].get("source", {}).get("sha"),
+                "request": r["details"].get("source", {}).get("baseline"),
                 "conclusion": (report := json.loads(r["result"] or "{}")).get("conclusion"),
                 "summary": (report.get("summary") or r["error"] or "")[:1200],
                 "basis": [s[:500] for s in report.get("basis", [])[:6]],
@@ -166,21 +169,6 @@ def current(store: Store, task_id: int) -> dict[str, Any] | None:
     return None
 
 
-def simple_block(reason: str) -> bool:
-    return any(
-        word in reason.casefold()
-        for word in (
-            "missing package",
-            "missing acceptance",
-            "authentication missing",
-            "cleanup",
-            "unconfirmed",
-            "缺少制品",
-            "缺少材料",
-        )
-    )
-
-
 def analyzable(store: Store, task: dict[str, Any]) -> bool:
     task_id = task["id"]
     if task["state"] not in {
@@ -190,7 +178,11 @@ def analyzable(store: Store, task: dict[str, Any]) -> bool:
         State.WAITING_DEPENDENCY,
     }:
         return False
-    if task["cancel_requested"] or task["snapshot"].get("state") != "open":
+    if (
+        task["cancel_requested"]
+        or task["snapshot"].get("state") != "open"
+        or task["snapshot"].get("merged")
+    ):
         return False
     if store.db.execute("SELECT 1 FROM leases WHERE task_id=?", (task_id,)).fetchone():
         return False
@@ -200,9 +192,7 @@ def analyzable(store: Store, task: dict[str, Any]) -> bool:
         (task_id, task_id),
     ).fetchone():
         return False
-    return not simple_block(
-        task["reason"] + " ".join(r["error"] or "" for r in store.runs(task_id)[-3:])
-    )
+    return True
 
 
 def complex_block(store: Store, task_id: int) -> bool:
@@ -217,10 +207,9 @@ def complex_block(store: Store, task_id: int) -> bool:
         if d["state"] in {State.HUMAN, State.FAILED} and analyzable(store, store.task(d["id"]))
     ]
     if len(blocked_dependencies) > 1:
-        return True  # Multiple unresolved decisions, rather than ordinary dependency waits.
-    conflict = any(word in task["reason"].casefold() for word in ("conflict", "冲突"))
+        return True  # A signal to analyze; the controller does not diagnose the cause.
     feedback = request_facts(task)["feedback"]
-    if conflict and len({item["feedback"] for item in feedback}) > 1:
+    if len({item["feedback"] for item in feedback}) > 1:
         return True
     if task["state"] == State.WAITING_DEPENDENCY:
         return False
@@ -230,6 +219,7 @@ def complex_block(store: Store, task_id: int) -> bool:
         and all(
             r["details"].get("source", {}).get("sha")
             and r["target_sha"] == task["target_sha"]
+            and r["details"].get("source", {}).get("baseline") == baseline(task)
             and (
                 r["state"] == State.FAILED
                 or json.loads(r["result"] or "{}").get("conclusion") in {"blocked", "failed"}
