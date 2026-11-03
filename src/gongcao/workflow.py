@@ -27,6 +27,8 @@ class Workflow:
         self.remote = Controlled(store, config, github)
         self.lease: Lease | None = None
         self.watch_instructions = True
+        self.coordinate_advice = True
+        self.advice_pending = False
 
     async def sync(self, task_id: int) -> dict[str, Any]:
         task = self.store.task(task_id)
@@ -329,7 +331,13 @@ class Workflow:
         try:
             if self.watch_instructions:
                 async with Controls(self.store).listen(self.config, self.github, task_id):
-                    if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
+                    if self.store.task(task_id)["state"] in {
+                        State.WAITING_INSTRUCTION,
+                        State.RECONCILE,
+                        State.HUMAN,
+                        State.FAILED,
+                        State.WAITING_ENVIRONMENT,
+                    }:
                         await Controls(self.store).poll(task_id, self.config, self.github)
                     return await self.execute(task_id)
             return await self.execute(task_id)
@@ -343,11 +351,28 @@ class Workflow:
             progress(self.store, task_id)
 
     async def execute(self, task_id: int) -> list[str]:
+        entry = self.store.task(task_id)["control"]
         if self.store.task(task_id)["state"] == State.WAITING_INSTRUCTION:
             return []
-        async with Lease(self.store, task_id) as lease:
+        steps = list(
+            self.store.db.execute(
+                "SELECT id,data FROM instructions WHERE task_id=? "
+                "AND status IN ('pending','accepted') AND reason='' "
+                "AND json_extract(data,'$.mode')='step'",
+                (task_id,),
+            )
+        )
+        recovering = any(json.loads(row["data"]).get("recovery") for row in steps)
+        async with Lease(self.store, task_id, recovery=recovering) as lease:
             self.lease = lease
             if not lease.acquired:
+                for row in steps:
+                    Controls(self.store).finish_step(
+                        task_id,
+                        command_id=row["id"],
+                        reason="Execution lease is occupied; send a new Step after it settles",
+                        active_owner=lease.lock is None,
+                    )
                 return []
             before = {run["id"] for run in self.store.runs(task_id)}
             try:
@@ -355,6 +380,14 @@ class Workflow:
                 for _ in range(4 * self.config.max_revisions + 10):
                     task = await self.sync(task_id)
                     await controls.poll(task_id, self.config, self.github)
+                    from .discovery import Discovery
+
+                    try:
+                        await Discovery(self.store, self.config, self.github).reconcile_status(
+                            task_id
+                        )
+                    except ValueError as exc:
+                        raise UncertainWrite(str(exc)) from exc
                     if not controls.revalidate(task_id, self.config):
                         break
                     task = self.store.task(task_id)
@@ -439,4 +472,19 @@ class Workflow:
                 self.store.halt(task_id, state, Redactor().text(f"{type(exc).__name__}: {exc}"))
             finally:
                 await self.save_output(task_id)
-            return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]
+                Controls(self.store).finish_step(task_id)
+        from .coordination import Coordinator
+
+        control = self.store.task(task_id)["control"]
+        receipt = self.store.db.execute(
+            "SELECT data FROM instructions WHERE task_id=? AND id=?",
+            (task_id, control.get("command_id")),
+        ).fetchone()
+        self.advice_pending = bool(
+            receipt
+            and json.loads(receipt[0])["mode"] == "step"
+            and (control.get("command_id") != entry.get("command_id") or not entry.get("spent"))
+        )
+        if self.advice_pending and self.coordinate_advice:
+            await Coordinator(self.store, self.config, self.github).run(task_id)
+        return [run["id"] for run in self.store.runs(task_id) if run["id"] not in before]

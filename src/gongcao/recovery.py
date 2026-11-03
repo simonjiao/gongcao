@@ -3,11 +3,12 @@
 import hashlib
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from .control import Controls, InstructionChanged
+from .control import Controls, InstructionChanged, bind
 from .events import Redactor
 from .github import Deferred, GitHub, Target, command
 from .leases import Lease, identity, session_alive
@@ -44,7 +45,7 @@ class Recovery:
         row = self.store.db.execute(
             "SELECT data FROM claims WHERE task_id=?", (task["id"],)
         ).fetchone()
-        if row:
+        if row and json.loads(row["data"]).get("kind") != "manual":
             data = json.loads(row["data"])
             sha = await self.default_base(task)
             if sha != data["base_sha"]:
@@ -151,6 +152,10 @@ class Recovery:
 
     async def reconcile(self, task_id: int, owner: str) -> dict[str, Any]:
         task = self.store.task(task_id)
+        from .config import Config
+        from .discovery import Discovery
+
+        await Discovery(self.store, Config(), self.github).reconcile_status(task_id)
         records = self.store.db.execute(
             "SELECT * FROM processes WHERE task_id=? AND owner!=? AND state!='stopped'",
             (task_id, owner),
@@ -331,13 +336,67 @@ class Recovery:
             return {"task_id": task_id, "recovered": True, "task": self.store.task(task_id)}
 
     def reset_retry(
-        self, task_id: int, refreshed_sha: str, *, reset_revisions: bool = False
+        self,
+        task_id: int,
+        refreshed_sha: str,
+        *,
+        reset_revisions: bool = False,
+        command_id: str | None = None,
     ) -> None:
         """Caller holds the same lease throughout reconciliation and authorization."""
-        task = self.store.task(task_id)
         with Controls(self.store).transaction():
-            if refreshed_sha != task["target_sha"]:
+            controls = Controls(self.store)
+            if refreshed_sha != self.store.task(task_id)["target_sha"]:
                 self.store.refresh_base(task_id, refreshed_sha)
+            task = self.store.task(task_id)
+            control = task["control"]
+            if command_id is not None:
+                data = json.loads(
+                    self.store.db.execute(
+                        "SELECT data FROM instructions WHERE task_id=? AND id=?",
+                        (task_id, command_id),
+                    ).fetchone()[0]
+                )
+            elif control.get("mode") == "step" and control.get("spent"):
+                command_id = "local:" + uuid.uuid4().hex
+                data = bind(
+                    task,
+                    {
+                        "mode": "retry",
+                        "target": None,
+                        "actor": "local",
+                        "created": time.time(),
+                        "policy": control.get("policy"),
+                        "feedback": "",
+                    },
+                )
+                controls.record(task_id, command_id, data, "accepted")
+            if command_id is not None:
+                if control.get("command_id") != command_id and control.get("command_id"):
+                    controls.mark(
+                        task_id, control["command_id"], "superseded", "Fresh retry authorization"
+                    )
+                controls.mark(task_id, command_id, "accepted", "")
+                controls.save(
+                    task_id,
+                    control
+                    | {
+                        "mode": "step"
+                        if data["mode"] == "step"
+                        or control["mode"] not in {"step", "auto", "until"}
+                        else control["mode"],
+                        "command_id": command_id,
+                        "explicit": True
+                        if data["mode"] == "step"
+                        else control.get("explicit", False),
+                        "spent": False,
+                        "pause_requested": False,
+                        "pause_reason": "",
+                        "policy": data["policy"],
+                        "since": data["created"],
+                        "baseline": data["baseline"],
+                    },
+                )
             self.store.db.execute(
                 "UPDATE runs SET evidence_valid=0 WHERE task_id=? AND "
                 "(state!='completed' OR NOT ("

@@ -1,4 +1,5 @@
 import subprocess
+from datetime import UTC, datetime
 
 from gongcao.github import GitHub
 
@@ -132,3 +133,36 @@ class RegisteredGitHub(GitHub):
     async def mutate(self, path, payload):
         self.writes += 1
         raise AssertionError("Recovery must never write remotely")
+
+
+class StatusGitHub(RegisteredGitHub):
+    """Registered-task fixture with the real ordinary-comment protocol boundary."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.comments = []
+
+    async def read(self, path):
+        if path == "user":
+            return {"id": 1, "login": "controller"}
+        return next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
+
+    async def instructions(self, task):
+        return [dict(c) for c in self.comments if c["url"] == task["url"]]
+
+    async def mutate(self, path, payload, *, method="POST"):
+        assert method == "POST" and path.endswith("/comments")
+        self.writes += 1
+        number = int(path.split("/issues/")[1].split("/")[0])
+        url = next(t["url"] for t in self.store.tasks() if t["snapshot"]["number"] == number)
+        stamp = datetime.now(UTC).isoformat()
+        item = {
+            "id": len(self.comments) + 1,
+            "url": url,
+            "user": {"id": 1, "login": "controller"},
+            "created_at": stamp,
+            "updated_at": stamp,
+            **payload,
+        }
+        self.comments.append(item)
+        return dict(item)

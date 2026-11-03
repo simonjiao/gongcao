@@ -9,6 +9,9 @@ scheduler:
   jobs: 2  # 允许 1～3；省略时默认 1。
 qa:
   jobs: 2  # 正整数；省略时默认 2。
+# 仅复杂阻塞按事实变化触发只读分析；用户主动 step / coordinate 不依赖此开关。
+coordination:
+  enabled: false
 roles:
   # 以下是发送给 Agent 的任务提示词（实际配置值，不是注释），故保持原文。
   analyst: >-

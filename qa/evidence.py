@@ -403,6 +403,10 @@ async def verify_live(
         verify(discovery, run.value["github_login"])
     if run.value["scenario"] == "recover":
         verify_recovery(run, task, reviews)
+    if (run.root / "manual-feedback.json").exists():
+        from .feedback import verify as verify_feedback
+
+        await verify_feedback(run, github)
     result.update(
         boundary_probe={"inputs": VECTORS, "initial": old, "final": final},
         changed_files=files,

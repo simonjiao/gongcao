@@ -23,7 +23,7 @@ traffic: ContextVar["Traffic | None"] = ContextVar("github_traffic", default=Non
 
 
 class Deferred(RuntimeError):
-    """Request was not sent or was rejected by GitHub's rate limiter."""
+    """Work waits for GitHub transport limits or confirmed synchronization."""
 
 
 def response(raw: str) -> tuple[dict[str, str], str]:
@@ -356,8 +356,6 @@ class GitHub:
 
     async def instructions(self, task: dict[str, Any]) -> list[dict[str, Any]]:
         target = Target.parse(task["url"])
-        if target.kind != "issues":
-            return []
         return await self.pages(
             f"repos/{target.repository}/issues/{target.number}/comments?per_page=100"
         )

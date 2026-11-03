@@ -2,18 +2,254 @@
 
 import asyncio
 import json
+from contextlib import closing
 from copy import deepcopy
 
 import pytest
+from _support.worker import install_worker
 
 from gongcao.config import Config
-from gongcao.control import Controls, InstructionChanged
+from gongcao.control import Controls, InstructionChanged, baseline
+from gongcao.coordination import Coordinator
 from gongcao.discovery import Discovery
-from gongcao.github import command
+from gongcao.github import Deferred, command
 from gongcao.leases import Lease
-from gongcao.model import Stage, State
+from gongcao.model import Role, Stage, State
 from gongcao.recovery import Recovery
+from gongcao.runner import Runner
+from gongcao.scheduler import Scheduler
 from gongcao.store import Store
+
+
+async def test_long_handoff_requires_confirmed_readback_and_reaches_isolated_workers(
+    intake, store, repo, sha, policy, monkeypatch
+):
+    await intake.scan()
+    task = store.tasks()[0]
+    task_id = task["id"]
+    store.halt(task_id, State.QUEUED, "Analyze current request")
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    run = store.begin_run(task_id, Role.ANALYST)
+    store.run_details(run, source={"sha": sha, "baseline": baseline(task)})
+    publisher = Discovery(store, policy, intake.github)
+    await publisher.publish(publisher.records()[0])
+    report = {
+        "conclusion": "ready",
+        "target_sha": sha,
+        "summary": "Evidence and acceptance detail. " * 180,
+        "basis": ["Owner chose return zero; github_pat_secret123"],
+        "next_steps": ["Preserve the final necessary decision: return zero."],
+    }
+    store.finish(
+        run,
+        State.COMPLETED,
+        Stage.DEVELOPMENT,
+        State.QUEUED,
+        "Analysis ready",
+        json.dumps(report),
+    )
+    mutate = intake.github.mutate
+
+    async def unavailable(*args, **kwargs):
+        raise ConnectionError("Publication unavailable before first POST")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("An unconfirmed handoff cannot start the next Agent")
+
+    count = len(store.runs(task_id))
+    writes = len(intake.github.writes)
+    with monkeypatch.context() as pending:
+        pending.setattr(Discovery, "owned", unavailable)
+        pending.setattr(Runner, "session", forbidden)
+        scheduler = Scheduler(store, policy, intake.github)
+        for _ in range(3):
+            await scheduler.advance(task_id)
+        assert len(store.runs(task_id)) == count
+        assert not (store.root / "worktrees").exists()
+        assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
+        assert store.task(task_id)["state"] == State.QUEUED
+        assert len(intake.github.writes) == writes
+
+    async def lost_response(*args, **kwargs):
+        await mutate(*args, **kwargs)
+        intake.github.failure = "403"  # POST applied, but confirmation cannot be read.
+        raise ConnectionError("Reply lost")
+
+    monkeypatch.setattr(intake.github, "mutate", lost_response)
+    with pytest.raises(PermissionError):
+        await publisher.publish(publisher.records()[0])
+    run_dir = store.root / "runs" / "pending-handoff"
+    with pytest.raises(Deferred, match="handoff"):
+        await publisher.report_context(task, report, run_dir)
+    assert not run_dir.exists()  # An unknown POST is never a confirmed handoff.
+    writes = len(intake.github.writes)
+    intake.github.failure = ""
+    monkeypatch.setattr(intake.github, "mutate", mutate)
+    await publisher.publish(publisher.records()[0])
+    assert len(intake.github.writes) == writes
+    published = deepcopy(intake.github.comments[-1])
+    assert report["next_steps"][0] in published["body"]
+    assert "secret123" not in published["body"]
+
+    store.halt(task_id, State.WAITING_INSTRUCTION, "Next milestone, same report")
+    await publisher.publish(publisher.records()[0])
+    assert report["summary"] not in intake.github.comments[-1]["body"]
+    assert f"#issuecomment-{published['id']}" in intake.github.comments[-1]["body"]
+    with closing(Store(store.root)) as restarted:
+        reader = Discovery(restarted, policy, intake.github)
+        current = restarted.task(task_id)
+        bound = await reader.report_context(current, report, run_dir)
+        assert bound["reference"]["comment_id"] == published["id"]
+        assert bound["reference"]["request"] == baseline(current)
+        assert report["summary"] not in json.dumps(bound)
+        for changed in (
+            current | {"target_sha": "0" * 40},
+            current | {"snapshot": current["snapshot"] | {"body": "New requirements"}},
+        ):
+            assert await reader.report_context(changed, report, run_dir) == report
+        for change in (
+            {"user": {"login": "someone-else"}},
+            {"body": published["body"] + "edited"},
+            {"updated_at": "edited-later"},
+        ):
+            intake.github.comments[published["id"] - 1].update(change)
+            with pytest.raises(ValueError, match="handoff"):
+                await reader.report_context(current, report, run_dir)
+            intake.github.comments[published["id"] - 1] = deepcopy(published)
+        before = deepcopy(intake.github.comments)
+        await reader.publish(reader.records()[0])
+        assert intake.github.comments == before
+
+    # Both existing SDK paths consume the actual file inside their existing OS sandbox.
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    read, denied = intake.github.read, 0
+
+    async def unauthorized(path):
+        nonlocal denied
+        if path.endswith(f"/comments/{published['id']}"):
+            denied += 1
+            raise PermissionError("HTTP 403: handoff read access denied")
+        return await read(path)
+
+    with monkeypatch.context() as pending:
+        pending.setattr(intake.github, "read", unauthorized)
+        pending.setattr(Runner, "session", forbidden)
+        scheduler = Scheduler(store, policy, intake.github)
+        for _ in range(3):
+            await scheduler.advance(task_id)
+        assert denied == 1  # Persisted sync backoff also applies across Runner instances.
+        assert len(store.runs(task_id)) == count
+        assert not (store.root / "worktrees").exists()
+        assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
+        assert store.task(task_id)["state"] == State.QUEUED
+    await publisher.publish(publisher.records()[0])
+
+    install_worker(
+        monkeypatch,
+        """
+import json, pathlib, sys
+request = json.loads(sys.stdin.readline())
+data = request['context']
+coordinator = data['role'] == 'coordinator'
+handoff = (next(r['handoff'] for r in data['facts']['runs'] if 'handoff' in r)
+    if coordinator else data['confirmed_analysis'])
+assert handoff['source'] == 'confirmed_github_comment'
+body = pathlib.Path(handoff['details_file']).read_text()
+assert 'Preserve the final necessary decision: return zero.' in body
+assert 'secret123' not in body
+assert len(handoff['summary']) <= 600
+print(json.dumps({'kind':'thread','data':{'thread_id':data['role']}}))
+print(json.dumps({'kind':'execution','data':{'model':request['model'],
+    'reasoning_effort':request['reasoning_effort']}}))
+result = {'facts':['Verified GitHub handoff'], 'blockers':['Owner input'],
+    'suggestions':[{'action':'Request input','owner':'owner','inputs':['decision']}]}
+if not coordinator:
+    result = {'conclusion':'ready','target_sha':data['target_sha'], 'summary':'Read handoff',
+        'basis':['Version-matched decision retained'],'next_steps':['Controller checks']}
+print(json.dumps({'kind':'result','data':result}))
+""",
+    )
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    developer = await Runner(store, policy, intake.github).run(task_id)
+    assert store.runs(task_id)[-1]["state"] == State.COMPLETED
+    developer_data = json.loads((store.root / "runs" / developer / "context.json").read_text())
+    assert developer_data["confirmed_analysis"]["reference"]["comment_id"] == published["id"]
+    # In an uninterrupted auto flow, the original publisher confirms the report before use.
+    store.transition(store.task(task_id), Stage.ANALYSIS, State.QUEUED, "New analysis")
+    analysis = store.begin_run(task_id, Role.ANALYST)
+    store.run_details(analysis, source={"sha": sha, "baseline": baseline(store.task(task_id))})
+    updated = report | {"summary": report["summary"] + "Updated conclusion."}
+    store.finish(
+        analysis,
+        State.COMPLETED,
+        Stage.DEVELOPMENT,
+        State.QUEUED,
+        "Updated analysis",
+        json.dumps(updated),
+    )
+    developer = await Runner(store, policy, intake.github).run(task_id)
+    assert store.runs(task_id)[-1]["state"] == State.COMPLETED
+    developer_data = json.loads((store.root / "runs" / developer / "context.json").read_text())
+    reference = developer_data["confirmed_analysis"]["reference"]
+    assert reference["comment_id"] != published["id"]
+    assert "Updated conclusion." in intake.github.comments[reference["comment_id"] - 1]["body"]
+    original_context = await publisher.report_context(
+        store.task(task_id), report, store.root / "runs" / "original-handoff"
+    )
+    assert original_context["reference"]["comment_id"] == published["id"]
+    dependencies = []
+    for number in (3, 5):
+        item = intake.github.rows[number] | {"labels": []}
+        dependency = store.register(item["url"], repo, sha, item)
+        store.halt(dependency, State.HUMAN, "Owner input")
+        dependencies.append(dependency)
+    store.depend(task_id, dependencies)
+    store.halt(task_id, State.HUMAN, "Owner input")
+    await publisher.publish(publisher.records()[0])
+    before = (
+        store.task(task_id) | {"status_sync": None},
+        store.runs(task_id),
+        deepcopy(intake.github.comments),
+    )
+    advice = await Coordinator(store, policy, intake.github).run(task_id)
+    assert advice["status"] == "completed", advice
+    assert before == (
+        store.task(task_id) | {"status_sync": None},
+        store.runs(task_id),
+        intake.github.comments,
+    )
+
+
+@pytest.mark.parametrize("kind", ["issues", "pull"])
+async def test_manual_status_anchor_and_progress_are_append_only_without_discovery(
+    intake, store, repo, sha, snapshot, kind, monkeypatch
+):
+    item = snapshot | {"kind": kind, "url": snapshot["url"].replace("/issues/", f"/{kind}/")}
+    task_id = store.register(item["url"], repo, sha, item)
+    publisher = Discovery(store, Config(), intake.github)
+    publisher.manual(task_id)
+    read = intake.github.read
+
+    async def with_concurrent_progress(path):
+        if path == "user":
+            with closing(Store(store.root)) as writer:
+                writer.halt(task_id, State.HUMAN, "并发到达的变化")
+        return await read(path)
+
+    monkeypatch.setattr(intake.github, "read", with_concurrent_progress)
+    await publisher.refresh(task_id)
+    assert any("并发到达的变化" in c["body"] for c in intake.github.comments)
+    row = publisher.records()[0]
+    assert json.loads(row["data"])["kind"] == "manual" and row["confirmed"]
+    original = deepcopy(intake.github.comments)
+    store.halt(task_id, State.HUMAN, "缺少验收材料，NOT_RUN")
+    await publisher.refresh(task_id)
+    assert intake.github.comments[: len(original)] == original
+    assert "NOT_RUN" in intake.github.comments[-1]["body"]
+    count = len(intake.github.writes)
+    with closing(Store(store.root)) as restarted:
+        await Discovery(restarted, Config(), intake.github).refresh(task_id)
+    assert len(intake.github.writes) == count
 
 
 async def test_filter_dedupe_backlog_status_and_cross_state_lock(
@@ -77,7 +313,11 @@ async def test_unknown_claim_never_reposts_or_runs_before_confirmation(intake, s
     restarted = Discovery(store, intake.config if failure == "limited" else Config(), intake.github)
     async with restarted.active(once=True):
         assert bool(store.tasks()) == (failure != "absent")
-    assert intake.github.writes.count("POST") == 1 + (failure == "limited")
+    # A confirmed lost response may publish the newly registered stage, never another anchor.
+    assert intake.github.writes.count("POST") == 1 + (failure in {"limited", "lost"})
+    assert sum(
+        c["body"].startswith("<!-- gongcao:controller=") for c in intake.github.comments
+    ) == (failure != "absent")
     assert not store.db.execute("SELECT 1 FROM runs").fetchone()
     if failure == "absent":
         assert "refusing replay" in restarted.records()[0]["reason"]

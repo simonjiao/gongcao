@@ -360,6 +360,9 @@ async def execute(
                             },
                         )
                         if run.value["scenario"] == "delivery":
+                            from .feedback import exercise
+
+                            await exercise(run, github)
                             await verify_live(run, after, config, github)
                         verdict = {
                             "passed": True,
@@ -369,6 +372,7 @@ async def execute(
                             else "real-loop",
                             **result,
                             "repeat_unchanged": True,
+                            "manual_feedback": run.value["scenario"] == "delivery",
                         }
                         if run.value["scenario"] != "delivery":
                             require(

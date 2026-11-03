@@ -9,8 +9,10 @@ from _support.checkpoint_fixture import BLOCKED_AGAIN, WORKER
 from _support.worker import install_worker
 
 from gongcao.control import Controls
-from gongcao.github import command
+from gongcao.github import Deferred, command
 from gongcao.model import Stage, State
+from gongcao.recovery import Recovery
+from gongcao.scheduler import Scheduler
 from gongcao.store import Store
 from gongcao.workflow import Workflow
 
@@ -118,8 +120,9 @@ async def blocked(store, task_id, fixture_github, policy, monkeypatch, request):
     )
 
 
+@pytest.mark.parametrize("resume", ["step", "retry", "cli"])
 async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_at_review(
-    store, task_id, blocked, caplog
+    store, task_id, blocked, caplog, resume
 ):
     caplog.set_level("INFO", logger="gongcao")
     config, github, post, status, step = blocked
@@ -128,12 +131,17 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
     assert saved["state"] == "confirmed"
     assert github.pull is None
     assert store.task(task_id)["target_sha"] == first["target_sha"]
-    assert not store.task(task_id)["control"]["spent"]
-    assert store.evidence(task_id)["instructions"][-1]["status"] == "accepted"
+    assert store.task(task_id)["control"]["spent"]
+    assert store.evidence(task_id)["instructions"][-1]["status"] == "blocked"
     assert saved["sha"] in status()["body"] and "NOT_RUN" in status()["body"]
     assert "/gongcao retry" in status()["body"] and "original/r1" in status()["body"]
     assert store.task(task_id)["status_sync"]["dirty"] == 0
-    retry = post("/gongcao retry")
+    if resume == "cli":
+        assert (await Recovery(store, github).retry(task_id))["recovered"]
+        command_id = store.task(task_id)["control"]["command_id"]
+    else:
+        retry = post("/gongcao " + resume)
+        command_id = f"github:{retry['id']}"
     restarted = Store(store.root)
     try:
         await Workflow(restarted, config, github).run(task_id)
@@ -143,7 +151,10 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         runs = restarted.runs(task_id)
         second = runs[-1]
         assert second["thread_id"] != first["thread_id"]
-        assert "GitHub retry 已授权并完成恢复核验" in caplog.text
+        if resume != "cli":
+            assert "GitHub retry 已授权并完成恢复核验" in caplog.text
+        else:
+            assert command_id.startswith("local:")
         assert second["details"]["source"]["sha"] == saved["sha"]
         assert (
             Path(second["worktree"], "sample.txt").read_text()
@@ -156,7 +167,7 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         assert task["pr_number"] == 9 and task["control"]["spent"]
         receipts = {r["id"]: r for r in restarted.evidence(task_id)["instructions"]}
         assert receipts[f"github:{step['id']}"]["status"] == "superseded"
-        assert receipts[f"github:{retry['id']}"]["status"] == "consumed"
+        assert receipts[command_id]["status"] == "consumed"
         count = len(runs)
         await Workflow(restarted, config, github).run(task_id)
         assert len(restarted.runs(task_id)) == count
@@ -164,10 +175,14 @@ async def test_offline_step_block_save_handoff_retry_inherits_commit_and_pauses_
         restarted.close()
 
 
-@pytest.mark.parametrize("bad", ["unauthorized", "edited", "stale", "changed", "remote", "process"])
-async def test_retry_rejects_unsafe_or_stale_permission(store, task_id, blocked, bad):
+@pytest.mark.parametrize(
+    "resume,bad",
+    [("retry", bad) for bad in ("unauthorized", "edited", "stale", "changed", "remote", "process")]
+    + [("step", "remote"), ("step", "process")],
+)
+async def test_retry_rejects_unsafe_or_stale_permission(store, task_id, blocked, bad, resume):
     config, github, post, status, step = blocked
-    receipt = post("/gongcao retry", actor="stranger" if bad == "unauthorized" else "owner")
+    receipt = post("/gongcao " + resume, actor="stranger" if bad == "unauthorized" else "owner")
     if bad == "edited":
         receipt["updated_at"] = "2099-01-01T00:00:00Z"
     if bad == "stale":
@@ -210,7 +225,7 @@ async def test_save_failure_no_change_and_lost_response_do_not_duplicate_commits
     config, github, post, status, step = blocked
     run = store.runs(task_id)[-1]
     save = run["details"]["save"]
-    assert github.pull is None and not store.task(task_id)["control"]["spent"]
+    assert github.pull is None and store.task(task_id)["control"]["spent"]
     operations = store.evidence(task_id)["operations"]
     if save["state"] == "unchanged":
         assert not operations
@@ -454,7 +469,7 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
     config, github, post, status, step = blocked
     run = store.runs(task_id)[-1]
     result = json.loads(run["result"])
-    result["basis"] = ["x" * 100_000]
+    result["basis"] = ["x" * 100_000 + "必要事实🙂" * 2000]
     result["next_steps"] = ["Need original/r1 packages " + "x" * 100_000]
     with store.db:
         store.db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), run["id"]))
@@ -463,6 +478,62 @@ async def test_long_report_and_persistent_status_backoff(store, task_id, blocked
     body = publisher.render(publisher.records()[0])
     assert len(body) < 60_000
     assert "Saved WIP:" in body and "/gongcao retry" in body
+    instructions, mutate = github.instructions, github.mutate
+    sent, offline = 0, False
+
+    async def interrupted_parts(path, payload, **kwargs):
+        nonlocal sent, offline
+        assert len(payload["body"].encode()) < 50_000
+        response = await mutate(path, payload, **kwargs)
+        sent += 1
+        if sent == 2:
+            offline = True
+            raise ConnectionError("Part applied, response lost")
+        return response
+
+    async def read_parts(task):
+        if offline:
+            raise ConnectionError("Part confirmation unavailable")
+        return await instructions(task)
+
+    monkeypatch.setattr(github, "mutate", interrupted_parts)
+    monkeypatch.setattr(github, "instructions", read_parts)
+    store.halt(task_id, State.HUMAN, "Publish complete handoff")
+    with pytest.raises(ConnectionError):
+        await publisher.publish(publisher.records()[0])
+    run_dir = store.root / "runs" / "large-handoff"
+    with pytest.raises(Deferred, match="handoff"):
+        await publisher.report_context(store.task(task_id), result, run_dir)
+    assert not run_dir.exists()
+    post("/gongcao step")
+    count = len(store.runs(task_id))
+    worktrees = sorted((store.root / "worktrees").iterdir())
+    scheduler = Scheduler(store, config, github)
+    for _ in range(3):
+        await scheduler.advance(task_id)
+    assert len(store.runs(task_id)) == count
+    assert sorted((store.root / "worktrees").iterdir()) == worktrees
+    assert not store.db.execute("SELECT 1 FROM retries WHERE task_id=?", (task_id,)).fetchone()
+    history = await instructions(store.task(task_id))
+    offline = False
+    monkeypatch.setattr(github, "mutate", mutate)
+    restarted = Store(store.root)
+    try:
+        reader = Discovery(restarted, config, github)
+        await reader.publish(reader.records()[0])
+        context = await reader.report_context(restarted.task(task_id), result, run_dir)
+        assert len(context["reference"]["parts"]) > 1
+        text = (run_dir / "home" / Path(context["details_file"]).name).read_text()
+        assert result["basis"][0] in text and result["next_steps"][0] in text
+        comments = await instructions(restarted.task(task_id))
+        assert comments[: len(history)] == history
+        await reader.publish(reader.records()[0])
+        assert await instructions(restarted.task(task_id)) == comments
+        assert restarted.db.execute("PRAGMA user_version").fetchone()[0] == 5
+    finally:
+        restarted.close()
+    monkeypatch.setattr(github, "instructions", instructions)
+    publisher = Discovery(store, config, github)
     calls = 0
 
     async def unavailable(*args, **kwargs):
@@ -523,15 +594,16 @@ async def test_retry_order_uses_comment_ids_not_collection_order(store, task_id,
     assert receipts["github:99"]["status"] == "superseded"
 
 
+@pytest.mark.parametrize("command", ["retry", "step"])
 async def test_retry_rechecks_barrier_under_the_consumption_transaction(
-    store, task_id, blocked, monkeypatch
+    store, task_id, blocked, monkeypatch, command
 ):
     from contextlib import contextmanager
 
     from gongcao.control import bind
 
     config, github, post, status, step = blocked
-    candidate = post("/gongcao retry")
+    candidate = post("/gongcao " + command)
     old_transaction = Controls.transaction
     armed = False
     barrier = Controls.retry_barrier

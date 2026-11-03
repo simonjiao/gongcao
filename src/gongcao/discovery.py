@@ -18,12 +18,59 @@ from .control import Controls, baseline
 from .events import Redactor, task_event
 from .github import Deferred, GitHub, Target, background
 from .model import Stage, State
+from .plan import digest
 from .processes import CleanupError, NotStarted
 from .recovery import Recovery
 from .store import Store
 from .workspace import clone_prefix, prepare_repository
 
 LOG = logging.getLogger(__name__)
+HANDOFF_MARKER = "\n<!-- gongcao-handoff -->\n```json\n"
+
+
+def detailed_reports(event: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Public structured reports only; never quality stdout, private logs or contexts."""
+    reports = {
+        "run:" + run["id"]: {
+            "role": run["role"],
+            "sha": run["target_sha"],
+            "request": run["details"].get("source", {}).get("baseline"),
+            "report": json.loads(run["result"]),
+        }
+        for run in event["runs"]
+        if run["result"]
+    }
+    if (advice := event.get("coordination")) and advice.get("status") == "completed":
+        reports["coordination:" + advice["fingerprint"]] = advice["binding"] | {
+            "report": advice["report"]
+        }
+    return {
+        key: Redactor().clean(value)
+        for key, value in reports.items()
+        if len(json.dumps(value["report"], ensure_ascii=False)) > 4000
+    }
+
+
+def handoff_records(event: dict[str, Any], body: str | None = None) -> dict[str, Any]:
+    try:
+        published = (
+            json.JSONDecoder().raw_decode(body.rsplit(HANDOFF_MARKER, 1)[1])[0]
+            if body is not None
+            else detailed_reports(event)
+        )
+    except (IndexError, ValueError):
+        return {}
+    if not isinstance(published, dict):
+        return {}
+    return {
+        key: {
+            "sha": value["sha"],
+            "request": value["request"],
+            "report_hash": digest(value["report"]),
+        }
+        for key, value in detailed_reports(event).items()
+        if published.get(key) == value
+    }
 
 
 def lock_path(repo: str) -> Path:
@@ -48,6 +95,24 @@ class Discovery:
 
     def records(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.store.db.execute("SELECT * FROM claims ORDER BY url")]
+
+    def manual(self, task_id: int) -> None:
+        """Explicit registration owns a status anchor, never an intake claim."""
+        task = self.store.task(task_id)
+        data = {
+            "kind": "manual",
+            "repo": task["snapshot"]["repository"],
+            "base_sha": task["target_sha"],
+            "mode": task["control"]["mode"],
+            "marker": f"<!-- gongcao:controller={self.controller};task={task['url']} -->",
+            "attempted": False,
+        }
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT OR IGNORE INTO claims(url,data,task_id) VALUES(?,?,?)",
+                (task["url"], json.dumps(data), task_id),
+            )
+            self.store.progress(task_id)
 
     def save(self, url: str, **values: Any) -> None:
         assert not values.keys() - {
@@ -149,6 +214,8 @@ class Discovery:
             try:
                 if row["task_id"] is None:
                     await self.claim(row)
+                elif not row["confirmed"]:
+                    await self.publish(row)
                 else:
                     if facts_due:
                         await self.lifecycle(row["task_id"])
@@ -466,21 +533,34 @@ class Discovery:
     async def _claim(self, row: dict[str, Any]) -> None:
         data = json.loads(row["data"])
         target = Target.parse(row["url"])
+        manual = data.get("kind") == "manual"
+        if manual and "actor" not in data:
+            data["actor"] = (await self.github.read("user"))["login"].lower()
+            self.store.claim_data(row["url"], lambda current: current.update(actor=data["actor"]))
+            row["data"] = json.dumps(data)
         comments = await self.github.instructions({"url": row["url"]})
         item = await self.owned(row, comments)
         if item is None:
             if data["attempted"]:
                 raise ValueError("Unconfirmed claim POST; refusing replay or Agent execution")
-            if not self.config.discovery.enabled:
+            if not manual and not self.config.discovery.enabled:
                 raise ValueError("Discovery disabled; retaining the planned claim without a POST")
-            await self.eligible(target, data["label"], data["marker"], comments=comments)
+            if not manual:
+                await self.eligible(target, data["label"], data["marker"], comments=comments)
             body = (
                 data["marker"]
-                + f"\nGongcao claim pending confirmation. Mode: {data['mode']}."
+                + (
+                    "\nGongcao 手工登记状态锚点。"
+                    if manual
+                    else "\nGongcao claim pending confirmation."
+                )
+                + f" Mode: {data['mode']}."
                 + f" SHA: `{data['base_sha']}`"
             )
             data["attempted"] = True
-            self.save(row["url"], data=json.dumps(data), intent=body)
+            with Controls(self.store).transaction():
+                self.store.claim_data(row["url"], lambda current: current.update(attempted=True))
+                self.store.db.execute("UPDATE claims SET intent=? WHERE url=?", (body, row["url"]))
             try:
                 response = await self.github.mutate(
                     f"repos/{target.repository}/issues/{target.number}/comments", {"body": body}
@@ -489,7 +569,11 @@ class Discovery:
                 row["comment_id"] = response["id"]
             except Deferred:
                 data["attempted"] = False
-                self.save(row["url"], data=json.dumps(data), intent="")
+                with Controls(self.store).transaction():
+                    self.store.claim_data(
+                        row["url"], lambda current: current.update(attempted=False)
+                    )
+                    self.store.db.execute("UPDATE claims SET intent='' WHERE url=?", (row["url"],))
                 raise
             except Exception:
                 item = await self.owned(row)
@@ -501,6 +585,8 @@ class Discovery:
         if item is None or not expected or item["body"] != expected:
             raise ValueError("Claim content was not confirmed; Agent execution is prohibited")
         self.save(row["url"], comment_id=item["id"], confirmed=item["body"], intent="")
+        if manual:
+            return
         # A confirmed claim survives label removal; lifecycle changes remain a registration gate.
         snapshot = self.github.facts(
             target, await self.github.read(f"repos/{target.repository}/issues/{target.number}")
@@ -546,6 +632,7 @@ class Discovery:
         task = event["task"] if event else self.store.task(row["task_id"])
         control = task["control"]
         runs = event["runs"] if event else self.store.runs(task["id"])
+        details = detailed_reports(event) if event else {}
         retry_available = bool(
             runs and runs[-1]["details"].get("source", {}).get("baseline") == baseline(task)
         )
@@ -555,16 +642,16 @@ class Discovery:
             else "pending"
         )
         action = (
-            "Post a new authorized `/gongcao step` or `/gongcao auto` comment on this Issue"
+            "在本登记对象发新的 /gongcao step，推进一个业务阶段"
             if task["state"] == State.WAITING_INSTRUCTION
-            else "Supply missing inputs, then post a new authorized `/gongcao retry` comment"
+            else "补齐所列材料后，在本登记对象发新的 /gongcao step；高级命令 /gongcao retry 仍可用"
             if task["state"] in {State.HUMAN, State.FAILED, State.WAITING_ENVIRONMENT}
             and task["snapshot"].get("state") == "open"
             and not task["cancel_requested"]
             and retry_available
-            else "Reconciliation required; retry cannot bypass unverified provenance or cleanup"
+            else "需人工核对来源、进程清理或未知写入；step 不能绕过核验"
             if task["state"] in {State.RECONCILE, State.HUMAN}
-            else "Await human merge"
+            else "已完成自动流程，等待所有者人工合并"
             if task["stage"] == Stage.MERGEABLE
             else task["reason"][:2000] or "Controller will advance within the configured policy"
         )
@@ -580,6 +667,32 @@ class Discovery:
             f"PR: {pull}\nTarget SHA: `{task['target_sha']}`\nNext / reason: {action}"
             f"\nReason: {task['reason'][:2000] or '-'}"
         )
+        if step := event.get("step") if event else Controls(self.store).step_result(task["id"]):
+            body += (
+                "\n本次 Step："
+                + {
+                    "advanced": "已推进一个阶段",
+                    "checked": "只读核对完成，未推进阶段",
+                    "blocked": "本次仍受阻，需新 Step 才会再尝试",
+                }[step["status"]]
+            )
+            body += "; " + step["reason"][:1000]
+        from .coordination import current
+
+        advice = event.get("coordination") if event else current(self.store, task["id"])
+        if (
+            advice
+            and advice.get("status") == "completed"
+            and "coordination:" + advice["fingerprint"] not in details
+        ):
+            report = advice["report"]
+            body += "\n协调 Agent 建议（非控制器确认事实，不构成执行授权）："
+            body += "\n依据：" + "; ".join(report["facts"])
+            body += "\n阻塞分析：" + "; ".join(report["blockers"])
+            body += "\n建议：" + "; ".join(
+                f"{s['action']}；责任方={s['owner']}；所需输入={s['inputs']}"
+                for s in report["suggestions"]
+            )
         if event and (corrects := event.get("corrects")):
             body += (
                 f"\nCorrection of event `{corrects['event_id']}`: "
@@ -595,9 +708,9 @@ class Discovery:
                 f" · report: `{result.get('conclusion', 'unavailable')}`"
                 "\nA session ending does not complete the business stage or acceptance gates."
             )
-            if result:
+            if result and "run:" + run["id"] not in details:
                 body += (
-                    "\nAgent report excerpts (full report retained locally): "
+                    "\nAgent report (self-reported, not controller acceptance): "
                     + result["summary"][:4000]
                 )
                 body += "\nReported checks/basis: " + "; ".join(result["basis"])[:6000]
@@ -658,7 +771,107 @@ class Discovery:
             )
         else:
             body += "\nController acceptance: NOT_RUN (no current-version check evidence)"
+        published = json.loads(
+            self.store.db.execute("SELECT data FROM claims WHERE url=?", (row["url"],)).fetchone()[
+                0
+            ]
+        ).get("handoffs", {})
+        fresh = {}
+        for key, value in details.items():
+            ref = published.get(key, {})
+            if all(
+                ref.get(k) == v
+                for k, v in {
+                    "sha": value["sha"],
+                    "request": value["request"],
+                    "report_hash": digest(value["report"]),
+                }.items()
+            ):
+                body += (
+                    "\n详细交接引用："
+                    + ", ".join(part["url"] for part in ref["parts"])
+                    + "（原 sha/request，非执行授权）"
+                )
+            else:
+                fresh[key] = value
+        if fresh:
+            body += (
+                "\n详细交接（Agent 报告/协调建议，不是控制器验收或执行授权；"
+                "sha/request 标识原始版本）："
+                + HANDOFF_MARKER
+                + json.dumps(fresh, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
         return Redactor().text(body)
+
+    async def report_context(
+        self, task: dict[str, Any], report: dict[str, Any] | None, run_dir: Path
+    ) -> dict[str, Any] | None:
+        """Resolve a confirmed public record; short/unpublished reports keep their context."""
+        if report is None:
+            return None
+        if len(json.dumps(report, ensure_ascii=False)) > 4000:
+            with self.store.db:
+                self.store.progress(task["id"])
+            await self.handoff(task["id"])
+        row = self.store.db.execute(
+            "SELECT data FROM claims WHERE task_id=?", (task["id"],)
+        ).fetchone()
+        data = json.loads(row[0]) if row else {}
+        report_hash = digest(Redactor().clean(report))
+        if any(
+            value["report_hash"] == report_hash
+            and value["sha"] == task["target_sha"]
+            and value["request"] == baseline(task)
+            for event in data.get("progress", [])
+            for value in event.get("handoff_records", handoff_records(event)).values()
+        ):
+            raise Deferred("GitHub handoff is pending confirmed publication/readback")
+        references = data.get("handoffs", {}).values()
+        for ref in references:
+            if (
+                ref["report_hash"] != report_hash
+                or ref["sha"] != task["target_sha"]
+                or ref["request"] != baseline(task)
+            ):
+                continue
+            if data.get("status_retry", {}).get("next_at", 0) > time.time():
+                raise Deferred("GitHub handoff readback is waiting for synchronization backoff")
+            target = Target.parse(task["url"])
+            text = []
+            for part in ref["parts"]:
+                try:
+                    item = await self.github.read(
+                        f"repos/{target.repository}/issues/comments/{part['comment_id']}"
+                    )
+                except (ConnectionError, TimeoutError, PermissionError) as exc:
+                    self.warning(task["url"], exc)
+                    raise Deferred("GitHub handoff readback is unavailable; verify access") from exc
+                if (
+                    item["id"] != part["comment_id"]
+                    or item["user"].get("id") != part["actor_id"]
+                    or item["user"]["login"].lower() != part["actor"]
+                    or digest(item["body"]) != part["body_hash"]
+                    or item.get("updated_at") != part["updated_at"]
+                ):
+                    raise ValueError(
+                        "GitHub handoff author/content changed; refusing stale handoff"
+                    )
+                text.append(item["body"][part["prefix"] :])
+            body = "".join(text)
+            if digest(body) != ref["content_hash"]:
+                raise ValueError("GitHub handoff parts do not match the confirmed record")
+            home = run_dir / "home"
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            name = f"handoff-{ref['comment_id']}.txt"
+            (home / name).write_text(body)
+            return {
+                "source": "confirmed_github_comment",
+                "reference": ref,
+                "summary": Redactor().text(report.get("summary", "Detailed report"))[:600],
+                "details_file": f"/home/agent/{name}",
+            }
+        return report
 
     async def handoff(self, task_id: int) -> None:
         """Await the sole status publisher even while serve holds the discovery lock."""
@@ -680,7 +893,20 @@ class Discovery:
         finally:
             background.reset(token)
 
-    async def _publish_locked(self, row: dict[str, Any]) -> None:
+    async def reconcile_status(self, task_id: int) -> None:
+        """Recovery observes uncertain comments without sending any new feedback."""
+        for row in self.records():
+            if row["task_id"] != task_id:
+                continue
+            data = json.loads(row["data"])
+            if (
+                row["intent"]
+                or (data.get("attempted") and not row["confirmed"])
+                or any(e["attempted"] for e in data.get("progress", []))
+            ):
+                await self._publish_locked(row, read_only=True)
+
+    async def _publish_locked(self, row: dict[str, Any], *, read_only: bool = False) -> None:
         # Foreground handoff and the background ticker share one persistent event queue.
         key = hashlib.sha256(row["url"].encode()).hexdigest()
         with (self.store.root / f"status-{key}.lock").open("a") as lock:
@@ -693,18 +919,29 @@ class Discovery:
             current = self.store.db.execute(
                 "SELECT * FROM claims WHERE url=?", (row["url"],)
             ).fetchone()
-            await self._publish(dict(current))
+            if (
+                not read_only
+                and not current["confirmed"]
+                and json.loads(current["data"]).get("kind") == "manual"
+            ):
+                await self.claim(dict(current))
+                current = self.store.db.execute(
+                    "SELECT * FROM claims WHERE url=?", (row["url"],)
+                ).fetchone()
+            await self._publish(dict(current), read_only=read_only)
             self.store.claim_data(row["url"], lambda data: data.pop("status_retry", None))
 
-    async def _publish(self, row: dict[str, Any]) -> None:
+    async def _publish(self, row: dict[str, Any], *, read_only: bool = False) -> None:
         item = await self.owned(row)
         if item is None:
             raise ValueError("Claim comment is missing")
         if row["intent"]:
             if item["body"] != row["intent"]:
                 raise ValueError("Unconfirmed status PATCH; refusing replay")
-            self.save(row["url"], confirmed=item["body"], intent="", reason="")
-            row.update(confirmed=item["body"], intent="")
+            self.save(
+                row["url"], comment_id=item["id"], confirmed=item["body"], intent="", reason=""
+            )
+            row.update(comment_id=item["id"], confirmed=item["body"], intent="")
         if item["body"] != row["confirmed"]:
             raise ValueError("Owned status comment was edited outside the recorded intent")
         while True:
@@ -722,6 +959,35 @@ class Discovery:
                     return
             event = queue[0]
             body = event.get("body") or self.render(row, event)
+            if not read_only and not event["attempted"] and len(body.encode()) > 50_000:
+                # Freeze bounded parts before the first intent; each uses the original
+                # POST/readback/unknown-write protocol and the same queue head.
+                raw, chunks = body.encode(), []
+                while raw:
+                    chunk = raw[:48_000].decode("utf-8", errors="ignore")
+                    chunks.append(chunk)
+                    raw = raw[len(chunk.encode()) :]
+                parts = []
+                for index, chunk in enumerate(chunks, 1):
+                    part_id = f"{event['id']}-{index}"
+                    prefix = (
+                        f"<!-- gongcao-progress:{part_id} -->\n"
+                        f"交接 {event['id']} · {index}/{len(chunks)} · "
+                        f"SHA {event['task']['target_sha']} · request {baseline(event['task'])}\n"
+                    )
+                    parts.append({"id": part_id, "body": prefix + chunk, "prefix": len(prefix)})
+                planned = {
+                    **parts[0],
+                    "handoff_pending": parts[1:],
+                    "handoff_records": handoff_records(event, body),
+                    "handoff_content_hash": digest(body),
+                }
+
+                def plan(current: dict[str, Any], planned: dict[str, Any] = planned) -> None:
+                    current["progress"][0].update(planned)
+
+                self.store.claim_data(row["url"], plan)
+                continue
 
             async def observe(
                 event: dict[str, Any] = event, body: str = body, actor: str = data["actor"]
@@ -750,6 +1016,8 @@ class Discovery:
             if observed is None:
                 if event["attempted"]:
                     raise ValueError("Unconfirmed progress POST; refusing replay")
+                if read_only:
+                    return
 
                 def attempt(current: dict[str, Any], body: str = body) -> None:
                     current["progress"][0].update(body=body, attempted=True)
@@ -781,16 +1049,50 @@ class Discovery:
                     raise ValueError("Progress POST was not confirmed; refusing replay")
 
             assert observed is not None
+            part = {
+                "comment_id": observed["id"],
+                "url": f"{row['url']}#issuecomment-{observed['id']}",
+                "body_hash": digest(observed["body"]),
+                "actor": observed["user"]["login"].lower(),
+                "actor_id": observed["user"].get("id"),
+                "updated_at": observed.get("updated_at"),
+                "prefix": event.get("prefix", 0),
+            }
+            parts = [*event.get("handoff_confirmed", []), part]
+            references = {
+                key: value
+                | {
+                    "event_id": event["id"],
+                    "comment_id": parts[0]["comment_id"],
+                    "url": parts[0]["url"],
+                    "parts": parts,
+                    "content_hash": event.get("handoff_content_hash", digest(body)),
+                }
+                for key, value in event.get("handoff_records", handoff_records(event, body)).items()
+            }
 
             def confirm(
                 current: dict[str, Any],
                 event_id: str = event["id"],
                 comment_id: int = observed["id"],
+                references: dict[str, Any] = references,
+                parts: list[dict[str, Any]] = parts,
             ) -> None:
                 if current["progress"][0]["id"] != event_id:
                     raise ValueError("Progress queue changed before confirmation")
-                current["progress"].pop(0)
                 current["progress_last"] = {"event_id": event_id, "comment_id": comment_id}
+                if pending := current["progress"][0].get("handoff_pending"):
+                    current["progress"][0].update(
+                        **pending[0],
+                        handoff_pending=pending[1:],
+                        handoff_confirmed=parts,
+                        attempted=False,
+                    )
+                    current["progress"][0].pop("comment_id", None)
+                    return
+                current["progress"].pop(0)
+                if references:
+                    current.setdefault("handoffs", {}).update(references)
 
             self.store.claim_data(row["url"], confirm)
 

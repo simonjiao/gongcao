@@ -43,6 +43,16 @@ def test_canonical_target():
     assert Target.parse("https://github.com/a/b/pull/12/").url == "https://github.com/a/b/pull/12"
 
 
+async def test_pr_instructions_read_only_the_top_level_conversation(monkeypatch):
+    api = GitHub()
+    pages = AsyncMock(return_value=[{"id": 42, "body": "/gongcao step"}])
+    monkeypatch.setattr(api, "pages", pages)
+    assert await api.instructions({"url": "https://github.com/a/b/pull/12"}) == [
+        {"id": 42, "body": "/gongcao step"}
+    ]
+    pages.assert_awaited_once_with("repos/a/b/issues/12/comments?per_page=100")
+
+
 async def test_github_adapter_calls_get_only_and_redacts(monkeypatch):
     calls, release = [], asyncio.Event()
 

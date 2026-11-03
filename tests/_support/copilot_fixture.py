@@ -66,7 +66,7 @@ class OfflineGitHub(GitHub):
 
     async def read(self, path: str) -> Any:
         if path == "user":
-            return {"login": "owner"}
+            return {"login": "owner", "id": 1}
         if "/issues/comments/" in path:
             return next(
                 row
@@ -126,9 +126,11 @@ class OfflineGitHub(GitHub):
                 result = {
                     "id": 100 + len(rows),
                     "issue": int(path.split("/issues/")[1].split("/")[0]),
-                    "user": {"login": "owner"},
+                    "user": {"login": "owner", "id": 1},
+                    "created_at": datetime.now(UTC).isoformat(),
                     **payload,
                 }
+                result["updated_at"] = result["created_at"]
                 rows.append(result)
             else:
                 result = next(row for row in rows if row["id"] == int(path.rsplit("/", 1)[1]))

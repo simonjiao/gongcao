@@ -127,6 +127,15 @@ def test_offline_invalid_configuration_fails_before_execution(offline_checkout, 
 
 def test_discovery_configuration_defaults_and_rejections(tmp_path):
     assert not Config.load(None).discovery.enabled
+    assert not Config.load(None).coordination_enabled
+    coordination = tmp_path / "coordination.yaml"
+    coordination.write_text("coordination:\n  enabled: true\n")
+    assert Config.load(coordination).coordination_enabled
+    assert Config.load(coordination).policy_hash == Config.load(None).policy_hash
+    for raw in ("true", "[]", "{enabled: 1}", "{unknown: true}"):
+        coordination.write_text("coordination: " + raw + "\n")
+        with pytest.raises(ValueError, match="coordination"):
+            Config.load(coordination)
     for raw in (
         {"enabled": True},
         {"interval_seconds": 0},

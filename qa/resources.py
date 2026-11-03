@@ -1,6 +1,7 @@
 """Run-owned GitHub resources: persist intent, observe, and never replay an unknown write."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import shutil
@@ -8,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode
 
+from gongcao.coordination import AdvisoryProcesses
 from gongcao.events import Redactor
 from gongcao.github import GitHub, Target, command
 from gongcao.workspace import repository as validate_repository
@@ -187,10 +189,26 @@ def cleanup_local(run: Run) -> None:
 
 async def cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> None:
     try:
-        await _cleanup(run, task, github)
-    except Unconfirmed as exc:
-        run.value.update(status="needs_reconciliation", cleanup_failure=str(exc))
+        state = run.root / "state"
+        if state.is_symlink() or state.resolve() != state:
+            raise Unconfirmed("QA state path has been redirected")
+        if not state.exists():
+            # A queued Run never prepared native execution or coordination resources.
+            await _cleanup(run, task, github)
+            return
+        with (state / "coordination.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Unconfirmed("Coordination is still active; retain QA resources") from None
+            if AdvisoryProcesses.unresolved(state / "coordination-process.json") is not None:
+                raise Unconfirmed("Coordination cleanup is unconfirmed; retain QA resources")
+            await _cleanup(run, task, github)
+    except (Unconfirmed, OSError) as exc:
+        run.value.update(status="needs_reconciliation", cleaned=False, cleanup_failure=str(exc))
         run.event("cleanup-blocked", reason=str(exc))
+        if not isinstance(exc, Unconfirmed):
+            raise Unconfirmed("Cleanup access cannot be confirmed; retain QA resources") from exc
         raise
 
 
@@ -198,6 +216,28 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
     """Caller owns Run.lock; archive first, then verify all ownership before any mutation."""
     run.value["cleaned"] = False
     run.save()
+    if (run.root / "state/gongcao.sqlite3").exists():
+        from gongcao.recovery import diagnose
+        from gongcao.store import Store
+
+        state = Store(run.root / "state")
+        try:
+            if state.db.execute(
+                "SELECT 1 FROM claims WHERE intent!='' OR confirmed='' "
+                "OR COALESCE(json_array_length(data,'$.progress'),0)>0"
+            ).fetchone():
+                raise Unconfirmed("Controller feedback needs reconciliation before cleanup")
+            for peer in state.tasks():
+                settled(
+                    peer
+                    | {
+                        "runs": state.runs(peer["id"]),
+                        "evidence": state.evidence(peer["id"]),
+                        "runtime": diagnose(state, peer["id"]),
+                    }
+                )
+        finally:
+            state.close()
     if task:
         settled(task)
         if not (run.root / "cleanup-task.json").exists():
@@ -404,6 +444,18 @@ async def _cleanup(run: Run, task: dict[str, Any] | None, github: GitHub) -> Non
 
 async def reconcile(run: Run, github: GitHub) -> None:
     """An explicit read-only reconciliation never resends a pending write."""
+    if (run.root / "state/gongcao.sqlite3").exists():
+        from gongcao.config import Config
+        from gongcao.discovery import Discovery
+        from gongcao.store import Store
+
+        state = Store(run.root / "state")
+        try:
+            publisher = Discovery(state, Config(), github)
+            for task in state.tasks():
+                await publisher.reconcile_status(task["id"])
+        finally:
+            state.close()
     for key, record in list(run.value["actions"].items()):
         intent = record["intent"]
         if key == "create-issue":

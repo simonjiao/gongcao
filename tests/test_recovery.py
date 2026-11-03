@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
-from _support.github import RegisteredGitHub
+from _support.github import RegisteredGitHub, StatusGitHub
 from _support.tasks import analysis_ready, wait_for
 from _support.worker import SUCCESS, WORKER, install_worker
 
@@ -304,7 +304,8 @@ async def test_service_shutdown_leaves_interrupted_work_recoverable(
         "print(json.dumps({'kind':'thread','data':{'thread_id':'silent-live'}}),flush=True);"
         "time.sleep(60)",
     )
-    scheduler = Scheduler(store, Config(auth_file=auth_file), RegisteredGitHub(store))
+    github = StatusGitHub(store)
+    scheduler = Scheduler(store, Config(auth_file=auth_file), github)
     serving = asyncio.create_task(scheduler.serve(once=True))
     await wait_for(lambda: any(r["thread_id"] == "silent-live" for r in store.runs(task_id)))
     assert "no_progress_after_bounded_attempts" not in diagnose(store, task_id)["issues"]
@@ -314,7 +315,9 @@ async def test_service_shutdown_leaves_interrupted_work_recoverable(
     task = store.task(task_id)
     assert task["state"] == State.RECONCILE and not task["cancel_requested"]
     assert not store.runs(task_id)[-1]["evidence_valid"]
-    assert (await Recovery(store, RegisteredGitHub(store)).recover(task_id))["recovered"]
+    writes = github.writes
+    assert (await Recovery(store, github).recover(task_id))["recovered"]
+    assert github.writes == writes
     assert store.task(task_id)["state"] == State.QUEUED
 
 
