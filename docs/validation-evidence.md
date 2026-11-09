@@ -4,6 +4,13 @@
 分析候选只提供建议，控制器执行结果才是证据。支持 Python、Maven、npm 和 Make 入口。
 未知入口保留 blocked；人工确认可给出有理由的 not_applicable，不能用 Agent 报告充当通过。
 
+候选入口按真实 Git 变更路径筛选；纯文档差异不因根目录构建文件存在而强制全量代码检查。
+Issue 与当前 SHA 的 AGENTS 验收仍须由 Analyst 说明来源、适用范围及冲突，Reviewer/Validator
+独立核对；不适用项必须说明依据并使用空入口。缺少部分分析类别不额外创建必需空检查。
+文档路径本身不证明验收不适用；尚未评估的类别保留待评估占位，不能自动豁免专项验收。
+必需入口或真实执行授权缺失时保持 blocked；相同计划/环境复用等待证据，不消耗执行失败预算。
+补齐入口、明确授权或版本/环境变化后重新核验；实际进程/环境执行错误仍按原有有界退避处理。
+
 计划和结果绑定 repository、Issue/PR、base_sha、target_sha、request_hash、plan_hash 和运行环境。
 同 SHA 更换计划使旧质量结果、Reviewer、Validator 失效；旧格式仅保留为历史记录。
 已删除 quality YAML、必经 CI gate 和 Actions 结果读取，无兼容或迁移路径。

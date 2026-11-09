@@ -69,6 +69,8 @@ async def test_failure_and_missing_environment_are_distinct(store, task_id, entr
     assert verdict(result) == status
     assert result["items"][1]["status"] == status
     assert ("失败 1" if status == "failed" else "未执行/缺环境 1") in caplog.text
+    again = await quality.run(store.task(task_id), include_e2e=True)
+    assert (again["run_id"] == result["run_id"]) == (not entry)
 
 
 async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store, task_id, repo):
@@ -84,6 +86,7 @@ async def test_real_qa_requires_exact_plan_and_preserves_multiple_results(store,
     plan = quality.confirm(store.task(task_id), checks)
     blocked = await quality.run(store.task(task_id), include_e2e=True)
     assert verdict(blocked) == "blocked"
+    assert (await quality.run(store.task(task_id), include_e2e=True))["run_id"] == blocked["run_id"]
     with pytest.raises(ValueError, match="authorization"):
         await quality.run(
             store.task(task_id), include_e2e=True, real_check=2, approved_plan="stale"

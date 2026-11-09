@@ -10,7 +10,7 @@ from .events import Redactor, progress
 from .github import Deferred, GitHub
 from .leases import Lease
 from .model import Role, Stage, State, same_version
-from .quality import Quality, verdict
+from .quality import Quality, requirements_wait, verdict
 from .recovery import Recovery
 from .remote import Controlled, UncertainWrite
 from .runner import Runner
@@ -225,6 +225,7 @@ class Workflow:
                 self.store.halt(
                     task["id"], State.WAITING_ENVIRONMENT, "Required plan checks are blocked"
                 )
+                self.wait_for_requirements(task["id"], checks, include_e2e=False)
                 return
             if verdict(checks, include_e2e=False) == "failed":
                 self.revision(task, checks)
@@ -280,6 +281,7 @@ class Workflow:
                     State.WAITING_ENVIRONMENT,
                     "Required E2E/environment evidence is blocked",
                 )
+                self.wait_for_requirements(task["id"], evidence)
                 return
             run = await self.agent(task, Role.VALIDATOR, evidence)
             if run is None:
@@ -325,6 +327,18 @@ class Workflow:
                 Stage.MERGEABLE if state == State.COMPLETED else Stage.VALIDATION,
                 state,
                 "Ready for human merge" if state == State.COMPLETED else reason,
+            )
+
+    def wait_for_requirements(
+        self, task_id: int, checks: dict[str, Any], *, include_e2e: bool = True
+    ) -> None:
+        if requirements_wait(checks, include_e2e=include_e2e):
+            task = self.store.task(task_id)
+            self.store.record(
+                task,
+                "quality-wait",
+                self.config.policy_hash,
+                {"updated": task["updated"], "plan_hash": checks["plan_hash"]},
             )
 
     async def run(self, task_id: int) -> list[str]:

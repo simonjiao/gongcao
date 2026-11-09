@@ -33,12 +33,28 @@ def test_repository_and_diff_choose_entries(changed, expected):
                 }
             ),
         },
-        "diff": {"patch": f"diff --git a/{changed} b/{changed}"},
+        "diff": {"changed_files": [changed]},
     }
     plan = propose(data)
     assert {i["entry"][0] for i in plan if i["entry"]} == {expected}
     assert {i["category"] for i in plan} == {"build", "internal", "e2e"}
     assert all(i["environment"] == "controlled" for i in plan if i["category"] == "e2e")
+
+
+@pytest.mark.parametrize("changed", ["AGENTS.md", "src/service.py", "pyproject.toml"])
+def test_root_python_entries_follow_changed_scope(changed):
+    plan = propose(
+        {
+            "repository_files": ["pyproject.toml", changed],
+            "build_files": {"pyproject.toml": "ruff mypy pytest"},
+            "diff": {"changed_files": [changed]},
+        }
+    )
+    if changed == "AGENTS.md":
+        assert all(item["required"] and not item["entry"] for item in plan)
+        assert all("Issue/AGENTS applicability assessment" in item["reason"] for item in plan)
+    else:
+        assert {i["entry"][3] for i in plan if i["entry"]} == {"ruff", "mypy", "pytest"}
 
 
 async def test_plan_context_and_analysis_suggestions_are_not_results(store, task_id, repo):
@@ -49,7 +65,7 @@ async def test_plan_context_and_analysis_suggestions_are_not_results(store, task
     plan = await quality.plan(task)
     assert plan["base_sha"] == plan["target_sha"] == task["target_sha"]
     assert store.artifact(task_id, "quality-results", plan["plan_hash"]) is None
-    assert any(not i["entry"] and "assessment" in i["reason"] for i in plan["items"])
+    assert not any(i["category"] == "internal" and not i["entry"] for i in plan["items"])
     quality.confirm(task, propose(data))
     result = await quality.run(task)
     assert verdict(result, include_e2e=False) == "passed" and verdict(result) == "blocked"
@@ -111,6 +127,10 @@ async def test_analyst_cannot_relabel_offline_tests_as_real_e2e(store, task_id):
     checks = items(["true"])
     checks[-1].update(required=True, entry=["pytest", "tests/test_control_cli.py"])
     with pytest.raises(ValueError, match="real E2E.*controlled"):
+        Quality(store, Config()).confirm(store.task(task_id), checks)
+    checks = items([])
+    checks[0]["required"] = False
+    with pytest.raises(ValueError, match="Not-applicable.*empty entry"):
         Quality(store, Config()).confirm(store.task(task_id), checks)
 
 
@@ -239,9 +259,28 @@ async def test_invalid_analysis_cannot_fill_a_current_plan(store, task_id):
     assert all(item["reason"] != "STALE_ANALYSIS_SENTINEL" for item in renewed["items"])
 
 
-async def test_new_isolation_policy_rejects_previously_cached_pass(store, task_id):
+async def test_partial_analysis_does_not_invent_required_checks(store, task_id):
+    task = store.task(task_id)
+    run = store.begin_run(task_id, Role.ANALYST)
+    proposal = [items([])[-1]]
+    store.finish(
+        run,
+        State.COMPLETED,
+        Stage.REVIEW,
+        State.QUEUED,
+        "partial assessment",
+        json.dumps({"target_sha": task["target_sha"], "validation_plan": proposal}),
+    )
+    quality = Quality(store, Config())
+    plan = await quality.plan(store.task(task_id))
+    assert not any(i["required"] and not i["entry"] for i in plan["items"])
+    assert verdict(await quality.run(store.task(task_id), include_e2e=True)) == "passed"
+
+
+@pytest.mark.parametrize("policy", ["quality_isolation", "plan_applicability"])
+async def test_new_quality_policy_rejects_previously_cached_pass(store, task_id, policy):
     old = Quality(store, Config())
-    old.runtime.pop("quality_isolation")
+    old.runtime.pop(policy)
     before = old.confirm(store.task(task_id), items(["true"]))
     previous_result = await old.run(store.task(task_id), include_e2e=True)
     assert verdict(previous_result) == "passed"

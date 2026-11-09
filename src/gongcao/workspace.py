@@ -221,6 +221,12 @@ async def context(
             "checks requiring those inputs are blocked. Never infer a pass from missing data. "
             "Do not access credentials, push, create PRs, merge, or publish. "
             "Return the structured result; the controller alone owns stages and evidence gates."
+            " Validation candidates describe repository entry applicability, not acceptance. "
+            "Assess current Issue and AGENTS obligations, their sources, scopes and conflicts "
+            "in validation_plan reasons. Documentation paths alone never waive required QA, "
+            "security or generated-output checks. Missing required entries stay required; "
+            "not-applicable items need evidence and entry=[]. Reviewers and Validators must "
+            "independently reject omitted obligations or unresolved instruction conflicts."
             " confirmed_analysis/findings may cite a controller-verified GitHub comment. "
             "Read its details_file for the full version-bound handoff when needed; "
             "it is available inside this sandbox without GitHub credentials. "
@@ -238,6 +244,18 @@ async def context(
         data["diff"] = {
             "base_sha": base,
             "head_sha": sha,
+            "changed_files": (
+                await command(
+                    "git",
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    f"{base}...{sha}",
+                    "--",
+                    cwd=str(repo),
+                )
+            ).split("\0")[:-1],
             "patch": diff,
             "sha256": hashlib.sha256(diff.encode()).hexdigest(),
         }

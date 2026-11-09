@@ -31,6 +31,7 @@ class Quality:
             "python": platform.python_version(),
             "platform": platform.platform(),
             "quality_isolation": "target-source-v1",
+            "plan_applicability": "changed-scope-v1",
         }
 
     def confirm(
@@ -44,6 +45,10 @@ class Quality:
         checks = [Check.model_validate(item).model_dump() for item in items]
         if {item["category"] for item in checks} != {"build", "internal", "e2e"}:
             raise ValueError("Plan must explicitly cover build, internal and e2e")
+        if any(not item["required"] and item["entry"] for item in checks):
+            raise ValueError(
+                "Not-applicable checks must have an empty entry and an evidence reason"
+            )
         if any(
             i["category"] == "e2e" and i["required"] and i["environment"] != "controlled"
             for i in checks
@@ -162,16 +167,6 @@ class Quality:
                 same["required"] |= item["required"]
                 same["scope"] = list(dict.fromkeys([*same["scope"], *item["scope"]]))
                 same["reason"] += "; " + item["reason"]
-        if {i["category"] for i in proposal} != {"build", "internal", "e2e"}:
-            items.append(
-                Check(
-                    category="internal",
-                    entry=[],
-                    scope=["Issue", "AGENTS.md"],
-                    required=True,
-                    reason="Current-SHA Issue and repository acceptance assessment required",
-                ).model_dump()
-            )
         return self.confirm(task, items, source="repository", analysis_hash=digest(proposal))
 
     async def run(
@@ -189,7 +184,10 @@ class Quality:
         if real_check is not None and approved_plan != plan["plan_hash"]:
             raise ValueError("Explicit real QA authorization must name the current plan hash")
         cached = self.store.artifact(task["id"], "quality-results", plan["plan_hash"])
-        if cached and verdict(cached, include_e2e=include_e2e) == "passed":
+        if cached and (
+            verdict(cached, include_e2e=include_e2e) == "passed"
+            or (real_check is None and requirements_wait(cached, include_e2e=include_e2e))
+        ):
             return cached
         commands = plan["items"]
         self.store.transition(
@@ -200,10 +198,8 @@ class Quality:
         directory.mkdir(parents=True, mode=0o700)
         workspace = self.store.root / "worktrees" / key
         repo = Path(task["repo_path"])
-        await worktree(repo, workspace, task["target_sha"], Role.DEVELOPER, key)
         sandbox = Sandbox(workspace, directory, Role.DEVELOPER, controller_runtime=False)
-        sandbox.prepare(self.config, authentication=False)
-        isolation = await sandbox.verify(repo)
+        isolation: dict[str, Any] = {}
         started = time.time()
         results = []
         tainted = False
@@ -228,6 +224,10 @@ class Quality:
                     }
                 )
                 continue
+            if not isolation:
+                await worktree(repo, workspace, task["target_sha"], Role.DEVELOPER, key)
+                sandbox.prepare(self.config, authentication=False)
+                isolation = await sandbox.verify(repo)
             argv = item["entry"]
             command_started = time.time()
             expanded = [
@@ -408,3 +408,20 @@ def verdict(data: dict[str, Any], *, include_e2e: bool = True) -> str:
     if any(item["status"] == "failed" for item in required):
         return "failed"
     return "passed" if all(item["status"] == "passed" for item in required) else "blocked"
+
+
+def requirements_wait(data: dict[str, Any], *, include_e2e: bool = True) -> bool:
+    """Only unexecuted missing entries/permissions wait for a changed prerequisite."""
+    pending = [
+        item
+        for item in data["items"]
+        if item["required"]
+        and (include_e2e or item["category"] != "e2e")
+        and item["status"] != "passed"
+    ]
+    return bool(pending) and all(
+        item["status"] == "blocked"
+        and "exit_code" not in item
+        and (not item["entry"] or item["environment"] == "controlled")
+        for item in pending
+    )

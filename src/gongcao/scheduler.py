@@ -66,6 +66,16 @@ class Scheduler:
             return
         if task["state"] not in {State.FAILED, State.WAITING_ENVIRONMENT}:
             return
+        waiting = self.store.artifact(task_id, "quality-wait", self.config.policy_hash)
+        plan = self.store.artifact(task_id, "quality-plan", self.config.policy_hash)
+        if (
+            task["state"] == State.WAITING_ENVIRONMENT
+            and waiting
+            and plan
+            and waiting["plan_hash"] == plan["plan_hash"]
+            and waiting["updated"] == task["updated"]
+        ):
+            return
         previous = self.store.db.execute(
             "SELECT * FROM retries WHERE task_id=?", (task_id,)
         ).fetchone()

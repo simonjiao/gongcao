@@ -3,12 +3,109 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
+from _support.worker import WORKER, install_worker
 
-from gongcao.github import Deferred
+from gongcao.control import Controls
+from gongcao.github import Deferred, command
 from gongcao.model import Stage, State
 from gongcao.quality import Quality
 from gongcao.scheduler import Scheduler
 from gongcao.workflow import Workflow
+
+
+@pytest.mark.parametrize(
+    "acceptance", ["documentation", "required_entry", "required_e2e", "conflict"]
+)
+async def test_documentation_workflow_preserves_acceptance_and_waits_without_retries(
+    store, task_id, repo, fixture_github, policy, monkeypatch, acceptance
+):
+    instructions = (
+        "Run pytest before every change, including documentation."
+        if acceptance == "conflict"
+        else "Documentation-only edits need independent document review."
+    )
+    (repo / "AGENTS.md").write_text(instructions + "\n")
+    (repo / "pyproject.toml").write_text("[tool.ruff]\n[tool.mypy]\n[tool.pytest.ini_options]\n")
+    await command("git", "add", ".", cwd=str(repo))
+    await command("git", "commit", "-qm", "Document task baseline", cwd=str(repo))
+    fixture_github.sha = (await command("git", "rev-parse", "HEAD", cwd=str(repo))).strip()
+    fixture_github.issue.update(
+        head_sha=fixture_github.sha,
+        body="Update only AGENTS.md; inspect the document diff; do not run code tests.",
+        labels=[{"name": "agent-ready"}],
+    )
+    if acceptance in {"required_entry", "required_e2e"}:
+        fixture_github.issue["body"] += " A separate real acceptance entry is mandatory."
+    store.sync(task_id, fixture_github.issue)
+    worker = WORKER.replace(
+        "sample.write_text('complete\\n' if data['confirmed_findings'] else 'incomplete\\n')",
+        "p = pathlib.Path('/workspace/AGENTS.md'); p.write_text(p.read_text()+'Minimum tests.\\n')",
+    )
+    worker = worker.replace(
+        "print(json.dumps({'kind':'thread'",
+        f"""
+if data.get('diff', {{}}).get('changed_files'):
+    assert data['diff']['changed_files'] == ['AGENTS.md']
+    assert all(i['required'] and not i['entry'] for i in data['validation_candidates'])
+    for item in plan:
+        item.update(required=False, entry=[], scope=['Issue', 'AGENTS.md'],
+                    reason='Issue limits edits to docs; AGENTS requires document review')
+    if {acceptance == "required_e2e"!r}:
+        plan = [i for i in plan if i['category'] != 'e2e']  # Missing assessment cannot waive QA.
+if role == 'analyst' and {acceptance == "required_entry"!r}:
+    for item in plan:
+        if item['category']=='internal':
+            item.update(required=True, entry=[], reason='Issue requires a separate entry')
+if role in ('reviewer','validator'):
+    assert 'do not run code tests' in data['github']['body']
+    assert {instructions!r} in data['repository_instructions']
+    assert ({acceptance == "required_entry"!r} or
+            not any(i.get('argv') for i in data['quality_evidence']['items']))
+    if {acceptance == "conflict"!r}:
+        conclusion = 'blocked'
+print(json.dumps({{'kind':'thread'""",
+    )
+    install_worker(monkeypatch, worker)
+    Controls(store).issue(task_id, "auto", policy=policy.policy_hash)
+    scheduler = Scheduler(store, policy, fixture_github)
+    await scheduler.advance(task_id)
+    task = store.task(task_id)
+    assert not list((store.root / "worktrees").glob("check-*"))
+    if acceptance == "conflict":
+        assert task["stage"] == Stage.REVIEW and task["state"] == State.HUMAN
+        assert not any(r["role"] == "validator" for r in store.runs(task_id))
+    elif acceptance in {"required_entry", "required_e2e"}:
+        assert task["stage"] == (
+            Stage.REVIEW if acceptance == "required_entry" else Stage.VALIDATION
+        )
+        assert task["state"] == State.WAITING_ENVIRONMENT
+        quality = Quality(store, policy)
+        plan = await quality.plan(task)
+        result = store.artifact(task_id, "quality-results", plan["plan_hash"])
+        runs = store.runs(task_id)
+        for _ in range(4):
+            await scheduler.advance(task_id)
+            assert store.task(task_id)["state"] == State.WAITING_ENVIRONMENT
+        assert store.runs(task_id) == runs
+        assert (
+            store.artifact(task_id, "quality-results", plan["plan_hash"])["run_id"]
+            == result["run_id"]
+        )
+        assert store.db.execute("SELECT count(*) FROM retries").fetchone()[0] == 0
+        if acceptance == "required_e2e":
+            e2e = next(i for i in result["items"] if i["category"] == "e2e")
+            assert e2e["required"] and e2e["status"] == "blocked"
+            assert not any(r["role"] == "validator" for r in runs)
+            return
+        for item in plan["items"]:
+            if item["category"] == "internal":
+                item["entry"] = ["test", "-f", "AGENTS.md"]
+        quality.confirm(store.task(task_id), plan["items"])
+        await scheduler.advance(task_id)
+    if acceptance != "conflict":
+        assert store.task(task_id)["stage"] == Stage.MERGEABLE
+        assert store.task(task_id)["state"] == State.COMPLETED
+    assert store.db.execute("SELECT count(*) FROM retries").fetchone()[0] == 0
 
 
 async def test_worktrees_review_revision_and_quality_reach_human_merge(

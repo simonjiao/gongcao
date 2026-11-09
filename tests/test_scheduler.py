@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from _support.cli import GONGCAO, cli_env, events, run_cli
 from _support.github import RegisteredGitHub, StatusGitHub
+from _support.quality import items
 from _support.tasks import analysis_ready, register_more, wait_for
 from _support.worker import SUCCESS, install_worker
 
@@ -17,7 +18,8 @@ from gongcao.config import Config
 from gongcao.control import Controls
 from gongcao.github import Deferred
 from gongcao.leases import Lease
-from gongcao.model import State
+from gongcao.model import Stage, State
+from gongcao.quality import Quality
 from gongcao.recovery import Recovery, diagnose
 from gongcao.remote import Controlled
 from gongcao.scheduler import Scheduler
@@ -73,25 +75,44 @@ async def test_parallel_developers_write_distinct_worktrees_and_leave_source_unc
         await running
 
 
+@pytest.mark.parametrize("failure", ["agent", "environment"])
 async def test_scheduler_stops_after_three_failures_and_manual_retry_preserves_history(
-    store, task_id, auth_file, monkeypatch
+    store, task_id, sha, auth_file, monkeypatch, failure
 ):
     install_worker(monkeypatch, "import sys;sys.stdin.readline();raise SystemExit(7)")
     github = StatusGitHub(store)
     scheduler = Scheduler(store, Config(auth_file=auth_file), github)
-    for _ in range(3):
+    if failure == "environment":
+        analysis_ready(store, task_id, sha)
+        store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "Ready for checks")
+        Quality(store, scheduler.config).confirm(
+            store.task(task_id), items(["missing-check-entry"])
+        )
+    expected_runs = 1 if failure == "environment" else 3
+    for attempt in range(1, 4):
         await scheduler.serve(once=True)
+        retry = store.db.execute("SELECT * FROM retries WHERE task_id=?", (task_id,)).fetchone()
+        assert retry["failures"] == attempt
+        assert (retry["next_at"] > time.time()) == (attempt < 3)
         with store.db:
             store.db.execute("UPDATE retries SET next_at=0")
-    assert len(store.runs(task_id)) == 3
+    assert len(store.runs(task_id)) == expected_runs
+    if failure == "environment":
+        results = [
+            a["data"]
+            for a in store.evidence(task_id)["artifacts"]
+            if a["kind"] == "quality-results"
+        ]
+        assert len({r["run_id"] for r in results}) == 3
+        assert all(r["items"][1]["exit_code"] == 127 for r in results)
     assert store.task(task_id)["state"] == State.HUMAN
     await scheduler.serve(once=True)
-    assert len(store.runs(task_id)) == 3
+    assert len(store.runs(task_id)) == expected_runs
     assert "no_progress_after_bounded_attempts" in diagnose(store, task_id)["issues"]
     assert (await Recovery(store, github).retry(task_id))["recovered"]
     assert store.task(task_id)["state"] == State.QUEUED
-    assert len(store.runs(task_id)) == 3
-    assert not any(r["evidence_valid"] for r in store.runs(task_id))
+    assert len(store.runs(task_id)) == expected_runs
+    assert all(r["evidence_valid"] == (failure == "environment") for r in store.runs(task_id))
 
 
 async def test_occupied_capacity_does_not_spend_retry_budget(store, task_id, repo, sha, snapshot):

@@ -46,7 +46,10 @@ def binding(task: dict[str, Any]) -> dict[str, Any]:
 def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
     """Conservative controller defaults; a task-specific confirmed plan can refine them."""
     files, builds = context["repository_files"], context["build_files"]
-    changed = context.get("diff", {}).get("patch", "")
+    changed = context.get("diff", {}).get("changed_files", [])
+    documentation_only = bool(changed) and all(
+        PurePosixPath(path).suffix.lower() in {".md", ".rst"} for path in changed
+    )
     items: list[dict[str, Any]] = []
 
     def add(category: str, entry: list[str], scope: str, environment: str = "sandbox") -> None:
@@ -66,7 +69,11 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
     for path, body in builds.items():
         directory = str(PurePosixPath(path).parent)
         # A PR touching only another component does not run this component's build.
-        if changed and directory != "." and f"b/{directory}/" not in changed:
+        if documentation_only or (
+            changed
+            and directory != "."
+            and not any(PurePosixPath(name).is_relative_to(directory) for name in changed)
+        ):
             continue
         if path.endswith("pom.xml"):
             add("build", ["mvn", "-B", "-f", path, "-DskipTests", "package"], directory)
@@ -88,7 +95,8 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
             if "mypy" in body:
                 add("build", ["uv", "run", "--locked", "mypy"], ".")
             if "pytest" in body:
-                from qa.scenarios import pytest_snapshot_script
+                if "qa/scenarios.py" in files:
+                    from qa.scenarios import pytest_snapshot_script
 
                 add(
                     "internal",
@@ -110,14 +118,20 @@ def propose(context: dict[str, Any]) -> list[dict[str, Any]]:
                     add(category, ["make", target], ".")
     for category in ("build", "internal", "e2e"):
         if not any(i["category"] == category for i in items):
-            # Missing entry is evidence missing, never implicit success.
+            # Entry discovery alone cannot establish task-specific acceptance obligations.
             items.append(
                 Check(
                     category=category,  # type: ignore[arg-type]
                     entry=[],
                     scope=["."],
                     required=True,
-                    reason="No confirmed repository entry; supply a task-specific plan",
+                    reason=(
+                        f"Only documentation paths changed: {changed}; no applicable code entry. "
+                        "Current Issue/AGENTS applicability assessment required"
+                        if documentation_only
+                        else "No confirmed repository entry; task-specific acceptance assessment "
+                        "required"
+                    ),
                     environment="controlled" if category == "e2e" else "sandbox",
                 ).model_dump()
             )
