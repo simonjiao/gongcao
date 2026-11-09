@@ -75,19 +75,41 @@ async def test_parallel_developers_write_distinct_worktrees_and_leave_source_unc
         await running
 
 
-@pytest.mark.parametrize("failure", ["agent", "environment"])
-async def test_scheduler_stops_after_three_failures_and_manual_retry_preserves_history(
+@pytest.mark.parametrize("failure", ["agent", "environment", "requirements"])
+async def test_scheduler_distinguishes_requirement_waits_and_bounded_failures(
     store, task_id, sha, auth_file, monkeypatch, failure
 ):
     install_worker(monkeypatch, "import sys;sys.stdin.readline();raise SystemExit(7)")
     github = StatusGitHub(store)
     scheduler = Scheduler(store, Config(auth_file=auth_file), github)
-    if failure == "environment":
+    if failure != "agent":
         analysis_ready(store, task_id, sha)
         store.transition(store.task(task_id), Stage.REVIEW, State.QUEUED, "Ready for checks")
-        Quality(store, scheduler.config).confirm(
-            store.task(task_id), items(["missing-check-entry"])
+        quality = Quality(store, scheduler.config)
+        plan = quality.confirm(
+            store.task(task_id), items([] if failure == "requirements" else ["missing-check-entry"])
         )
+    if failure == "requirements":
+        run_ids = []
+        for _ in range(4):
+            await scheduler.serve(once=True)
+            assert store.task(task_id)["state"] == State.WAITING_ENVIRONMENT
+            run_ids.append(store.artifact(task_id, "quality-results", plan["plan_hash"])["run_id"])
+            assert dict(
+                store.db.execute(
+                    "SELECT kind,count(*) FROM artifacts "
+                    "WHERE kind IN ('quality-wait','quality-results') "
+                    "GROUP BY kind"
+                )
+            ) == {"quality-wait": 1, "quality-results": 1}
+            assert store.db.execute("SELECT count(*) FROM retries").fetchone()[0] == 0
+        assert len(set(run_ids)) == 1
+        plan["items"][1]["entry"] = ["true"]
+        quality.confirm(store.task(task_id), plan["items"])
+        resumed = await quality.run(store.task(task_id), include_e2e=True)
+        assert resumed["passed"] and resumed["run_id"] != run_ids[0]
+        assert store.task(task_id)["state"] == State.QUEUED
+        return
     expected_runs = 1 if failure == "environment" else 3
     for attempt in range(1, 4):
         await scheduler.serve(once=True)

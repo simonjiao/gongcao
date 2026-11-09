@@ -333,13 +333,25 @@ class Workflow:
         self, task_id: int, checks: dict[str, Any], *, include_e2e: bool = True
     ) -> None:
         if requirements_wait(checks, include_e2e=include_e2e):
-            task = self.store.task(task_id)
-            self.store.record(
-                task,
-                "quality-wait",
-                self.config.policy_hash,
-                {"updated": task["updated"], "plan_hash": checks["plan_hash"]},
-            )
+            with Controls(self.store).transaction():
+                task = self.store.guard(self.store.task(task_id))
+                data = {
+                    "updated": task["updated"],
+                    "plan_hash": checks["plan_hash"],
+                    "run_id": checks["run_id"],
+                    "stage": task["stage"],
+                }
+                waiting = self.store.artifact(task_id, "quality-wait", self.config.policy_hash)
+                if waiting and waiting | {"updated": task["updated"]} == data:
+                    # Refresh the classification fence, not the append-only execution evidence.
+                    self.store.db.execute(
+                        "UPDATE artifacts SET data=? WHERE id=(SELECT id FROM artifacts "
+                        "WHERE task_id=? AND sha=? AND kind='quality-wait' AND policy=? "
+                        "AND valid=1 ORDER BY id DESC LIMIT 1)",
+                        (json.dumps(data), task_id, task["target_sha"], self.config.policy_hash),
+                    )
+                else:
+                    self.store.record(task, "quality-wait", self.config.policy_hash, data)
 
     async def run(self, task_id: int) -> list[str]:
         try:

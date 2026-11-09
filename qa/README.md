@@ -31,10 +31,13 @@ protocol substitutes in regression tests are **not** real end-to-end evidence.
 
 `tests/test_workflow.py` also runs a documentation-only task through the local Git,
 Bubblewrap and SDK/GitHub protocol fixtures in explicit auto mode. It checks root
-Python entries remain inapplicable, instruction conflicts stop independent review,
+Python entries remain inapplicable, a fixture-supplied blocked review stops the controller,
 and a required missing acceptance entry waits across scheduler cycles without
 spending execution retries, then resumes after a version-bound plan supplies it.
 This offline workflow does not claim real GitHub/model acceptance.
+The conflict fixture does not prove a real Reviewer recognizes Issue #102's actual
+requirements against current AGENTS.md. Scheduler regressions also exercise normal
+serve polling: unchanged waits reuse one marker/result without spending retries.
 
 The `delivery` scenario also registers its own unmerged PR for status feedback,
 checks both manual Issue/PR anchors and append-only conversation comments,

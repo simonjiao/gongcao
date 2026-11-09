@@ -88,6 +88,12 @@ print(json.dumps({{'kind':'thread'""",
             assert store.task(task_id)["state"] == State.WAITING_ENVIRONMENT
         assert store.runs(task_id) == runs
         assert (
+            store.db.execute("SELECT count(*) FROM artifacts WHERE kind='quality-wait'").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert (
             store.artifact(task_id, "quality-results", plan["plan_hash"])["run_id"]
             == result["run_id"]
         )
