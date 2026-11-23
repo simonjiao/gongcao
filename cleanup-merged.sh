@@ -4,7 +4,7 @@ set -euo pipefail
 # 合并后收尾与本地 worktree 清理工具（不调用 agy/codex，不直接调用 gh）
 # 扫描近期已合并（merged）的 PR：
 #   1. 若 PR 或关联 Issue 仍带有非 done 的 agy:* 标签，将其切换为 agy:done；
-#   2. 在 flock 锁保护下安全清理本地对应的 issue-<N> / review-pr-<P> / e2e-pr-<P> worktree
+#   2. 在 flock 锁保护下安全清理本地对应的 issue-<N> / review-pr-<P> / e2e-pr-<P> / final-pr-<P> worktree
 #      及已合并的本地 agy/issue-<N> 分支（绝不强删未合并分支）。
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
@@ -158,12 +158,13 @@ run_cleanup_pass() {
     has_agy_non_done="$("$JQ_BIN" -r --arg prefix "$LABEL_PREFIX" --arg done_lbl "${LABEL_PREFIX}done" \
       'if any(.labels[]?.name; startswith($prefix) and . != $done_lbl) then "1" else "0" end' <<<"$row")"
 
-    local wt_issue="" wt_review wt_e2e has_local_wt=0
+    local wt_issue="" wt_review wt_e2e wt_final has_local_wt=0
     wt_review="${WORKTREE_ROOT}/review-pr-${pr_num}"
     wt_e2e="${WORKTREE_ROOT}/e2e-pr-${pr_num}"
+    wt_final="${WORKTREE_ROOT}/final-pr-${pr_num}"
     [[ -n "$issue_num" ]] && wt_issue="${WORKTREE_ROOT}/issue-${issue_num}"
 
-    if [[ -d "$wt_review" || -d "$wt_e2e" ]] || [[ -n "$wt_issue" && -d "$wt_issue" ]]; then
+    if [[ -d "$wt_review" || -d "$wt_e2e" || -d "$wt_final" ]] || [[ -n "$wt_issue" && -d "$wt_issue" ]]; then
       has_local_wt=1
     fi
 
@@ -188,6 +189,9 @@ run_cleanup_pass() {
     fi
     if [[ -d "$wt_e2e" ]]; then
       remove_worktree_safe "$wt_e2e" && removed_items+=" e2e-pr-${pr_num}"
+    fi
+    if [[ -d "$wt_final" ]]; then
+      remove_worktree_safe "$wt_final" && removed_items+=" final-pr-${pr_num}"
     fi
 
     # 仅在本地分支存在且以 BRANCH_PREFIX 开头时安全删除（用 -d 而非 -D，仅删已合并分支）

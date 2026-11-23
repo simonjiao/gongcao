@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-# 一键启动 / 管理 gongcao 全链路 tmux 流水线（4 窗口：dev / review / e2e / monitor+cleanup）
+# 一键启动 / 管理 gongcao 全链路 tmux 流水线（5 窗口：dev / review / e2e / final-gate / monitor+cleanup）
 # 用法:
 #   ./start-gongcao.sh <owner/repo> [start|attach|status|stop]
 
@@ -32,7 +32,7 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   start-gongcao.sh <owner/repo> [start|attach|status|stop]
 
 示例:
-  ./start-gongcao.sh simonjiao/airdb          # 启动 4 窗口 tmux 流水线（若已运行则直接提示）
+  ./start-gongcao.sh simonjiao/airdb          # 启动 5 窗口 tmux 流水线（若已运行则直接提示）
   ./start-gongcao.sh simonjiao/airdb attach   # 进入 tmux 面板查看
   ./start-gongcao.sh simonjiao/airdb status   # 查看会话与窗口状态
   ./start-gongcao.sh simonjiao/airdb stop     # 停止整个 tmux 会话
@@ -113,7 +113,11 @@ case "$ACTION" in
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "e2e" \
       "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-e2e-loop.sh")"
 
-    # 窗口 3：monitor（上 pane 实时总览 activity.log，下 pane 运行 cleanup-merged.sh）
+    # 窗口 3：final-gate (codex-final-gate-loop.sh: 终审对账 + 更新信息 + 自动合并)
+    "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "final-gate" \
+      "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-final-gate-loop.sh")"
+
+    # 窗口 4：monitor（上 pane 实时总览 activity.log，下 pane 运行 cleanup-merged.sh）
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "monitor" \
       "$(printf '%q' "$TAIL_BIN") -n 40 -F $(printf '%q' "$ACTIVITY_LOG")"
     "$TMUX_BIN" split-window -v -t "${SESSION_NAME}:monitor" \
@@ -122,9 +126,9 @@ case "$ACTION" in
     "$TMUX_BIN" select-window -t "${SESSION_NAME}:monitor"
 
     printf '已启动全链路 tmux 会话: %s\n' "$SESSION_NAME"
-    printf '  窗口列表 : [0] dev | [1] review | [2] e2e | [3] monitor (activity.log + cleanup-merged)\n'
+    printf '  窗口列表 : [0] dev | [1] review | [2] e2e | [3] final-gate | [4] monitor (activity.log + cleanup-merged)\n'
     printf '  进入看板 : %s attach-session -t %s\n' "$TMUX_BIN" "$SESSION_NAME"
-    printf '  切换窗口 : Ctrl+b 然后按 0/1/2/3（或 w 列表选择）\n'
+    printf '  切换窗口 : Ctrl+b 然后按 0/1/2/3/4（或 w 列表选择）\n'
     printf '  停止全部 : %s %s stop\n' "$0" "$REPO_ARG"
     ;;
 

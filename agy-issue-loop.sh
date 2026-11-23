@@ -50,9 +50,10 @@ if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
 else
   FILTER_LABEL="${FILTER_LABEL-}"
 fi
-HANDLE_CHANGES_REQUESTED="${HANDLE_CHANGES_REQUESTED:-1}" # 是否自动接回评审/E2E 打回的 agy:changes-requested（1=是，0=否）
+HANDLE_CHANGES_REQUESTED="${HANDLE_CHANGES_REQUESTED:-1}" # 是否自动接回评审/E2E/终审打回的 agy:changes-requested（1=是，0=否）
 REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
 E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
+FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-comment -->}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
 PRINT_TIMEOUT="${PRINT_TIMEOUT:-15m}"
@@ -503,16 +504,20 @@ while true; do
       "Agent 已认领该 Issue，正在独立 worktree 中分析与开发。"
   fi
 
-  # 若本轮是评审或 E2E 打回（changes-requested），拉取最新 Codex 评审 / E2E 反馈注入 prompt
+  # 若本轮是评审、E2E 或终审打回（changes-requested），拉取最新反馈注入 prompt
   review_feedback_section=""
   if (( picked_from_changes_requested == 1 )) && [[ "$GH_SYNC_ENABLED" == "1" ]]; then
     review_feedback="$(gh_state get-comment issue "$number" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
     e2e_feedback="$(gh_state get-comment issue "$number" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+    final_gate_feedback="$(gh_state get-comment issue "$number" "$FINAL_GATE_COMMENT_MARKER" 2>/dev/null || true)"
     if [[ -n "$review_feedback" ]]; then
       review_feedback_section+=$'\n\n'"### 独立代码评审反馈（请优先逐项修复以下阻塞问题）"$'\n'"${review_feedback}"
     fi
     if [[ -n "$e2e_feedback" ]]; then
       review_feedback_section+=$'\n\n'"### 独立 E2E 验收反馈（请重点修复以下端到端失败项）"$'\n'"${e2e_feedback}"
+    fi
+    if [[ -n "$final_gate_feedback" ]]; then
+      review_feedback_section+=$'\n\n'"### 终审合入门禁反馈（请优先修复以下终审阻塞项）"$'\n'"${final_gate_feedback}"
     fi
   fi
 

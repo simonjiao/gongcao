@@ -49,9 +49,10 @@ STATES=(
   "todo|0e8a16|Ready for agy to pick up"
   "in-progress|fbca04|Currently being processed by agy"
   "in-review|1d76db|Draft PR created or updated by agy, awaiting review"
-  "changes-requested|e99695|Reviewer or E2E requested changes; awaiting follow-up fixes"
+  "changes-requested|e99695|Reviewer, E2E, or Final Gate requested changes; awaiting follow-up fixes"
   "approved|2ea44f|Independent code review passed; ready for E2E verification"
-  "e2e-passed|006b75|Independent E2E verification passed; ready for human merge"
+  "e2e-passed|006b75|Independent E2E verification passed; ready for final gate sign-off"
+  "ready-to-merge|0e8a16|Final gate passed; ready for merge"
   "blocked|d93f0b|Blocked or failed during automation; needs human attention"
   "done|5319e7|Completed"
 )
@@ -66,10 +67,14 @@ usage() {
   gh-state.sh list-prs [state] [label] [limit]
   gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
-  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|blocked|done>
+  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|ready-to-merge|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | -> [marker]
   gh-state.sh get-comment <issue|pr> <number> [marker]
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
+  gh-state.sh update-pr <pr_number> <title> <body_file>
+  gh-state.sh mark-pr-ready <pr_number>
+  gh-state.sh merge-pr <pr_number> [merge|squash|rebase] [expected_head_sha]
+  gh-state.sh get-repo-merge-settings
 
 环境变量:
   GONGCAO_HOME    主工作目录（默认 ~/.gongcao）
@@ -248,7 +253,7 @@ cmd_list_prs() {
     pr list
     --state "$pr_state"
     --limit "$limit"
-    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,labels
+    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,labels
   )
   [[ -n "$REPO" ]] && args+=(--repo "$REPO")
   [[ -n "$filter_label" ]] && args+=(--label "$filter_label")
@@ -519,21 +524,109 @@ cmd_ensure_pr() {
   printf '%s\n' "$created_url"
 }
 
+cmd_update_pr() {
+  local pr_num="${1:-}"
+  local pr_title="${2:-}"
+  local body_file="${3:-}"
+
+  if [[ ! "$pr_num" =~ ^[0-9]+$ ]] || [[ -z "$pr_title" ]] || [[ -z "$body_file" || ! -f "$body_file" ]]; then
+    printf '错误：update-pr 参数无效（需要 <pr_number> <title> <body_file>）\n' >&2
+    exit 2
+  fi
+
+  local pr_body
+  pr_body="$("$CAT_BIN" "$body_file")"
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] PATCH repos/%s/pulls/%s (title=%q)\n' "$repo_slug" "$pr_num" "$pr_title" >&2
+    return 0
+  fi
+
+  local patch_payload=""
+  patch_payload="$("$JQ_BIN" -c -n --arg title "$pr_title" --arg body "$pr_body" '{title: $title, body: $body}')"
+  run_gh_stdin "$patch_payload" api -X PATCH "repos/${repo_slug}/pulls/${pr_num}" --input - >/dev/null
+  printf '已更新 PR #%s 标题与正文\n' "$pr_num" >&2
+}
+
+cmd_mark_pr_ready() {
+  local pr_num="${1:-}"
+  if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
+    printf '错误：mark-pr-ready 需要有效的 <pr_number>\n' >&2
+    exit 2
+  fi
+
+  local -a extra_args=()
+  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] %s pr ready %s\n' "$GH_BIN" "$pr_num" >&2
+    return 0
+  fi
+
+  run_gh pr ready "$pr_num" "${extra_args[@]}" >/dev/null
+  printf '已将 PR #%s 转为 Ready for review\n' "$pr_num" >&2
+}
+
+cmd_merge_pr() {
+  local pr_num="${1:-}"
+  local method="${2:-merge}"
+  local expected_sha="${3:-}"
+
+  if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
+    printf '错误：merge-pr 需要有效的 <pr_number>\n' >&2
+    exit 2
+  fi
+  if [[ "$method" != "merge" && "$method" != "squash" && "$method" != "rebase" ]]; then
+    printf '错误：merge-pr 的合并方式无效 (%q)，应为 merge|squash|rebase\n' "$method" >&2
+    exit 2
+  fi
+
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+
+  local payload=""
+  if [[ -n "$expected_sha" ]]; then
+    payload="$("$JQ_BIN" -c -n --arg method "$method" --arg sha "$expected_sha" '{merge_method: $method, sha: $sha}')"
+  else
+    payload="$("$JQ_BIN" -c -n --arg method "$method" '{merge_method: $method}')"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] PUT repos/%s/pulls/%s/merge %s\n' "$repo_slug" "$pr_num" "$payload" >&2
+    return 0
+  fi
+
+  run_gh_stdin "$payload" api -X PUT "repos/${repo_slug}/pulls/${pr_num}/merge" --input - >/dev/null
+  printf '已合并 PR #%s (method=%s, sha=%s)\n' "$pr_num" "$method" "${expected_sha:0:10}" >&2
+}
+
+cmd_get_repo_merge_settings() {
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+  run_gh api "repos/${repo_slug}" --jq '{allow_merge_commit: (if .allow_merge_commit == null then true else .allow_merge_commit end), allow_squash_merge: (if .allow_squash_merge == null then true else .allow_squash_merge end), allow_rebase_merge: (if .allow_rebase_merge == null then true else .allow_rebase_merge end)}'
+}
+
 main() {
   local subcmd="${1:-}"
   shift || true
   case "$subcmd" in
-    clone-repo)  cmd_clone_repo "$@" ;;
-    init-labels) cmd_init_labels "$@" ;;
-    list-issues) cmd_list_issues "$@" ;;
-    get-issue)   cmd_get_issue "$@" ;;
-    list-prs)    cmd_list_prs "$@" ;;
-    get-pr-diff) cmd_get_pr_diff "$@" ;;
-    find-pr)     cmd_find_pr "$@" ;;
-    set-state)   cmd_set_state "$@" ;;
-    comment)     cmd_comment "$@" ;;
-    get-comment) cmd_get_comment "$@" ;;
-    ensure-pr)   cmd_ensure_pr "$@" ;;
+    clone-repo)    cmd_clone_repo "$@" ;;
+    init-labels)   cmd_init_labels "$@" ;;
+    list-issues)   cmd_list_issues "$@" ;;
+    get-issue)     cmd_get_issue "$@" ;;
+    list-prs)      cmd_list_prs "$@" ;;
+    get-pr-diff)   cmd_get_pr_diff "$@" ;;
+    find-pr)       cmd_find_pr "$@" ;;
+    set-state)     cmd_set_state "$@" ;;
+    comment)       cmd_comment "$@" ;;
+    get-comment)   cmd_get_comment "$@" ;;
+    ensure-pr)     cmd_ensure_pr "$@" ;;
+    update-pr)               cmd_update_pr "$@" ;;
+    mark-pr-ready)           cmd_mark_pr_ready "$@" ;;
+    merge-pr)                cmd_merge_pr "$@" ;;
+    get-repo-merge-settings) cmd_get_repo_merge_settings "$@" ;;
     -h|--help|"")
       usage
       [[ -n "$subcmd" ]] && exit 0 || exit 2
