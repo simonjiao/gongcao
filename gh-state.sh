@@ -39,6 +39,7 @@ usage() {
   "$CAT_BIN" <<'EOF' >&2
 用法:
   gh-state.sh init-labels
+  gh-state.sh list-issues [state] [label] [limit]
   gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | ->
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
@@ -54,12 +55,6 @@ EOF
 
 run_gh() {
   (cd -- "$REPO_DIR" && "$GH_BIN" "$@")
-}
-
-repo_flag_args() {
-  if [[ -n "$REPO" ]]; then
-    printf '%s\0%s\0' "--repo" "$REPO"
-  fi
 }
 
 RESOLVED_REPO=""
@@ -88,6 +83,32 @@ is_valid_state() {
     [[ "$name" == "$target" ]] && return 0
   done
   return 1
+}
+
+cmd_list_issues() {
+  local issue_state="${1:-open}"
+  local filter_label="${2:-}"
+  local limit="${3:-20}"
+
+  if [[ "$issue_state" != "open" && "$issue_state" != "closed" && "$issue_state" != "all" ]]; then
+    printf '错误：list-issues 的 state 无效 (%q)，应为 open|closed|all\n' "$issue_state" >&2
+    exit 2
+  fi
+  if [[ ! "$limit" =~ ^[0-9]+$ ]] || (( limit <= 0 )); then
+    printf '错误：list-issues 的 limit 必须是正整数 (%q)\n' "$limit" >&2
+    exit 2
+  fi
+
+  local -a args=(
+    issue list
+    --state "$issue_state"
+    --limit "$limit"
+    --json number,title,body,labels,state,url
+  )
+  [[ -n "$REPO" ]] && args+=(--repo "$REPO")
+  [[ -n "$filter_label" ]] && args+=(--label "$filter_label")
+
+  run_gh "${args[@]}"
 }
 
 cmd_init_labels() {
@@ -308,6 +329,7 @@ main() {
   shift || true
   case "$subcmd" in
     init-labels) cmd_init_labels "$@" ;;
+    list-issues) cmd_list_issues "$@" ;;
     set-state)   cmd_set_state "$@" ;;
     comment)     cmd_comment "$@" ;;
     ensure-pr)   cmd_ensure_pr "$@" ;;

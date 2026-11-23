@@ -12,7 +12,6 @@ resolve_bin() {
   PATH="$SEARCH_PATH" type -P "$1"
 }
 
-GH_BIN="$(resolve_bin gh)"
 JQ_BIN="$(resolve_bin jq)"
 AGY_BIN="$(resolve_bin agy)"
 GIT_BIN="$(resolve_bin git)"
@@ -36,6 +35,7 @@ INIT_LABELS="${INIT_LABELS:-1}"        # 启动时是否幂等初始化 agy:* �
 AUTO_PUSH_PR="${AUTO_PUSH_PR:-1}"      # 有新 commit 时是否自动 push 分支并创建/更新 Draft PR（1=是，0=仅维护 Issue 状态）
 DRY_RUN="${DRY_RUN:-0}"                # 1=演练模式（不修改远端 GitHub、不执行 git push）
 ISSUE_STATE="${ISSUE_STATE:-open}"     # open | closed | all
+ISSUE_LIMIT="${ISSUE_LIMIT:-20}"       # 每次拉取的最大 issue 数量
 # 启用 GitHub 状态机时默认只拉取人工放行的 agy:todo；显式传 FILTER_LABEL="" 可关闭标签过滤
 if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
   FILTER_LABEL="${FILTER_LABEL-${LABEL_PREFIX}todo}"
@@ -234,13 +234,9 @@ EOF
   printf '%s\n' "$comment_body" | gh_state comment issue "$issue_num" - || true
 }
 
-gh_args=(issue list --state "$ISSUE_STATE" --limit 20 --json number,title,body,labels,state,url)
-[[ -n "$REPO" ]] && gh_args+=(--repo "$REPO")
-[[ -n "$FILTER_LABEL" ]] && gh_args+=(--label "$FILTER_LABEL")
-
 while true; do
-  # 在主仓库目录下拉取 issue 列表
-  issues_json="$(cd -- "$REPO_ROOT" && "$GH_BIN" "${gh_args[@]}")"
+  # 通过 gh-state.sh 拉取待处理 issue 列表（本脚本不直接调用 gh）
+  issues_json="$(gh_state list-issues "$ISSUE_STATE" "$FILTER_LABEL" "$ISSUE_LIMIT")"
 
   # 找出第一个待处理的 issue
   next_issue_json=""
