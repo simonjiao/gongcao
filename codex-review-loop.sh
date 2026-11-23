@@ -47,7 +47,7 @@ CODEX_MODEL="${CODEX_MODEL:-gpt-6.2-sol}" # 默认使用 GPT-6.2-Sol
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 xhigh
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
-MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-2}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # 评审不通过时是否同步将关联 Issue 切为 changes-requested（触发 agy 自动修复）
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -394,6 +394,30 @@ EOF
     pr_diff_snippet="${pr_diff_snippet}"$'\n\n'"... (diff 已截断，请在当前只读工作区使用 git diff origin/${base_branch}...HEAD 查看完整变更)"
   fi
 
+  # 若为第 2 轮及以上复审，自动带入上一轮的阻塞问题清单以约束复审收敛
+  prev_review_section=""
+  if (( current_round >= 2 )); then
+    prev_verdict_file="${review_dir}/last_verdict.json"
+    if [[ ! -s "$prev_verdict_file" ]]; then
+      prev_verdict_file=""
+      for _vf in "${review_dir}"/verdict-*.json; do
+        [[ -s "$_vf" ]] && prev_verdict_file="$_vf"
+      done
+    fi
+    if [[ -n "$prev_verdict_file" && -s "$prev_verdict_file" ]]; then
+      prev_blocking="$("$JQ_BIN" -r '
+        if (.blocking_issues | length) > 0 then
+          [.blocking_issues[] | "- [" + .severity + "] `" + .location + "`：" + .description + "（原建议：" + .suggestion + "）"] | join("\n")
+        else
+          "- (上一轮无阻塞项)"
+        end
+      ' "$prev_verdict_file" 2>/dev/null || true)"
+      if [[ -n "$prev_blocking" ]]; then
+        prev_review_section=$'\n\n'"## 上一轮阻塞问题清单（本轮重点核验收敛）"$'\n'"${prev_blocking}"
+      fi
+    fi
+  fi
+
   "$CAT_BIN" > "$prompt_file" <<EOF
 你是一名独立、严谨的代码评审者（Independent Reviewer）。请严格依据原始 Issue 要求，评审以下 Pull Request 的实际代码变更。
 
@@ -402,13 +426,13 @@ EOF
 - 标题: ${pr_title}
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 最新 Commit: \`${head_sha}\`
-- 评审轮次: 第 ${current_round} 轮
+- 评审轮次: 第 ${current_round} / ${MAX_REVIEW_ROUNDS} 轮
 
 ### PR 描述
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}
+${issue_section}${prev_review_section}
 
 ## PR Diff 摘录
 \`\`\`diff
@@ -418,9 +442,12 @@ ${pr_diff_snippet:-"(空 diff)"}
 ## 评审准则（务必遵守）
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出，请按需阅读完整源文件、调用点与相关单元测试以核实证据，不要轻信 PR 描述中的自我声明。
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
-3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 non_blocking_notes 中。
-4. 只有在存在实质性缺陷、未满足 Issue 核心要求、明显 bug 或缺少必要内部单测时才输出 \`request_changes\`，并在 \`blocking_issues\` 中给出精确文件位置、问题描述与可执行修改建议；轻微命名/风格建议放入 \`non_blocking_notes\`，不要阻塞通过。
-5. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
+3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。
+4. **严格区分阻塞项与范围外建议（禁止范围蔓延）**：
+   - 仅将「违反原始 Issue 明确验收标准、或本次 PR 改动新引入的实质性正确性/安全/回归 bug、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
+   - **凡超出原始 Issue 范围的延伸需求、次要/极端边缘的 UI 展示优化、仓库历史既有问题或轻微风格建议**，如果认为有参考价值，**一律放入 \`non_blocking_notes\`（作为非阻塞项记录）**，不得借此阻塞通过。
+5. **复审收敛规则（第 2 轮及以上）**：重点核验上一轮列出的阻塞问题是否已修复，以及本次修订是否引入新的实质性回归；不要在复审轮次不断追加与原始 Issue 无关的新要求。
+6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
 EOF
 
   codex_args=(
@@ -455,6 +482,7 @@ EOF
   fi
 
   verdict="$("$JQ_BIN" -r '.verdict' "$verdict_file")"
+  "$CAT_BIN" "$verdict_file" > "${review_dir}/last_verdict.json"
   final_pr_state=""
   extra_notice=""
 
