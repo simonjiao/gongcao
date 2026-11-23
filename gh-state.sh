@@ -210,47 +210,42 @@ cmd_set_state() {
   fi
 
   local target_label="${LABEL_PREFIX}${state}"
-  local -a extra_args=()
-  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
 
-  # 读取现有标签，实现严格互斥切换
+  # 使用稳定的 REST API（Issue 与 PR 共用 /issues/{number}/labels），
+  # 避免旧版 gh (如 2.45.0) 的 gh pr edit 因 GraphQL Projects (classic) 废弃字段报错
   local labels_json=""
-  labels_json="$(run_gh "$kind" view "$number" --json labels "${extra_args[@]}")"
+  labels_json="$(run_gh api "repos/${repo_slug}/issues/${number}/labels?per_page=100")"
 
-  local -a to_remove=()
   local has_target=0
+  local has_other_state=0
   local lbl
   while IFS= read -r lbl; do
     [[ -z "$lbl" ]] && continue
     if [[ "$lbl" == "$target_label" ]]; then
       has_target=1
     elif [[ "$lbl" == "${LABEL_PREFIX}"* ]]; then
-      to_remove+=("$lbl")
+      has_other_state=1
     fi
-  done < <("$JQ_BIN" -r '.labels[]?.name // empty' <<<"$labels_json")
+  done < <("$JQ_BIN" -r '.[]?.name // empty' <<<"$labels_json")
 
-  local -a edit_args=("$kind" edit "$number" "${extra_args[@]}")
-  local need_edit=0
-  for lbl in "${to_remove[@]}"; do
-    edit_args+=(--remove-label "$lbl")
-    need_edit=1
-  done
-  if (( has_target == 0 )); then
-    edit_args+=(--add-label "$target_label")
-    need_edit=1
-  fi
-
-  if (( need_edit == 0 )); then
+  if (( has_target == 1 && has_other_state == 0 )); then
     printf '%s #%s 已处于状态 %s，跳过更新\n' "$kind" "$number" "$target_label" >&2
     return 0
   fi
 
+  local payload=""
+  payload="$("$JQ_BIN" -c \
+    --arg prefix "$LABEL_PREFIX" \
+    --arg target "$target_label" \
+    '{labels: (([.[]?.name | select(startswith($prefix) | not)] + [$target]) | unique)}' \
+    <<<"$labels_json")"
+
   if [[ "$DRY_RUN" == "1" ]]; then
-    printf '[DRY_RUN] %s' "$GH_BIN" >&2
-    printf ' %q' "${edit_args[@]}" >&2
-    printf '\n' >&2
+    printf '[DRY_RUN] PUT repos/%s/issues/%s/labels %s\n' "$repo_slug" "$number" "$payload" >&2
   else
-    run_gh "${edit_args[@]}" >/dev/null
+    printf '%s\n' "$payload" | run_gh api -X PUT "repos/${repo_slug}/issues/${number}/labels" --input - >/dev/null
     printf '已切换 %s #%s 状态 -> %s\n' "$kind" "$number" "$target_label" >&2
   fi
 }
@@ -360,10 +355,14 @@ cmd_ensure_pr() {
   existing_url="$("$JQ_BIN" -r '.[0].url // empty' <<<"$existing_json")"
 
   if [[ -n "$existing_num" ]]; then
+    local repo_slug
+    repo_slug="$(resolve_repo_slug)"
     if [[ "$DRY_RUN" == "1" ]]; then
-      printf '[DRY_RUN] %s pr edit %s --title %q --body <...>\n' "$GH_BIN" "$existing_num" "$pr_title" >&2
+      printf '[DRY_RUN] PATCH repos/%s/pulls/%s (title=%q)\n' "$repo_slug" "$existing_num" "$pr_title" >&2
     else
-      run_gh pr edit "$existing_num" --title "$pr_title" --body "$pr_body" "${extra_args[@]}" >/dev/null
+      local patch_payload=""
+      patch_payload="$("$JQ_BIN" -c -n --arg title "$pr_title" --arg body "$pr_body" '{title: $title, body: $body}')"
+      printf '%s\n' "$patch_payload" | run_gh api -X PATCH "repos/${repo_slug}/pulls/${existing_num}" --input - >/dev/null
       printf '已更新现有 PR #%s: %s\n' "$existing_num" "$existing_url" >&2
     fi
     cmd_set_state pr "$existing_num" in-review
