@@ -43,7 +43,8 @@ AUTO_CLONE="${AUTO_CLONE:-1}"            # 未克隆时自动只读克隆到 ~/.
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 REVIEW_LABEL="${REVIEW_LABEL:-${LABEL_PREFIX}in-review}"
 REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
-CODEX_MODEL="${CODEX_MODEL:-}"           # 留空使用 ~/.codex/config.toml 默认模型
+CODEX_MODEL="${CODEX_MODEL:-gpt-6.2-sol}" # 默认使用 GPT-6.2-Sol
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 xhigh
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
 MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-2}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
@@ -110,7 +111,8 @@ gh_state() {
 }
 
 printf '[%s] 启动 codex-review-loop\n' "$("$DATE_BIN" '+%F %T')"
-printf '  Codex 命令 : %s (model=%s, sandbox=%s)\n' "$CODEX_BIN" "${CODEX_MODEL:-(codex 默认)}" "$CODEX_SANDBOX"
+printf '  Codex 命令 : %s (model=%s, effort=%s, sandbox=%s)\n' \
+  "$CODEX_BIN" "${CODEX_MODEL:-(codex 默认)}" "${CODEX_REASONING_EFFORT:-(默认)}" "$CODEX_SANDBOX"
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  评审档案根 : %s\n' "$REVIEWS_ROOT"
@@ -252,7 +254,7 @@ render_review_markdown() {
     --arg round "$round" \
     --arg max_rounds "$MAX_REVIEW_ROUNDS" \
     --arg state "${LABEL_PREFIX}${final_state}" \
-    --arg model "${CODEX_MODEL:-(codex 默认)}" \
+    --arg model "${CODEX_MODEL:-(codex 默认)}${CODEX_REASONING_EFFORT:+ (${CODEX_REASONING_EFFORT})}" \
     --arg now "$now_ts" \
     '
     def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
@@ -433,6 +435,9 @@ EOF
   if [[ -n "$CODEX_MODEL" ]]; then
     codex_args+=(-m "$CODEX_MODEL")
   fi
+  if [[ -n "$CODEX_REASONING_EFFORT" ]]; then
+    codex_args+=(-c "model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"")
+  fi
   codex_args+=(-)
 
   codex_ok=0
@@ -498,6 +503,8 @@ EOF
     --arg head_branch "$head_branch" \
     --arg base_branch "$base_branch" \
     --arg head_sha "$head_sha" \
+    --arg model "$CODEX_MODEL" \
+    --arg reasoning_effort "$CODEX_REASONING_EFFORT" \
     --argjson round "$current_round" \
     --arg verdict "$verdict" \
     --arg final_state "$final_pr_state" \
@@ -509,6 +516,8 @@ EOF
       head_branch: $head_branch,
       base_branch: $base_branch,
       head_sha: $head_sha,
+      model: $model,
+      reasoning_effort: $reasoning_effort,
       round: $round,
       verdict: $verdict,
       final_state: $final_state,
