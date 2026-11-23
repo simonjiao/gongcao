@@ -290,6 +290,8 @@ render_review_markdown() {
 }
 
 consecutive_poll_errors=0
+idle_announced=0
+ACTIVITY_LOG="${STATE_ROOT}/activity.log"
 
 while true; do
   if [[ "$INIT_LABELS" == "1" && "$LABELS_READY" == "0" ]]; then
@@ -324,10 +326,15 @@ while true; do
   done < <("$JQ_BIN" -c '.[]' <<<"$prs_json")
 
   if [[ -z "$next_pr_json" ]]; then
-    printf '[%s] 没有待 Codex 评审的 PR，%ss 后重试...\n' "$("$DATE_BIN" '+%F %T')" "$POLL_INTERVAL"
+    if (( idle_announced == 0 )); then
+      printf '[%s] 空闲等待中：暂无待 Codex 评审的 PR（每 %ss 后台轮询一次）...\n' "$("$DATE_BIN" '+%F %T')" "$POLL_INTERVAL"
+      idle_announced=1
+    fi
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
   fi
+  idle_announced=0
+  task_start_sec=$SECONDS
 
   pr_num="$("$JQ_BIN" -r '.number' <<<"$next_pr_json")"
   pr_title="$("$JQ_BIN" -r '.title' <<<"$next_pr_json")"
@@ -552,8 +559,17 @@ EOF
       updated_at: $updated_at
     }' > "$meta_file"
 
-  printf '[%s] PR #%s 评审完成 -> verdict=%s, state=%s%s (报告：%s)\n' \
-    "$("$DATE_BIN" '+%F %T')" "$pr_num" "$verdict" "$LABEL_PREFIX" "$final_pr_state" "$comment_file"
+  total_elapsed=$((SECONDS - task_start_sec))
+  end_ts="$("$DATE_BIN" '+%F %T')"
+  printf '\n============================================================\n'
+  printf '[%s] [DONE] PR #%s Codex 评审完成 (第 %d/%d 轮, 耗时 %ds)\n' \
+    "$end_ts" "$pr_num" "$current_round" "$MAX_REVIEW_ROUNDS" "$total_elapsed"
+  printf '  评审结论 : %s -> %s%s\n' "$verdict" "$LABEL_PREFIX" "$final_pr_state"
+  printf '  关联Issue: #%s | Commit: %s\n' "${issue_num:-?}" "${head_sha:0:10}"
+  printf '  评审报告 : %s\n' "$comment_file"
+  printf '============================================================\n\n'
+  printf '[%s] [codex-review] PR #%s (Issue #%s, r%d) -> %s (%s%s, %ds)\n' \
+    "$end_ts" "$pr_num" "${issue_num:-?}" "$current_round" "$verdict" "$LABEL_PREFIX" "$final_pr_state" "$total_elapsed" >> "$ACTIVITY_LOG"
 
   "$SLEEP_BIN" 5
 done

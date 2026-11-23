@@ -303,6 +303,8 @@ EOF
 }
 
 consecutive_poll_errors=0
+idle_announced=0
+ACTIVITY_LOG="${STATE_ROOT}/activity.log"
 
 while true; do
   # 若启动时初始化标签失败，在网络恢复后补初始化一次
@@ -358,10 +360,15 @@ while true; do
   done < <("$JQ_BIN" -c '.[]' <<<"$issues_json")
 
   if [[ -z "$next_issue_json" ]]; then
-    printf '[%s] 没有待处理的 issue，%ss 后重试...\n' "$("$DATE_BIN" '+%F %T')" "$POLL_INTERVAL"
+    if (( idle_announced == 0 )); then
+      printf '[%s] 空闲等待中：暂无待处理 issue（每 %ss 后台轮询一次）...\n' "$("$DATE_BIN" '+%F %T')" "$POLL_INTERVAL"
+      idle_announced=1
+    fi
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
   fi
+  idle_announced=0
+  task_start_sec=$SECONDS
 
   # 提取 issue 字段
   number="$("$JQ_BIN" -r '.number' <<<"$next_issue_json")"
@@ -502,10 +509,14 @@ EOF
   fi
 
   # 2. 在独立 worktree 内执行 agy，保留完整会话事件流
+  agy_start_sec=$SECONDS
   run_ok=0
   if (cd -- "$wt_dir" && "$AGY_BIN" "${agy_args[@]}") | "$TEE_BIN" "$run_events_file" >> "$events_file"; then
     run_ok=1
   fi
+  agy_elapsed=$((SECONDS - agy_start_sec))
+  printf '[%s] Issue #%s agy 执行结束 (ok=%d, 耗时 %ds)，开始后处理（commit / push / 更新状态）...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$number" "$run_ok" "$agy_elapsed"
 
   # 提取并持久化 conversation_id
   new_conv_id="$(extract_conversation_id "$run_events_file")"
@@ -637,13 +648,21 @@ EOF
   write_session_meta "$meta_file" "$number" "$title" "$url" "$state" "$labels" \
     "$branch" "$wt_dir" "$final_conv_id" "$pr_url" "$final_status" "$finish_iso"
 
-  printf '[%s] Issue #%s 本轮结束 -> 状态: %s\n' "$("$DATE_BIN" '+%F %T')" "$number" "$final_status"
+  total_elapsed=$((SECONDS - task_start_sec))
+  end_ts="$("$DATE_BIN" '+%F %T')"
+  printf '\n============================================================\n'
+  printf '[%s] [DONE] Issue #%s 本轮处理结束 (耗时 %ds)\n' "$end_ts" "$number" "$total_elapsed"
+  printf '  最终状态 : %s%s\n' "$LABEL_PREFIX" "$final_status"
+  printf '  标题     : %s\n' "$title"
   printf '  Worktree : %s (分支 %s)\n' "$wt_dir" "$branch"
   [[ -n "$pr_url" ]] && printf '  Draft PR : %s\n' "$pr_url"
   printf '  会话记录 : %s\n' "$session_dir"
   if [[ -n "$final_conv_id" ]]; then
     printf '  人工接管 : cd %q && %q --conversation %q\n' "$wt_dir" "$AGY_BIN" "$final_conv_id"
   fi
+  printf '============================================================\n\n'
+  printf '[%s] [agy-dev] Issue #%s -> %s%s (%ds) %s\n' \
+    "$end_ts" "$number" "$LABEL_PREFIX" "$final_status" "$total_elapsed" "${pr_url:-$branch}" >> "$ACTIVITY_LOG"
 
   "$SLEEP_BIN" 5
 done
