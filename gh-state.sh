@@ -58,6 +58,7 @@ usage() {
   gh-state.sh clone-repo <owner/repo> [dest_dir]
   gh-state.sh init-labels
   gh-state.sh list-issues [state] [label] [limit]
+  gh-state.sh find-pr <head_branch>
   gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | ->
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
@@ -310,6 +311,21 @@ cmd_comment() {
   fi
 }
 
+cmd_find_pr() {
+  local head_branch="${1:-}"
+  if [[ -z "$head_branch" ]]; then
+    printf '错误：find-pr 需要 <head_branch> 参数\n' >&2
+    exit 2
+  fi
+
+  local -a extra_args=()
+  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+
+  local pr_json=""
+  pr_json="$(run_gh pr list --head "$head_branch" --state open --limit 1 --json number,url "${extra_args[@]}")"
+  "$JQ_BIN" -r 'if length > 0 then "\(.[0].number)\t\(.[0].url)" else empty end' <<<"$pr_json"
+}
+
 cmd_ensure_pr() {
   local issue_num="${1:-}"
   local head_branch="${2:-}"
@@ -388,6 +404,7 @@ main() {
     clone-repo)  cmd_clone_repo "$@" ;;
     init-labels) cmd_init_labels "$@" ;;
     list-issues) cmd_list_issues "$@" ;;
+    find-pr)     cmd_find_pr "$@" ;;
     set-state)   cmd_set_state "$@" ;;
     comment)     cmd_comment "$@" ;;
     ensure-pr)   cmd_ensure_pr "$@" ;;
