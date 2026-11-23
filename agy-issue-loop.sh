@@ -23,9 +23,15 @@ SLEEP_BIN="$(resolve_bin sleep)"
 TEE_BIN="$(resolve_bin tee)"
 CAT_BIN="$(resolve_bin cat)"
 
-# ===== 可调配置 =====
-REPO_DIR="${REPO_DIR:-$(pwd)}"         # 目标开发仓库路径（默认当前目录）
-REPO="${REPO:-}"                       # 留空默认从 REPO_DIR 识别 GitHub 仓库，也可填 "owner/repo"
+# ===== 主工作目录与可调配置 =====
+GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
+REPOS_ROOT="${REPOS_ROOT:-${GONGCAO_HOME}/repos}"
+STATE_BASE="${STATE_BASE:-${GONGCAO_HOME}/state}"
+
+REPO="${REPO:-}"                       # 目标 GitHub 仓库 "owner/repo"（留空默认从本地仓库识别）
+REPO_NAME="${REPO_NAME:-}"             # 可选：直接指定 ~/.gongcao/repos/<REPO_NAME>
+REPO_DIR="${REPO_DIR:-}"               # 可选：显式指定本地仓库路径；留空时按 REPO/REPO_NAME 定位到 ~/.gongcao/repos/
+AUTO_CLONE="${AUTO_CLONE:-1}"          # 指定 REPO 且本地尚未克隆时，是否自动 clone 到 ~/.gongcao/repos/（1=是，0=否）
 BASE_BRANCH="${BASE_BRANCH:-}"         # 创建 worktree/PR 的基准分支，留空自动探测 origin/HEAD 或当前 HEAD
 BRANCH_PREFIX="${BRANCH_PREFIX:-agy/issue-}"
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
@@ -47,9 +53,37 @@ PRINT_TIMEOUT="${PRINT_TIMEOUT:-15m}"
 AGY_MODE="${AGY_MODE:-auto}"           # auto | accept-edits | plan
 AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-high}" # 默认使用 Gemini 4 Hydrogen (High)
 
+"$MKDIR_BIN" -p "$GONGCAO_HOME" "$REPOS_ROOT" "$STATE_BASE"
+
+# 解析目标仓库目录（优先使用 ~/.gongcao/repos/）
+if [[ -z "$REPO_DIR" ]]; then
+  if [[ -n "$REPO" ]]; then
+    _slug="${REPO//\//__}"
+    _slug="${_slug//[^a-zA-Z0-9._-]/_}"
+    _short="${REPO##*/}"
+    _short="${_short//[^a-zA-Z0-9._-]/_}"
+    if [[ -e "${REPOS_ROOT}/${_slug}/.git" ]]; then
+      REPO_DIR="${REPOS_ROOT}/${_slug}"
+    elif [[ -e "${REPOS_ROOT}/${_short}/.git" ]]; then
+      REPO_DIR="${REPOS_ROOT}/${_short}"
+    else
+      REPO_DIR="${REPOS_ROOT}/${_slug}"
+      if [[ "$AUTO_CLONE" == "1" ]]; then
+        GONGCAO_HOME="$GONGCAO_HOME" REPOS_ROOT="$REPOS_ROOT" REPO="$REPO" DRY_RUN="$DRY_RUN" \
+          "$GH_STATE_BIN" clone-repo "$REPO" "$REPO_DIR" >/dev/null
+      fi
+    fi
+  elif [[ -n "$REPO_NAME" ]]; then
+    REPO_DIR="${REPOS_ROOT}/${REPO_NAME}"
+  else
+    REPO_DIR="$(pwd)"
+  fi
+fi
+
 # 校验目标仓库目录并获取主仓库根目录
 if ! REPO_ROOT="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   printf '错误：REPO_DIR (%s) 不是一个有效的 Git 仓库。\n' "$REPO_DIR" >&2
+  printf '提示：可先克隆到 %s/<repo> 或传入 REPO=owner/repo 自动克隆。\n' "$REPOS_ROOT" >&2
   exit 1
 fi
 
@@ -61,8 +95,8 @@ else
 fi
 REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 
-# 持久化目录布局（默认在 ~/.local/state/agy-issue-loop/<repo_slug>/）
-STATE_ROOT="${STATE_ROOT:-${HOME}/.local/state/agy-issue-loop/${REPO_SLUG}}"
+# 持久化目录布局（统一位于 ~/.gongcao/state/<repo_slug>/）
+STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 SESSIONS_ROOT="${SESSIONS_ROOT:-${STATE_ROOT}/sessions}"
 STATE_FILE="${STATE_FILE:-${STATE_ROOT}/processed_issues.txt}"
@@ -77,6 +111,8 @@ if [[ "$GH_SYNC_ENABLED" == "1" && "$DRY_RUN" != "1" && "$FILTER_LABEL" == "${LA
 fi
 
 gh_state() {
+  GONGCAO_HOME="$GONGCAO_HOME" \
+  REPOS_ROOT="$REPOS_ROOT" \
   REPO_DIR="$REPO_ROOT" \
   REPO="$REPO" \
   LABEL_PREFIX="$LABEL_PREFIX" \
@@ -85,7 +121,9 @@ gh_state() {
 }
 
 printf '[%s] 启动 agy-issue-loop\n' "$("$DATE_BIN" '+%F %T')"
+printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
+printf '  状态根目录 : %s\n' "$STATE_ROOT"
 printf '  Worktree 根: %s\n' "$WORKTREE_ROOT"
 printf '  会话记录根 : %s\n' "$SESSIONS_ROOT"
 printf '  过滤标签   : %s\n' "${FILTER_LABEL:-(无)}"

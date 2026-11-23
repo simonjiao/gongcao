@@ -18,10 +18,27 @@ resolve_bin() {
 GH_BIN="$(resolve_bin gh)"
 JQ_BIN="$(resolve_bin jq)"
 CAT_BIN="$(resolve_bin cat)"
+MKDIR_BIN="$(resolve_bin mkdir)"
 
 # ===== 可调配置 =====
-REPO_DIR="${REPO_DIR:-$(pwd)}"
+GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
+REPOS_ROOT="${REPOS_ROOT:-${GONGCAO_HOME}/repos}"
 REPO="${REPO:-}"
+if [[ -z "${REPO_DIR:-}" ]]; then
+  if [[ -n "$REPO" ]]; then
+    _repo_slug="${REPO//\//__}"
+    _repo_short="${REPO##*/}"
+    if [[ -e "${REPOS_ROOT}/${_repo_slug}/.git" ]]; then
+      REPO_DIR="${REPOS_ROOT}/${_repo_slug}"
+    elif [[ -e "${REPOS_ROOT}/${_repo_short}/.git" ]]; then
+      REPO_DIR="${REPOS_ROOT}/${_repo_short}"
+    else
+      REPO_DIR="$(pwd)"
+    fi
+  else
+    REPO_DIR="$(pwd)"
+  fi
+fi
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 COMMENT_MARKER="${COMMENT_MARKER:-<!-- agy-status-comment -->}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -38,6 +55,7 @@ STATES=(
 usage() {
   "$CAT_BIN" <<'EOF' >&2
 用法:
+  gh-state.sh clone-repo <owner/repo> [dest_dir]
   gh-state.sh init-labels
   gh-state.sh list-issues [state] [label] [limit]
   gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|blocked|done>
@@ -45,7 +63,9 @@ usage() {
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
 
 环境变量:
-  REPO_DIR        仓库目录（默认当前目录）
+  GONGCAO_HOME    主工作目录（默认 ~/.gongcao）
+  REPOS_ROOT      托管仓库根目录（默认 ~/.gongcao/repos）
+  REPO_DIR        仓库目录（留空时若指定 REPO 则优先查找 REPOS_ROOT，否则为当前目录）
   REPO            GitHub 仓库 owner/repo（留空自动从 REPO_DIR 探测）
   LABEL_PREFIX    状态标签前缀（默认 agy:）
   COMMENT_MARKER  置顶覆盖评论标记（默认 <!-- agy-status-comment -->）
@@ -83,6 +103,43 @@ is_valid_state() {
     [[ "$name" == "$target" ]] && return 0
   done
   return 1
+}
+
+cmd_clone_repo() {
+  local target_repo="${1:-$REPO}"
+  local dest_dir="${2:-}"
+
+  if [[ -z "$target_repo" ]]; then
+    printf '错误：clone-repo 需要 <owner/repo> 参数或设置 REPO 环境变量\n' >&2
+    exit 2
+  fi
+
+  if [[ -z "$dest_dir" ]]; then
+    local slug="${target_repo//\//__}"
+    slug="${slug//[^a-zA-Z0-9._-]/_}"
+    dest_dir="${REPOS_ROOT}/${slug}"
+  fi
+
+  if [[ -e "${dest_dir}/.git" ]]; then
+    printf '仓库已存在于 %s，跳过 clone\n' "$dest_dir" >&2
+    printf '%s\n' "$dest_dir"
+    return 0
+  fi
+
+  local parent_dir="${dest_dir%/*}"
+  if [[ "$parent_dir" != "$dest_dir" && -n "$parent_dir" ]]; then
+    "$MKDIR_BIN" -p "$parent_dir"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] %s repo clone %q %q\n' "$GH_BIN" "$target_repo" "$dest_dir" >&2
+    printf '%s\n' "$dest_dir"
+    return 0
+  fi
+
+  "$GH_BIN" repo clone "$target_repo" "$dest_dir" >&2
+  printf '已克隆仓库 %s -> %s\n' "$target_repo" "$dest_dir" >&2
+  printf '%s\n' "$dest_dir"
 }
 
 cmd_list_issues() {
@@ -328,6 +385,7 @@ main() {
   local subcmd="${1:-}"
   shift || true
   case "$subcmd" in
+    clone-repo)  cmd_clone_repo "$@" ;;
     init-labels) cmd_init_labels "$@" ;;
     list-issues) cmd_list_issues "$@" ;;
     set-state)   cmd_set_state "$@" ;;
