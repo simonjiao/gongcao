@@ -45,6 +45,7 @@ fi
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 PRINT_TIMEOUT="${PRINT_TIMEOUT:-15m}"
 AGY_MODE="${AGY_MODE:-auto}"           # auto | accept-edits | plan
+AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-high}" # 默认使用 Gemini 4 Hydrogen (High)
 
 # 校验目标仓库目录并获取主仓库根目录
 if ! REPO_ROOT="$("$GIT_BIN" -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
@@ -88,6 +89,7 @@ printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  Worktree 根: %s\n' "$WORKTREE_ROOT"
 printf '  会话记录根 : %s\n' "$SESSIONS_ROOT"
 printf '  过滤标签   : %s\n' "${FILTER_LABEL:-(无)}"
+printf '  运行模型   : %s (mode=%s)\n' "${AGY_MODEL:-(agy 默认)}" "$AGY_MODE"
 printf '  GitHub同步 : %s (AUTO_PUSH_PR=%s, DRY_RUN=%s)\n' "$GH_SYNC_ENABLED" "$AUTO_PUSH_PR" "$DRY_RUN"
 
 if [[ "$GH_SYNC_ENABLED" == "1" && "$INIT_LABELS" == "1" ]]; then
@@ -180,6 +182,7 @@ write_session_meta() {
     --arg repo_root "$REPO_ROOT" \
     --arg branch "$branch" \
     --arg worktree "$wt_dir" \
+    --arg model "$AGY_MODEL" \
     --arg conversation_id "$conv_id" \
     --arg pr_url "$pr_url" \
     --arg transcript_hint "$transcript_hint" \
@@ -195,6 +198,7 @@ write_session_meta() {
       repo_root: $repo_root,
       branch: $branch,
       worktree: $worktree,
+      model: $model,
       conversation_id: $conversation_id,
       pr_url: $pr_url,
       transcript_hint: $transcript_hint,
@@ -339,6 +343,9 @@ EOF
     --output-format stream-json
     --log-file "$cli_log_file"
   )
+  if [[ -n "$AGY_MODEL" ]]; then
+    agy_args+=(--model "$AGY_MODEL")
+  fi
   if [[ -n "$existing_conv_id" ]]; then
     agy_args=(--conversation "$existing_conv_id" "${agy_args[@]}")
     printf '[%s] 续接 Issue #%s 历史会话 (%s)，worktree: %s\n' \
