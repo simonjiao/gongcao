@@ -35,6 +35,8 @@ CAT_BIN="$(resolve_bin cat)"
 HEAD_BIN="$(resolve_bin head)"
 CP_BIN="$(resolve_bin cp)"
 FIND_BIN="$(resolve_bin find)"
+FLOCK_BIN="$(resolve_bin flock)"
+TIMEOUT_BIN="$(resolve_bin timeout)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -57,6 +59,7 @@ CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 x
 # E2E 需要启服务、访问本地数据库/端口/浏览器等；默认使用 danger-full-access 且免交互确认
 CODEX_E2E_SANDBOX="${CODEX_E2E_SANDBOX:-danger-full-access}"
 CODEX_E2E_BYPASS_APPROVALS="${CODEX_E2E_BYPASS_APPROVALS:-1}" # 1=传 --dangerously-bypass-approvals-and-sandbox；0=仅传 -s "$CODEX_E2E_SANDBOX"
+CODEX_TIMEOUT="${CODEX_TIMEOUT:-30m}"        # 单次 E2E 验收超时上限，防止环境挂死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-40000}"    # 嵌入 prompt 的 diff 最大字节数
 MAX_E2E_ROUNDS="${MAX_E2E_ROUNDS:-2}"        # 最大自动 E2E 失败打回轮数，超过则切 blocked
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # E2E 代码缺陷 fail 时是否将关联 Issue 切为 changes-requested
@@ -108,11 +111,13 @@ REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 E2E_ROOT="${E2E_ROOT:-${STATE_ROOT}/e2e}"
+REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
 if [[ -z "$E2E_ENV_FILE" && -f "${GONGCAO_HOME}/e2e/${REPO_SLUG}.md" ]]; then
   E2E_ENV_FILE="${GONGCAO_HOME}/e2e/${REPO_SLUG}.md"
 fi
 
 "$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$E2E_ROOT"
+"$TOUCH_BIN" "$REPO_GIT_LOCK"
 
 gh_state() {
   GONGCAO_HOME="$GONGCAO_HOME" \
@@ -238,25 +243,28 @@ prepare_e2e_worktree() {
   local head_sha="$3"
   local wt_dir="${WORKTREE_ROOT}/e2e-pr-${pr_num}"
 
-  "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-  "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
 
-  if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-    "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
-      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
-  fi
+    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
+        "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
+    fi
 
-  local target_commit="$head_sha"
-  if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
-    target_commit="FETCH_HEAD"
-  fi
+    local target_commit="$head_sha"
+    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
+      target_commit="FETCH_HEAD"
+    fi
 
-  if [[ -e "${wt_dir}/.git" ]]; then
-    "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
-    "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
-  else
-    "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
-  fi
+    if [[ -e "${wt_dir}/.git" ]]; then
+      "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
+      "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
+    else
+      "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
+    fi
+  ) 9>"$REPO_GIT_LOCK"
 
   printf '%s' "$wt_dir"
 }
@@ -293,25 +301,28 @@ publish_e2e_evidence() {
   fi
 
   local ev_wt="${WORKTREE_ROOT}/evidence-branch"
-  "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-  "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$E2E_EVIDENCE_BRANCH" >/dev/null 2>&1 || true
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$E2E_EVIDENCE_BRANCH" >/dev/null 2>&1 || true
 
-  if [[ -e "${ev_wt}/.git" ]]; then
-    if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}"; then
-      "$GIT_BIN" -C "$ev_wt" checkout -B "$E2E_EVIDENCE_BRANCH" "origin/${E2E_EVIDENCE_BRANCH}" >/dev/null 2>&1
+    if [[ -e "${ev_wt}/.git" ]]; then
+      if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}"; then
+        "$GIT_BIN" -C "$ev_wt" checkout -B "$E2E_EVIDENCE_BRANCH" "origin/${E2E_EVIDENCE_BRANCH}" >/dev/null 2>&1
+      else
+        "$GIT_BIN" -C "$ev_wt" checkout "$E2E_EVIDENCE_BRANCH" >/dev/null 2>&1 || true
+      fi
+      "$GIT_BIN" -C "$ev_wt" clean -fd >/dev/null 2>&1 || true
     else
-      "$GIT_BIN" -C "$ev_wt" checkout "$E2E_EVIDENCE_BRANCH" >/dev/null 2>&1 || true
+      if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}"; then
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add --track -b "$E2E_EVIDENCE_BRANCH" "$ev_wt" "origin/${E2E_EVIDENCE_BRANCH}" >&2
+      elif "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${E2E_EVIDENCE_BRANCH}"; then
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add "$ev_wt" "$E2E_EVIDENCE_BRANCH" >&2
+      else
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add --orphan -b "$E2E_EVIDENCE_BRANCH" "$ev_wt" >&2
+      fi
     fi
-    "$GIT_BIN" -C "$ev_wt" clean -fd >/dev/null 2>&1 || true
-  else
-    if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}"; then
-      "$GIT_BIN" -C "$REPO_ROOT" worktree add --track -b "$E2E_EVIDENCE_BRANCH" "$ev_wt" "origin/${E2E_EVIDENCE_BRANCH}" >&2
-    elif "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${E2E_EVIDENCE_BRANCH}"; then
-      "$GIT_BIN" -C "$REPO_ROOT" worktree add "$ev_wt" "$E2E_EVIDENCE_BRANCH" >&2
-    else
-      "$GIT_BIN" -C "$REPO_ROOT" worktree add --orphan -b "$E2E_EVIDENCE_BRANCH" "$ev_wt" >&2
-    fi
-  fi
+  ) 9>"$REPO_GIT_LOCK"
 
   local dest_dir="${ev_wt}/${rel_dir}"
   "$MKDIR_BIN" -p "$dest_dir"
@@ -510,6 +521,33 @@ while true; do
   head_branch="$("$JQ_BIN" -r '.headRefName' <<<"$next_pr_json")"
   base_branch="$("$JQ_BIN" -r '.baseRefName' <<<"$next_pr_json")"
   head_sha="$("$JQ_BIN" -r '.headRefOid' <<<"$next_pr_json")"
+  mergeable="$("$JQ_BIN" -r '.mergeable // ""' <<<"$next_pr_json")"
+  merge_state="$("$JQ_BIN" -r '.mergeStateStatus // ""' <<<"$next_pr_json")"
+
+  # 前置冲突拦截：存在合并冲突的 PR 不做 E2E，直接退回开发循环解冲突
+  if [[ "$mergeable" == "CONFLICTING" || "$merge_state" == "DIRTY" ]]; then
+    issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
+    conflict_md="$("$CAT_BIN" <<EOF
+### Codex E2E 验收前置拦截：存在合并冲突
+
+- PR #${pr_num}（\`${head_branch}\` -> \`${base_branch}\`）当前合并状态为 \`${mergeable:-CONFLICTING}\` / \`${merge_state:-DIRTY}\`。
+- 已将状态切为 \`${LABEL_PREFIX}changes-requested\`，请先同步最新 \`${base_branch}\` 并解决合并冲突后再进入 E2E 验收（本次不消耗 E2E 轮次）。
+EOF
+)"
+    printf '%s\n' "$conflict_md" | gh_state comment pr "$pr_num" - "$E2E_COMMENT_MARKER" || true
+    gh_state set-state pr "$pr_num" changes-requested || true
+    if [[ -n "$issue_num" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
+      gh_state set-state issue "$issue_num" changes-requested || true
+      printf '%s\n' "$conflict_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
+    fi
+    end_ts="$("$DATE_BIN" '+%F %T')"
+    printf '[%s] PR #%s 存在合并冲突 (%s/%s)，已直接退回 %schanges-requested\n' \
+      "$end_ts" "$pr_num" "$mergeable" "$merge_state" "$LABEL_PREFIX"
+    printf '[%s] [codex-e2e] PR #%s (Issue #%s) -> conflict-requeued (%schanges-requested)\n' \
+      "$end_ts" "$pr_num" "${issue_num:-?}" "$LABEL_PREFIX" >> "$ACTIVITY_LOG"
+    "$SLEEP_BIN" 5
+    continue
+  fi
 
   e2e_dir="${E2E_ROOT}/pr-${pr_num}"
   "$MKDIR_BIN" -p "$e2e_dir"
@@ -629,18 +667,26 @@ EOF
   codex_args+=(-)
 
   codex_ok=0
-  if "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
+  codex_rc=0
+  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
     if [[ -s "$result_file" ]] && "$JQ_BIN" -e '.verdict == "pass" or .verdict == "fail" or .verdict == "blocked"' "$result_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
+  else
+    codex_rc=$?
   fi
 
   # 清理 E2E 过程中可能在 worktree 产生的未跟踪文件，保持 worktree 干净
   cleanup_e2e_worktree "$e2e_wt"
 
   if (( codex_ok == 0 )); then
-    printf '[%s] 警告：Codex E2E 验收 PR #%s 执行异常或输出不符合 Schema（日志：%s），%ss 后重试...\n' \
-      "$("$DATE_BIN" '+%F %T')" "$pr_num" "$events_file" "$POLL_INTERVAL" >&2
+    if (( codex_rc == 124 )); then
+      printf '[%s] 警告：Codex E2E 验收 PR #%s 超时（上限 %s，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$CODEX_TIMEOUT" "$events_file" "$POLL_INTERVAL" >&2
+    else
+      printf '[%s] 警告：Codex E2E 验收 PR #%s 执行异常或输出不符合 Schema（exit=%d，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$codex_rc" "$events_file" "$POLL_INTERVAL" >&2
+    fi
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
   fi

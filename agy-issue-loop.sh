@@ -22,6 +22,7 @@ DATE_BIN="$(resolve_bin date)"
 SLEEP_BIN="$(resolve_bin sleep)"
 TEE_BIN="$(resolve_bin tee)"
 CAT_BIN="$(resolve_bin cat)"
+FLOCK_BIN="$(resolve_bin flock)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -35,7 +36,8 @@ AUTO_CLONE="${AUTO_CLONE:-1}"          # 指定 REPO 且本地尚未克隆时，
 BASE_BRANCH="${BASE_BRANCH:-}"         # 创建 worktree/PR 的基准分支，留空自动探测 origin/HEAD 或当前 HEAD
 BRANCH_PREFIX="${BRANCH_PREFIX:-agy/issue-}"
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
-GIT_FETCH="${GIT_FETCH:-1}"            # 创建新 worktree 前是否尝试 git fetch origin（1=是，0=否）
+GIT_FETCH="${GIT_FETCH:-1}"            # 创建或同步 worktree 前是否尝试 git fetch origin（1=是，0=否）
+AUTO_SYNC_BASE="${AUTO_SYNC_BASE:-1}"  # 启动/续跑前是否自动合并最新基准分支并把冲突交给 agy 解决（1=是，0=否）
 GH_SYNC_ENABLED="${GH_SYNC_ENABLED:-1}" # 是否启用 GitHub 状态机与置顶评论（1=是，0=纯本地模式）
 INIT_LABELS="${INIT_LABELS:-1}"        # 启动时是否幂等初始化 agy:* 标签（1=是，0=否）
 AUTO_PUSH_PR="${AUTO_PUSH_PR:-1}"      # 有新 commit 时是否自动 push 分支并创建/更新 Draft PR（1=是，0=仅维护 Issue 状态）
@@ -109,9 +111,10 @@ STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 SESSIONS_ROOT="${SESSIONS_ROOT:-${STATE_ROOT}/sessions}"
 STATE_FILE="${STATE_FILE:-${STATE_ROOT}/processed_issues.txt}"
+REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
 
 "$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$SESSIONS_ROOT"
-"$TOUCH_BIN" "$STATE_FILE"
+"$TOUCH_BIN" "$STATE_FILE" "$REPO_GIT_LOCK"
 
 # 判断是否完全以 GitHub 状态标签作为队列真相源（人工把标签改回 agy:todo 时可自动续接）
 USE_LOCAL_DEDUP=1
@@ -182,28 +185,72 @@ ensure_worktree() {
   local branch="${BRANCH_PREFIX}${issue_num}"
   local wt_dir="${WORKTREE_ROOT}/issue-${issue_num}"
 
-  # 若 worktree 目录已存在且有效，直接复用（保留已有修改与上下文）
-  if [[ -e "${wt_dir}/.git" ]]; then
-    printf '%s' "$wt_dir"
+  # 使用文件锁保护主仓库 fetch/worktree 操作，防止与 review/e2e/cleanup 循环并发冲突
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+
+    if [[ "$GIT_FETCH" == "1" ]] && "$GIT_BIN" -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+      "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
+    fi
+
+    if [[ ! -e "${wt_dir}/.git" ]]; then
+      if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; then
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add "$wt_dir" "$branch" >&2
+      elif "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add --track -b "$branch" "$wt_dir" "origin/${branch}" >&2
+      else
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add -b "$branch" "$wt_dir" "$base_ref" >&2
+      fi
+    fi
+  ) 9>"$REPO_GIT_LOCK"
+
+  printf '%s' "$wt_dir"
+}
+
+# 同步主干基准分支到当前 worktree；若发生冲突则保留冲突标记，输出冲突文件清单交给 agy 解决
+prepare_base_merge() {
+  local wt_dir="$1"
+  local base_ref="$2"
+  local conflict_list_file="$3"
+
+  : > "$conflict_list_file"
+  [[ "$AUTO_SYNC_BASE" == "1" ]] || return 0
+
+  # 若上次残留未完成的 merge 状态，先中止回退再基于最新主干重新合并
+  if "$GIT_BIN" -C "$wt_dir" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
+  fi
+
+  # 如果目标基准分支已包含在当前 HEAD 历史中，无需合并
+  if "$GIT_BIN" -C "$wt_dir" merge-base --is-ancestor "$base_ref" HEAD 2>/dev/null; then
     return 0
   fi
 
-  # 清理可能失效的历史 worktree 元数据
-  "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-
-  if [[ "$GIT_FETCH" == "1" ]] && "$GIT_BIN" -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
+  # 若工作区已有未提交改动，暂不自动 merge 以免覆盖现场
+  local dirty=""
+  dirty="$("$GIT_BIN" -C "$wt_dir" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$dirty" ]]; then
+    printf '[%s] 提示：worktree 存在未提交改动，暂跳过自动合并 %s\n' "$("$DATE_BIN" '+%F %T')" "$base_ref" >&2
+    return 0
   fi
 
-  if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; then
-    "$GIT_BIN" -C "$REPO_ROOT" worktree add "$wt_dir" "$branch" >&2
-  elif "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
-    "$GIT_BIN" -C "$REPO_ROOT" worktree add --track -b "$branch" "$wt_dir" "origin/${branch}" >&2
-  else
-    "$GIT_BIN" -C "$REPO_ROOT" worktree add -b "$branch" "$wt_dir" "$base_ref" >&2
+  printf '[%s] 检测到主干 %s 有新提交，尝试自动合并到当前分支...\n' "$("$DATE_BIN" '+%F %T')" "$base_ref" >&2
+  if "$GIT_BIN" -C "$wt_dir" merge --no-edit "$base_ref" >&2; then
+    printf '[%s] 已干净合并主干 %s\n' "$("$DATE_BIN" '+%F %T')" "$base_ref" >&2
+    return 0
   fi
 
-  printf '%s' "$wt_dir"
+  # 发生合并冲突：保留冲突现场，收集未合并文件清单交给 agy 解决
+  "$GIT_BIN" -C "$wt_dir" diff --name-only --diff-filter=U > "$conflict_list_file" 2>/dev/null || true
+  if [[ -s "$conflict_list_file" ]]; then
+    printf '[%s] 合并 %s 产生冲突，将交由 agy 解决（冲突文件已记录）\n' "$("$DATE_BIN" '+%F %T')" "$base_ref" >&2
+    return 0
+  fi
+
+  # 非典型 merge 失败且无冲突清单时回退，避免遗留异常状态
+  "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
+  return 1
 }
 
 extract_conversation_id() {
@@ -419,6 +466,25 @@ while true; do
     continue
   fi
 
+  # 同步最新基准分支到当前 worktree；若产生合并冲突，保留冲突标记并交给 agy 解决
+  conflict_list_file="${session_dir}/merge-conflicts-${run_ts}.txt"
+  if ! prepare_base_merge "$wt_dir" "$base_ref" "$conflict_list_file"; then
+    printf '[%s] 警告：为 Issue #%s 同步主干 %s 失败，%ss 后重试...\n' \
+      "$("$DATE_BIN" '+%F %T')" "$number" "$base_ref" "$POLL_INTERVAL" >&2
+    "$SLEEP_BIN" "$POLL_INTERVAL"
+    continue
+  fi
+
+  merge_conflict_section=""
+  if [[ -s "$conflict_list_file" ]]; then
+    conflict_files_md=""
+    while IFS= read -r cf; do
+      [[ -z "$cf" ]] && continue
+      conflict_files_md+="- \`${cf}\`"$'\n'
+    done < "$conflict_list_file"
+    merge_conflict_section=$'\n\n'"### 必须先解决的 Git 合并冲突（合入 ${base_ref} 产生）"$'\n'"当前 worktree 正在合并最新基准分支 \`${base_ref}\`，以下文件存在冲突标记（\`<<<<<<<\` / \`=======\` / \`>>>>>>>\`）："$'\n'"${conflict_files_md}请完整解决全部冲突标记（同时保留主干 \`${base_ref}\` 的新变更与本 Issue 的有效修复），完成后再继续处理反馈并运行内部验证；不要执行 \`git commit\`，外层宿主机脚本会在你解决完毕后自动完成合并提交。"
+  fi
+
   # 读取已有会话 ID（若存在则自动续接）
   existing_conv_id=""
   if [[ -s "$conv_id_file" ]]; then
@@ -462,7 +528,7 @@ while true; do
 - Worktree 目录: ${wt_dir}
 
 ### Issue 内容
-${body}${review_feedback_section}
+${body}${merge_conflict_section}${review_feedback_section}
 
 ### 处理要求
 1. 你当前运行在专属 git worktree（分支 ${branch}）的沙箱中，先阅读相关代码并分析问题根因或需求范围。
@@ -559,40 +625,67 @@ EOF
 
   final_status="blocked"
   status_detail=""
+  merge_in_progress=0
+  if "$GIT_BIN" -C "$wt_dir" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    merge_in_progress=1
+  fi
 
   if (( run_ok == 0 )); then
+    (( merge_in_progress == 1 )) && "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
     final_status="blocked"
     status_detail="Agent 执行异常退出，已停止推进并保留 worktree 与会话记录；排查或补充信息后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
   elif [[ -n "$blocked_reason" ]]; then
+    (( merge_in_progress == 1 )) && "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
     final_status="blocked"
     status_detail="Agent 报告工作阻塞并已主动停止，未自动提交或推送。补充信息后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。"$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
   else
-    # 正常完成：若 worktree 有文件改动，由宿主机自动暂存并提交到当前分支
-    dirty_files="$("$GIT_BIN" -C "$wt_dir" status --porcelain 2>/dev/null || true)"
-    commit_ok=1
-    if [[ -n "$dirty_files" ]]; then
-      if ! "$GIT_BIN" -C "$wt_dir" add -A >&2 || ! "$GIT_BIN" -C "$wt_dir" commit -m "$commit_msg" >&2; then
-        commit_ok=0
-      fi
+    # 若存在正在进行的合并，先校验所有冲突文件中不再残留冲突标记
+    unresolved_conflicts=""
+    if (( merge_in_progress == 1 )) && [[ -s "$conflict_list_file" ]]; then
+      while IFS= read -r cf; do
+        [[ -z "$cf" ]] && continue
+        if [[ -f "${wt_dir}/${cf}" ]] && "$GREP_BIN" -qE '^(<<<<<<< |=======$|>>>>>>> )' "${wt_dir}/${cf}"; then
+          unresolved_conflicts+="- \`${cf}\`"$'\n'
+        fi
+      done < "$conflict_list_file"
     fi
 
-    if (( commit_ok == 0 )); then
+    if [[ -n "$unresolved_conflicts" ]]; then
+      "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
       final_status="blocked"
-      status_detail="Agent 已修改代码，但宿主机自动 \`git commit\` 失败（请检查 git user.name/email 或 pre-commit hook），已停止推送。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+      status_detail="合并 \`${base_ref}\` 后仍存在未解决的冲突标记，已自动中止合并并停止推送："$'\n'"${unresolved_conflicts}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
     else
-      commits_ahead="$("$GIT_BIN" -C "$wt_dir" rev-list --count "${base_ref}..HEAD" 2>/dev/null || printf '0')"
-      if (( commits_ahead > 0 )); then
-        if [[ "$GH_SYNC_ENABLED" == "1" && "$AUTO_PUSH_PR" == "1" ]]; then
-          push_ok=0
-          if [[ "$DRY_RUN" == "1" ]]; then
-            printf '[DRY_RUN] %s -C %q push -u origin %q\n' "$GIT_BIN" "$wt_dir" "$branch" >&2
-            push_ok=1
-          elif "$GIT_BIN" -C "$wt_dir" push -u origin "$branch" >&2; then
-            push_ok=1
-          fi
+      # 正常完成：若处于合并状态或有文件改动，由宿主机自动暂存并提交到当前分支
+      dirty_files="$("$GIT_BIN" -C "$wt_dir" status --porcelain 2>/dev/null || true)"
+      commit_ok=1
+      if (( merge_in_progress == 1 )); then
+        if ! "$GIT_BIN" -C "$wt_dir" add -A >&2 || ! "$GIT_BIN" -C "$wt_dir" commit --no-edit >&2; then
+          "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
+          commit_ok=0
+        fi
+      elif [[ -n "$dirty_files" ]]; then
+        if ! "$GIT_BIN" -C "$wt_dir" add -A >&2 || ! "$GIT_BIN" -C "$wt_dir" commit -m "$commit_msg" >&2; then
+          commit_ok=0
+        fi
+      fi
 
-          if (( push_ok == 1 )); then
-            "$CAT_BIN" > "$pr_body_file" <<EOF
+      if (( commit_ok == 0 )); then
+        final_status="blocked"
+        status_detail="Agent 已修改代码，但宿主机自动 \`git commit\` 失败（请检查 git user.name/email 或 pre-commit hook），已停止推送。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+      else
+        commits_ahead="$("$GIT_BIN" -C "$wt_dir" rev-list --count "${base_ref}..HEAD" 2>/dev/null || printf '0')"
+        if (( commits_ahead > 0 )); then
+          if [[ "$GH_SYNC_ENABLED" == "1" && "$AUTO_PUSH_PR" == "1" ]]; then
+            push_ok=0
+            if [[ "$DRY_RUN" == "1" ]]; then
+              printf '[DRY_RUN] %s -C %q push -u origin %q\n' "$GIT_BIN" "$wt_dir" "$branch" >&2
+              push_ok=1
+            elif "$GIT_BIN" -C "$wt_dir" push -u origin "$branch" >&2; then
+              push_ok=1
+            fi
+
+            if (( push_ok == 1 )); then
+              "$CAT_BIN" > "$pr_body_file" <<EOF
 ## Summary
 
 ${summary_text:-"Automated changes for issue #${number}."}
@@ -605,25 +698,26 @@ ${summary_text:-"Automated changes for issue #${number}."}
 
 Closes #${number}
 EOF
-            pr_title="fix(#${number}): ${title}"
-            if pr_url="$(gh_state ensure-pr "$number" "$branch" "$pr_base_branch" "$pr_title" "$pr_body_file")"; then
-              final_status="in-review"
-              status_detail="已完成开发实现与内部验证，并自动提交推送、创建/更新 Draft PR（${commits_ahead} 个提交），等待人工 Review。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+              pr_title="fix(#${number}): ${title}"
+              if pr_url="$(gh_state ensure-pr "$number" "$branch" "$pr_base_branch" "$pr_title" "$pr_body_file")"; then
+                final_status="in-review"
+                status_detail="已完成开发实现与内部验证，并自动提交推送、创建/更新 Draft PR（${commits_ahead} 个提交），等待人工 Review。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+              else
+                final_status="blocked"
+                status_detail="分支 \`${branch}\` 已推送，但创建/更新 Draft PR 失败，请人工检查。"
+              fi
             else
               final_status="blocked"
-              status_detail="分支 \`${branch}\` 已推送，但创建/更新 Draft PR 失败，请人工检查。"
+              status_detail="本地已自动生成 ${commits_ahead} 个提交，但 \`git push origin ${branch}\` 失败，请人工检查权限或远端冲突。"
             fi
           else
-            final_status="blocked"
-            status_detail="本地已自动生成 ${commits_ahead} 个提交，但 \`git push origin ${branch}\` 失败，请人工检查权限或远端冲突。"
+            final_status="in-review"
+            status_detail="本地 worktree 已自动生成 ${commits_ahead} 个提交（未启用自动推送/建 PR）。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
           fi
         else
-          final_status="in-review"
-          status_detail="本地 worktree 已自动生成 ${commits_ahead} 个提交（未启用自动推送/建 PR）。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+          final_status="blocked"
+          status_detail="Agent 执行结束但未产生任何代码改动或新提交，已停止建 PR；请人工确认后将标签改回 \`${LABEL_PREFIX}todo\`。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
         fi
-      else
-        final_status="blocked"
-        status_detail="Agent 执行结束但未产生任何代码改动或新提交，已停止建 PR；请人工确认后将标签改回 \`${LABEL_PREFIX}todo\`。${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
       fi
     fi
   fi

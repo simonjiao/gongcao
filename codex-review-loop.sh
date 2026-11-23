@@ -30,6 +30,8 @@ DATE_BIN="$(resolve_bin date)"
 SLEEP_BIN="$(resolve_bin sleep)"
 CAT_BIN="$(resolve_bin cat)"
 HEAD_BIN="$(resolve_bin head)"
+FLOCK_BIN="$(resolve_bin flock)"
+TIMEOUT_BIN="$(resolve_bin timeout)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -46,6 +48,7 @@ REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.2-sol}" # 默认使用 GPT-6.2-Sol
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 xhigh
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
+CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"    # 单次 codex 评审超时上限，防止进程卡死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
 MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # 评审不通过时是否同步将关联 Issue 切为 changes-requested（触发 agy 自动修复）
@@ -97,8 +100,10 @@ REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 REVIEWS_ROOT="${REVIEWS_ROOT:-${STATE_ROOT}/reviews}"
+REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
 
 "$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$REVIEWS_ROOT"
+"$TOUCH_BIN" "$REPO_GIT_LOCK"
 
 gh_state() {
   GONGCAO_HOME="$GONGCAO_HOME" \
@@ -213,26 +218,29 @@ prepare_review_worktree() {
   local head_sha="$3"
   local wt_dir="${WORKTREE_ROOT}/review-pr-${pr_num}"
 
-  "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
 
-  # 拉取 PR 对应分支与远端最新提交
-  "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
-  if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-    "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
-      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
-  fi
+    # 拉取 PR 对应分支与远端最新提交
+    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
+    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
+        "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
+    fi
 
-  local target_commit="$head_sha"
-  if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
-    target_commit="FETCH_HEAD"
-  fi
+    local target_commit="$head_sha"
+    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
+      target_commit="FETCH_HEAD"
+    fi
 
-  if [[ -e "${wt_dir}/.git" ]]; then
-    "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
-    "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
-  else
-    "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
-  fi
+    if [[ -e "${wt_dir}/.git" ]]; then
+      "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
+      "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
+    else
+      "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
+    fi
+  ) 9>"$REPO_GIT_LOCK"
 
   printf '%s' "$wt_dir"
 }
@@ -343,6 +351,33 @@ while true; do
   head_branch="$("$JQ_BIN" -r '.headRefName' <<<"$next_pr_json")"
   base_branch="$("$JQ_BIN" -r '.baseRefName' <<<"$next_pr_json")"
   head_sha="$("$JQ_BIN" -r '.headRefOid' <<<"$next_pr_json")"
+  mergeable="$("$JQ_BIN" -r '.mergeable // ""' <<<"$next_pr_json")"
+  merge_state="$("$JQ_BIN" -r '.mergeStateStatus // ""' <<<"$next_pr_json")"
+
+  # 前置冲突拦截：若 PR 与目标分支存在合并冲突，直接退回开发循环解决，避免浪费评审 Token
+  if [[ "$mergeable" == "CONFLICTING" || "$merge_state" == "DIRTY" ]]; then
+    issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
+    conflict_md="$("$CAT_BIN" <<EOF
+### Codex 独立评审前置拦截：存在合并冲突
+
+- PR #${pr_num}（\`${head_branch}\` -> \`${base_branch}\`）当前合并状态为 \`${mergeable:-CONFLICTING}\` / \`${merge_state:-DIRTY}\`。
+- 已将状态切为 \`${LABEL_PREFIX}changes-requested\`，请先同步最新 \`${base_branch}\` 并解决合并冲突后再进入评审（本次不消耗评审轮次）。
+EOF
+)"
+    printf '%s\n' "$conflict_md" | gh_state comment pr "$pr_num" - "$REVIEW_COMMENT_MARKER" || true
+    gh_state set-state pr "$pr_num" changes-requested || true
+    if [[ -n "$issue_num" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
+      gh_state set-state issue "$issue_num" changes-requested || true
+      printf '%s\n' "$conflict_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
+    fi
+    end_ts="$("$DATE_BIN" '+%F %T')"
+    printf '[%s] PR #%s 存在合并冲突 (%s/%s)，已直接退回 %schanges-requested\n' \
+      "$end_ts" "$pr_num" "$mergeable" "$merge_state" "$LABEL_PREFIX"
+    printf '[%s] [codex-review] PR #%s (Issue #%s) -> conflict-requeued (%schanges-requested)\n' \
+      "$end_ts" "$pr_num" "${issue_num:-?}" "$LABEL_PREFIX" >> "$ACTIVITY_LOG"
+    "$SLEEP_BIN" 5
+    continue
+  fi
 
   review_dir="${REVIEWS_ROOT}/pr-${pr_num}"
   "$MKDIR_BIN" -p "$review_dir"
@@ -450,10 +485,12 @@ ${pr_diff_snippet:-"(空 diff)"}
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出，请按需阅读完整源文件、调用点与相关单元测试以核实证据，不要轻信 PR 描述中的自我声明。
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
 3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。
-4. **严格区分阻塞项与范围外建议（禁止范围蔓延）**：
-   - 仅将「违反原始 Issue 明确验收标准、或本次 PR 改动新引入的实质性正确性/安全/回归 bug、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
-   - **凡超出原始 Issue 范围的延伸需求、次要/极端边缘的 UI 展示优化、仓库历史既有问题或轻微风格建议**，如果认为有参考价值，**一律放入 \`non_blocking_notes\`（作为非阻塞项记录）**，不得借此阻塞通过。
-5. **复审收敛规则（第 2 轮及以上）**：重点核验上一轮列出的阻塞问题是否已修复，以及本次修订是否引入新的实质性回归；不要在复审轮次不断追加与原始 Issue 无关的新要求。
+4. **严格区分阻塞项与范围外建议（务实分级，禁止范围蔓延）**：
+   - 仅将「违反原始 Issue 明确验收标准、真实运行崩溃（如空指针 / \`TypeError\`）、或本次改动引入的真实数据正确性/安全回归、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
+   - **以下情况若认为有参考价值，一律放入 \`non_blocking_notes\`（作为非阻塞项记录），不得阻塞通过**：
+     - 超出原始 Issue 范围的延伸需求、次要/极端边缘的 UI 展示优化、仓库历史既有问题或轻微风格建议；
+     - 仅在人工伪造非法内部 JSON 结构（例如后端内部契约字段被篡改为非预期类型）或极罕见理论标识符构造下才触发的额外防御。
+5. **复审收敛规则（第 2 轮及以上）**：重点核验上一轮列出的阻塞问题是否已修复，以及本次修订是否引入新的真实崩溃或核心回归；不要在复审轮次不断追加与原始 Issue 无关的新要求，确保 1~2 轮内收敛进入后续 E2E 验收。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
 EOF
 
@@ -475,15 +512,23 @@ EOF
   codex_args+=(-)
 
   codex_ok=0
-  if "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
+  codex_rc=0
+  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
     if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e '.verdict == "approve" or .verdict == "request_changes"' "$verdict_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
+  else
+    codex_rc=$?
   fi
 
   if (( codex_ok == 0 )); then
-    printf '[%s] 警告：Codex 评审 PR #%s 失败或输出不符合 Schema（未记录该 SHA，日志：%s），%ss 后重试...\n' \
-      "$("$DATE_BIN" '+%F %T')" "$pr_num" "$events_file" "$POLL_INTERVAL" >&2
+    if (( codex_rc == 124 )); then
+      printf '[%s] 警告：Codex 评审 PR #%s 超时（上限 %s，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$CODEX_TIMEOUT" "$events_file" "$POLL_INTERVAL" >&2
+    else
+      printf '[%s] 警告：Codex 评审 PR #%s 失败或输出不符合 Schema（exit=%d，未记录该 SHA，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$codex_rc" "$events_file" "$POLL_INTERVAL" >&2
+    fi
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
   fi

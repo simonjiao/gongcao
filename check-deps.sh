@@ -23,11 +23,15 @@ REQUIRED_CMDS=(
   head
   cp
   find
+  flock
+  timeout
+  tail
 )
 
-# 可选命令清单（如独立 PR 评审脚本 codex-review-loop.sh 使用）
+# 可选命令清单（如独立 PR 评审/E2E/tmux 看板脚本使用）
 OPTIONAL_CMDS=(
   codex
+  tmux
 )
 
 declare -A CMD_PATHS=()
