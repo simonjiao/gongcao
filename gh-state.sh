@@ -48,8 +48,9 @@ STATES=(
   "todo|0e8a16|Ready for agy to pick up"
   "in-progress|fbca04|Currently being processed by agy"
   "in-review|1d76db|Draft PR created or updated by agy, awaiting review"
-  "changes-requested|e99695|Reviewer requested changes; awaiting follow-up fixes"
-  "approved|2ea44f|Independent review passed; ready for human merge"
+  "changes-requested|e99695|Reviewer or E2E requested changes; awaiting follow-up fixes"
+  "approved|2ea44f|Independent code review passed; ready for E2E verification"
+  "e2e-passed|006b75|Independent E2E verification passed; ready for human merge"
   "blocked|d93f0b|Blocked or failed during automation; needs human attention"
   "done|5319e7|Completed"
 )
@@ -64,7 +65,7 @@ usage() {
   gh-state.sh list-prs [state] [label] [limit]
   gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
-  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|blocked|done>
+  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | -> [marker]
   gh-state.sh get-comment <issue|pr> <number> [marker]
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]

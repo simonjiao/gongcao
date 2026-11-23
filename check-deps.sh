@@ -21,6 +21,8 @@ REQUIRED_CMDS=(
   tee
   cat
   head
+  cp
+  find
 )
 
 # 可选命令清单（如独立 PR 评审脚本 codex-review-loop.sh 使用）
