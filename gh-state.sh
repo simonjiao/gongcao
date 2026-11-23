@@ -19,6 +19,7 @@ GH_BIN="$(resolve_bin gh)"
 JQ_BIN="$(resolve_bin jq)"
 CAT_BIN="$(resolve_bin cat)"
 MKDIR_BIN="$(resolve_bin mkdir)"
+SLEEP_BIN="$(resolve_bin sleep)"
 
 # ===== 可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -81,8 +82,50 @@ usage() {
 EOF
 }
 
+GH_MAX_RETRIES="${GH_MAX_RETRIES:-3}"
+
 run_gh() {
-  (cd -- "$REPO_DIR" && "$GH_BIN" "$@")
+  local attempt=1
+  local rc=0
+  local wait_sec=2
+  while true; do
+    if (cd -- "$REPO_DIR" && "$GH_BIN" "$@"); then
+      return 0
+    else
+      rc=$?
+    fi
+    if (( attempt >= GH_MAX_RETRIES )); then
+      return "$rc"
+    fi
+    printf '[gh-state] 警告：gh 调用失败 (exit=%d, 第 %d/%d 次)，%ss 后重试...\n' \
+      "$rc" "$attempt" "$GH_MAX_RETRIES" "$wait_sec" >&2
+    "$SLEEP_BIN" "$wait_sec"
+    attempt=$((attempt + 1))
+    wait_sec=$((wait_sec * 2))
+  done
+}
+
+run_gh_stdin() {
+  local stdin_data="$1"
+  shift
+  local attempt=1
+  local rc=0
+  local wait_sec=2
+  while true; do
+    if (cd -- "$REPO_DIR" && printf '%s\n' "$stdin_data" | "$GH_BIN" "$@"); then
+      return 0
+    else
+      rc=$?
+    fi
+    if (( attempt >= GH_MAX_RETRIES )); then
+      return "$rc"
+    fi
+    printf '[gh-state] 警告：gh stdin 调用失败 (exit=%d, 第 %d/%d 次)，%ss 后重试...\n' \
+      "$rc" "$attempt" "$GH_MAX_RETRIES" "$wait_sec" >&2
+    "$SLEEP_BIN" "$wait_sec"
+    attempt=$((attempt + 1))
+    wait_sec=$((wait_sec * 2))
+  done
 }
 
 RESOLVED_REPO=""
@@ -300,7 +343,7 @@ cmd_set_state() {
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '[DRY_RUN] PUT repos/%s/issues/%s/labels %s\n' "$repo_slug" "$number" "$payload" >&2
   else
-    printf '%s\n' "$payload" | run_gh api -X PUT "repos/${repo_slug}/issues/${number}/labels" --input - >/dev/null
+    run_gh_stdin "$payload" api -X PUT "repos/${repo_slug}/issues/${number}/labels" --input - >/dev/null
     printf '已切换 %s #%s 状态 -> %s\n' "$kind" "$number" "$target_label" >&2
   fi
 }
@@ -442,7 +485,7 @@ cmd_ensure_pr() {
     else
       local patch_payload=""
       patch_payload="$("$JQ_BIN" -c -n --arg title "$pr_title" --arg body "$pr_body" '{title: $title, body: $body}')"
-      printf '%s\n' "$patch_payload" | run_gh api -X PATCH "repos/${repo_slug}/pulls/${existing_num}" --input - >/dev/null
+      run_gh_stdin "$patch_payload" api -X PATCH "repos/${repo_slug}/pulls/${existing_num}" --input - >/dev/null
       printf '已更新现有 PR #%s: %s\n' "$existing_num" "$existing_url" >&2
     fi
     cmd_set_state pr "$existing_num" in-review
