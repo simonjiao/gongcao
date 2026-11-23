@@ -3,10 +3,10 @@ set -euo pipefail
 
 # 检查 agy-issue-loop.sh 所需的全部命令，并一律使用绝对路径调用
 
-# 补充常见用户目录到搜索路径（避免非登录 shell 找不到 ~/.local/bin/agy）
-SEARCH_PATH="${PATH}:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
+# 补充常见用户目录与 linuxbrew 目录到搜索路径
+SEARCH_PATH="${PATH}:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
 
-# 需要检查的命令清单
+# 需要检查的必需命令清单
 REQUIRED_CMDS=(
   bash
   gh
@@ -20,6 +20,12 @@ REQUIRED_CMDS=(
   sleep
   tee
   cat
+  head
+)
+
+# 可选命令清单（如独立 PR 评审脚本 codex-review-loop.sh 使用）
+OPTIONAL_CMDS=(
+  codex
 )
 
 declare -A CMD_PATHS=()
@@ -75,6 +81,19 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
   else
     printf '[MISSING] %-8s -> 未找到可执行文件\n' "$cmd"
     missing_count=$((missing_count + 1))
+  fi
+done
+
+for cmd in "${OPTIONAL_CMDS[@]}"; do
+  if bin_path="$(resolve_cmd "$cmd")"; then
+    CMD_PATHS["$cmd"]="$bin_path"
+    if ver="$(get_version "$cmd" "$bin_path")"; then
+      printf '[OPT-OK]  %-8s -> %-32s | %s\n' "$cmd" "$bin_path" "$ver"
+    else
+      printf '[OPT-WRN] %-8s -> %-32s | 无法获取版本\n' "$cmd" "$bin_path"
+    fi
+  else
+    printf '[OPT-MIS] %-8s -> 未找到（仅 codex-review-loop.sh 需要）\n' "$cmd"
   fi
 done
 

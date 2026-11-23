@@ -48,7 +48,9 @@ STATES=(
   "todo|0e8a16|Ready for agy to pick up"
   "in-progress|fbca04|Currently being processed by agy"
   "in-review|1d76db|Draft PR created or updated by agy, awaiting review"
-  "blocked|d93f0b|Blocked or failed during agy execution; needs human attention"
+  "changes-requested|e99695|Reviewer requested changes; awaiting follow-up fixes"
+  "approved|2ea44f|Independent review passed; ready for human merge"
+  "blocked|d93f0b|Blocked or failed during automation; needs human attention"
   "done|5319e7|Completed"
 )
 
@@ -58,9 +60,13 @@ usage() {
   gh-state.sh clone-repo <owner/repo> [dest_dir]
   gh-state.sh init-labels
   gh-state.sh list-issues [state] [label] [limit]
+  gh-state.sh get-issue <number>
+  gh-state.sh list-prs [state] [label] [limit]
+  gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
-  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|blocked|done>
-  gh-state.sh comment <issue|pr> <number> <body | ->
+  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|blocked|done>
+  gh-state.sh comment <issue|pr> <number> <body | -> [marker]
+  gh-state.sh get-comment <issue|pr> <number> [marker]
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
 
 环境变量:
@@ -169,6 +175,54 @@ cmd_list_issues() {
   run_gh "${args[@]}"
 }
 
+cmd_get_issue() {
+  local number="${1:-}"
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf '错误：get-issue 需要有效的 <number>\n' >&2
+    exit 2
+  fi
+  local -a extra_args=()
+  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+  run_gh issue view "$number" --json number,title,body,state,url,labels "${extra_args[@]}"
+}
+
+cmd_list_prs() {
+  local pr_state="${1:-open}"
+  local filter_label="${2:-}"
+  local limit="${3:-20}"
+
+  if [[ "$pr_state" != "open" && "$pr_state" != "closed" && "$pr_state" != "merged" && "$pr_state" != "all" ]]; then
+    printf '错误：list-prs 的 state 无效 (%q)，应为 open|closed|merged|all\n' "$pr_state" >&2
+    exit 2
+  fi
+  if [[ ! "$limit" =~ ^[0-9]+$ ]] || (( limit <= 0 )); then
+    printf '错误：list-prs 的 limit 必须是正整数 (%q)\n' "$limit" >&2
+    exit 2
+  fi
+
+  local -a args=(
+    pr list
+    --state "$pr_state"
+    --limit "$limit"
+    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,labels
+  )
+  [[ -n "$REPO" ]] && args+=(--repo "$REPO")
+  [[ -n "$filter_label" ]] && args+=(--label "$filter_label")
+
+  run_gh "${args[@]}"
+}
+
+cmd_get_pr_diff() {
+  local number="${1:-}"
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf '错误：get-pr-diff 需要有效的 <number>\n' >&2
+    exit 2
+  fi
+  local -a extra_args=()
+  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+  run_gh pr diff "$number" "${extra_args[@]}"
+}
+
 cmd_init_labels() {
   local item name rest color desc full_label
   local -a extra_args=()
@@ -254,9 +308,10 @@ cmd_comment() {
   local kind="${1:-}"
   local number="${2:-}"
   local body_arg="${3:-}"
+  local marker="${4:-$COMMENT_MARKER}"
 
   if [[ "$kind" != "issue" && "$kind" != "pr" ]] || [[ ! "$number" =~ ^[0-9]+$ ]] || [[ -z "$body_arg" ]]; then
-    printf '错误：comment 参数无效（需要 <issue|pr> <number> <body | ->）\n' >&2
+    printf '错误：comment 参数无效（需要 <issue|pr> <number> <body | -> [marker]）\n' >&2
     exit 2
   fi
 
@@ -268,8 +323,8 @@ cmd_comment() {
   fi
 
   # 确保顶部包含隐藏标记，便于下次原地覆盖更新
-  if [[ "$body" != *"$COMMENT_MARKER"* ]]; then
-    body="${COMMENT_MARKER}"$'\n'"${body}"
+  if [[ "$body" != *"$marker"* ]]; then
+    body="${marker}"$'\n'"${body}"
   fi
 
   local repo_slug
@@ -282,7 +337,7 @@ cmd_comment() {
   if [[ -n "$comments_json" ]]; then
     while IFS= read -r cid; do
       [[ -n "$cid" ]] && existing_id="$cid"
-    done < <("$JQ_BIN" -r --arg marker "$COMMENT_MARKER" \
+    done < <("$JQ_BIN" -r --arg marker "$marker" \
       'select((.body // "") | contains($marker)) | .id' <<<"$comments_json")
   fi
 
@@ -304,6 +359,30 @@ cmd_comment() {
       -f body="$body" >/dev/null
     printf '已创建 %s #%s 置顶状态评论\n' "$kind" "$number" >&2
   fi
+}
+
+cmd_get_comment() {
+  local kind="${1:-}"
+  local number="${2:-}"
+  local marker="${3:-$COMMENT_MARKER}"
+
+  if [[ "$kind" != "issue" && "$kind" != "pr" ]] || [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf '错误：get-comment 参数无效（需要 <issue|pr> <number> [marker]）\n' >&2
+    exit 2
+  fi
+
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+
+  local comments_json=""
+  comments_json="$(run_gh api --paginate "repos/${repo_slug}/issues/${number}/comments?per_page=100" --jq '.[]')"
+  if [[ -z "$comments_json" ]]; then
+    return 0
+  fi
+
+  "$JQ_BIN" -rs --arg marker "$marker" \
+    '[.[] | select((.body // "") | contains($marker))] | last | .body // empty' \
+    <<<"$comments_json"
 }
 
 cmd_find_pr() {
@@ -403,9 +482,13 @@ main() {
     clone-repo)  cmd_clone_repo "$@" ;;
     init-labels) cmd_init_labels "$@" ;;
     list-issues) cmd_list_issues "$@" ;;
+    get-issue)   cmd_get_issue "$@" ;;
+    list-prs)    cmd_list_prs "$@" ;;
+    get-pr-diff) cmd_get_pr_diff "$@" ;;
     find-pr)     cmd_find_pr "$@" ;;
     set-state)   cmd_set_state "$@" ;;
     comment)     cmd_comment "$@" ;;
+    get-comment) cmd_get_comment "$@" ;;
     ensure-pr)   cmd_ensure_pr "$@" ;;
     -h|--help|"")
       usage

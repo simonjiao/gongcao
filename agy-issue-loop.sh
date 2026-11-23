@@ -48,6 +48,8 @@ if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
 else
   FILTER_LABEL="${FILTER_LABEL-}"
 fi
+HANDLE_CHANGES_REQUESTED="${HANDLE_CHANGES_REQUESTED:-1}" # 是否自动接回评审打回的 agy:changes-requested（1=是，0=否）
+REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
 PRINT_TIMEOUT="${PRINT_TIMEOUT:-15m}"
@@ -194,6 +196,8 @@ ensure_worktree() {
 
   if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; then
     "$GIT_BIN" -C "$REPO_ROOT" worktree add "$wt_dir" "$branch" >&2
+  elif "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+    "$GIT_BIN" -C "$REPO_ROOT" worktree add --track -b "$branch" "$wt_dir" "origin/${branch}" >&2
   else
     "$GIT_BIN" -C "$REPO_ROOT" worktree add -b "$branch" "$wt_dir" "$base_ref" >&2
   fi
@@ -307,10 +311,32 @@ while true; do
     fi
   fi
 
-  # 通过 gh-state.sh 拉取待处理 issue 列表（带网络/限流容错与指数退避，不中断常驻循环）
-  issues_json=""
-  if ! issues_json="$(gh_state list-issues "$ISSUE_STATE" "$FILTER_LABEL" "$ISSUE_LIMIT")" \
-    || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$issues_json"; then
+  # 通过 gh-state.sh 拉取待处理 issue 列表（优先接回评审打回的 changes-requested，再拉取 todo）
+  issues_json="[]"
+  picked_from_changes_requested=0
+  poll_failed=0
+
+  if [[ "$GH_SYNC_ENABLED" == "1" && "$HANDLE_CHANGES_REQUESTED" == "1" ]]; then
+    cr_json=""
+    if cr_json="$(gh_state list-issues "$ISSUE_STATE" "${LABEL_PREFIX}changes-requested" "$ISSUE_LIMIT")" \
+      && "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$cr_json"; then
+      if "$JQ_BIN" -e 'length > 0' >/dev/null 2>&1 <<<"$cr_json"; then
+        issues_json="$cr_json"
+        picked_from_changes_requested=1
+      fi
+    else
+      poll_failed=1
+    fi
+  fi
+
+  if (( poll_failed == 0 && picked_from_changes_requested == 0 )); then
+    if ! issues_json="$(gh_state list-issues "$ISSUE_STATE" "$FILTER_LABEL" "$ISSUE_LIMIT")" \
+      || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$issues_json"; then
+      poll_failed=1
+    fi
+  fi
+
+  if (( poll_failed == 1 )); then
     consecutive_poll_errors=$((consecutive_poll_errors + 1))
     wait_sec="$(calc_backoff "$consecutive_poll_errors")"
     printf '[%s] 警告：拉取 issue 列表失败（连续第 %d 次），%ss 后重试...\n' \
@@ -324,7 +350,7 @@ while true; do
   next_issue_json=""
   while IFS= read -r row; do
     num="$("$JQ_BIN" -r '.number' <<<"$row")"
-    if (( USE_LOCAL_DEDUP == 0 )) || ! "$GREP_BIN" -qx "$num" "$STATE_FILE"; then
+    if (( picked_from_changes_requested == 1 || USE_LOCAL_DEDUP == 0 )) || ! "$GREP_BIN" -qx "$num" "$STATE_FILE"; then
       next_issue_json="$row"
       break
     fi
@@ -403,6 +429,15 @@ while true; do
       "Agent 已认领该 Issue，正在独立 worktree 中分析与开发。"
   fi
 
+  # 若本轮是评审打回（changes-requested），拉取最新 Codex 评审意见注入 prompt
+  review_feedback_section=""
+  if (( picked_from_changes_requested == 1 )) && [[ "$GH_SYNC_ENABLED" == "1" ]]; then
+    review_feedback="$(gh_state get-comment issue "$number" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
+    if [[ -n "$review_feedback" ]]; then
+      review_feedback_section=$'\n\n'"### 独立评审反馈（请优先逐项修复以下阻塞问题）"$'\n'"${review_feedback}"
+    fi
+  fi
+
   prompt="$("$CAT_BIN" <<EOF
 请处理以下 GitHub Issue：
 
@@ -415,7 +450,7 @@ while true; do
 - Worktree 目录: ${wt_dir}
 
 ### Issue 内容
-${body}
+${body}${review_feedback_section}
 
 ### 处理要求
 1. 你当前运行在专属 git worktree（分支 ${branch}）的沙箱中，先阅读相关代码并分析问题根因或需求范围。
