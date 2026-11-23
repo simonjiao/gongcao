@@ -111,10 +111,13 @@ gh_state() {
 extract_linked_issue() {
   local pr_body="$1"
   local head_branch="$2"
-  local num=""
-  num="$(printf '%s\n' "$pr_body" | "$GREP_BIN" -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' | "$HEAD_BIN" -n 1 | "$GREP_BIN" -oE '[0-9]+' || true)"
+  local match="" num=""
+
+  match="$("$GREP_BIN" -oiE -m 1 '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<<"$pr_body" || true)"
+  [[ -n "$match" ]] && num="${match##*#}"
   if [[ -z "$num" ]]; then
-    num="$(printf '%s\n' "$head_branch" | "$GREP_BIN" -oE 'issue-[0-9]+' | "$HEAD_BIN" -n 1 | "$GREP_BIN" -oE '[0-9]+' || true)"
+    match="$("$GREP_BIN" -oE -m 1 'issue-[0-9]+' <<<"$head_branch" || true)"
+    [[ -n "$match" ]] && num="${match#issue-}"
   fi
   printf '%s' "$num"
 }

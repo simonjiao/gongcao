@@ -228,11 +228,13 @@ EOF
 extract_linked_issue() {
   local pr_body="$1"
   local head_branch="$2"
-  local num=""
+  local match="" num=""
 
-  num="$(printf '%s\n' "$pr_body" | "$GREP_BIN" -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' | "$HEAD_BIN" -n 1 | "$GREP_BIN" -oE '[0-9]+' || true)"
+  match="$("$GREP_BIN" -oiE -m 1 '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<<"$pr_body" || true)"
+  [[ -n "$match" ]] && num="${match##*#}"
   if [[ -z "$num" ]]; then
-    num="$(printf '%s\n' "$head_branch" | "$GREP_BIN" -oE 'issue-[0-9]+' | "$HEAD_BIN" -n 1 | "$GREP_BIN" -oE '[0-9]+' || true)"
+    match="$("$GREP_BIN" -oE -m 1 'issue-[0-9]+' <<<"$head_branch" || true)"
+    [[ -n "$match" ]] && num="${match#issue-}"
   fi
   printf '%s' "$num"
 }
@@ -602,7 +604,8 @@ EOF
   fi
 
   pr_diff_raw="$(gh_state get-pr-diff "$pr_num" 2>/dev/null || true)"
-  pr_diff_snippet="$(printf '%s' "$pr_diff_raw" | "$HEAD_BIN" -c "$MAX_DIFF_BYTES")"
+  # 使用纯 Bash 切片截断，避免 set -o pipefail 下 printf | head 触发 SIGPIPE (141) 退出
+  pr_diff_snippet="${pr_diff_raw:0:MAX_DIFF_BYTES}"
   if (( ${#pr_diff_raw} > MAX_DIFF_BYTES )); then
     pr_diff_snippet="${pr_diff_snippet}"$'\n\n'"... (diff 已截断，可在当前工作区用 git diff origin/${base_branch}...HEAD 查看)"
   fi

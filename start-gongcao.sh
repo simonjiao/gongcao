@@ -102,6 +102,8 @@ case "$ACTION" in
     # 窗口 0：dev (agy-issue-loop.sh)
     "$TMUX_BIN" new-session -d -s "$SESSION_NAME" -n "dev" \
       "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/agy-issue-loop.sh")"
+    # 防止任何窗口进程意外退出时窗口直接消失，保留最后报错现场
+    "$TMUX_BIN" set-option -t "$SESSION_NAME" remain-on-exit on
 
     # 窗口 1：review (codex-review-loop.sh)
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "review" \
