@@ -323,9 +323,10 @@ ${body}
 
 ### 处理要求
 1. 你当前运行在专属 git worktree（分支 ${branch}）中，先阅读相关代码并分析问题根因或需求范围。
-2. 给出并实施最小必要改动，运行相关测试验证。
-3. 验证通过后，将本次修改提交到当前分支 ${branch}（使用清晰的 commit message，不要执行 git push，也不要修改 GitHub Issue/PR 状态，这些由外层脚本统一处理）。
-4. 将本次改动的简明中文总结（改动文件、验证结果、风险或阻塞原因）写入 ${summary_tmp}（不要把总结文件提交到仓库）。
+2. 仅完成开发实现和相关内部验证（如类型检查、构建检查、改动相关的单元测试或模块级测试）。
+3. **不需要执行 E2E（端到端）验证**（例如浏览器自动化 E2E、启动完整外部依赖服务或全链路集成环境测试）；不要在 E2E 环境准备上耗费时间。
+4. 内部验证通过后，将本次修改提交到当前分支 ${branch}（使用清晰的 commit message，不要执行 git push，也不要修改 GitHub Issue/PR 状态，这些由外层脚本统一推送并生成 PR）。
+5. 将本次改动的简明中文总结（改动文件、已执行的内部验证结果、显式标注 E2E 未执行，以及风险或阻塞原因）写入 ${summary_tmp}（不要把总结文件提交到仓库）。
 EOF
 )"
 
@@ -403,6 +404,7 @@ ${summary_text:-"Automated changes for issue #${number}."}
 - Issue: #${number}
 - Branch: \`${branch}\`
 - Conversation ID: \`${final_conv_id:-"(none)"}\`
+- Verification Scope: 仅完成开发实现与内部验证（未执行 E2E 验证）
 
 Closes #${number}
 EOF
