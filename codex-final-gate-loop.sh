@@ -59,6 +59,8 @@ CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"
 AUTO_MERGE="${AUTO_MERGE:-1}"                # 1=终审通过后自动转 Ready 并合并；0=仅更新信息并标 agy:ready-to-merge
 MERGE_METHOD="${MERGE_METHOD:-merge}"        # 首选默认合并方式: merge | squash | rebase（默认保留 merge commit）
 FINAL_GATE_JUDGE_MERGE_METHOD="${FINAL_GATE_JUDGE_MERGE_METHOD:-1}" # 1=由终审结合仓库策略、提交拓扑与冲突演练裁定合并方式；0=强制使用 MERGE_METHOD
+AUTO_RESOLVE_TRIVIAL_CONFLICT="${AUTO_RESOLVE_TRIVIAL_CONFLICT:-1}" # 1=终审先判断冲突性质，机械/简单冲突直接就地解决并推进合入，仅实质冲突退回开发；0=一律退回
+CONFLICT_RESOLVE_TIMEOUT="${CONFLICT_RESOLVE_TIMEOUT:-10m}"
 REQUIRE_EVIDENCE_SHA_MATCH="${REQUIRE_EVIDENCE_SHA_MATCH:-1}" # 1=硬校验远端证据 tested_sha == head_sha
 REQUIRE_CI_PASS="${REQUIRE_CI_PASS:-1}"      # 1=硬校验 CI 无失败且无进行中检查
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}"
@@ -133,8 +135,8 @@ printf '  Codex 命令 : %s (model=%s, effort=%s, sandbox=%s, timeout=%s)\n' \
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  终审档案根 : %s\n' "$FINAL_ROOT"
-printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, DRY_RUN=%s\n' \
-  "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$DRY_RUN"
+printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, DRY_RUN=%s\n' \
+  "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$DRY_RUN"
 printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s)\n' \
   "$FINAL_GATE_LABEL" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS"
 
@@ -448,6 +450,301 @@ resolve_safe_merge_method() {
   printf '%s\t%s\n' "$fallback" "$note"
 }
 
+write_conflict_triage_schema() {
+  local schema_file="$1"
+  "$CAT_BIN" > "$schema_file" <<'EOF'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action", "reason", "resolved_files", "verification_note"],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["resolved", "requeue_dev", "blocked"]
+    },
+    "reason": { "type": "string" },
+    "resolved_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "verification_note": { "type": "string" }
+  }
+}
+EOF
+}
+
+# 终审冲突分诊与就地消解：
+# 先在隔离 worktree 执行 git merge --no-commit --no-ff origin/<base_branch>，
+# 由 Codex 判断冲突是否可直接处理（相邻新增/import/路由注册/文档/配置等机械冲突）：
+#   - 可直接处理 -> 仅在冲突文件就地消解并由宿主机严格校验（无冲突标记、无无关改动、无未追踪文件）后提交并推送合并提交；
+#   - 不可直接处理（核心逻辑/契约冲突或会影响 E2E 结论）-> 中止合并，返回 requeue_dev 才转交 agy:changes-requested。
+# 输出 JSON: {outcome: "clean"|"resolved"|"dry_run_resolved"|"requeue_dev"|"blocked", new_head_sha, reason, conflict_files, verification_note}
+triage_and_resolve_conflict() {
+  local pr_num="$1"
+  local head_branch="$2"
+  local base_branch="$3"
+  local head_sha="$4"
+  local final_dir="$5"
+  local run_ts="$6"
+  local stage_tag="$7"
+
+  local resolve_wt="${WORKTREE_ROOT}/final-resolve-pr-${pr_num}"
+  local base_ref="origin/${base_branch}"
+
+  emit_triage_json() {
+    "$JQ_BIN" -n \
+      --arg outcome "$1" \
+      --arg new_head_sha "$2" \
+      --arg reason "$3" \
+      --arg conflict_files "$4" \
+      --arg verification_note "$5" \
+      '{
+        outcome: $outcome,
+        new_head_sha: $new_head_sha,
+        reason: $reason,
+        conflict_files: $conflict_files,
+        verification_note: $verification_note
+      }'
+  }
+
+  abort_resolve_wt() {
+    (
+      "$FLOCK_BIN" -x 9
+      if [[ -e "${resolve_wt}/.git" ]]; then
+        "$GIT_BIN" -C "$resolve_wt" merge --abort >/dev/null 2>&1 || true
+        "$GIT_BIN" -C "$resolve_wt" reset --hard "$head_sha" >/dev/null 2>&1 || true
+        "$GIT_BIN" -C "$resolve_wt" clean -fd >/dev/null 2>&1 || true
+      fi
+    ) 9>"$REPO_GIT_LOCK"
+  }
+
+  local merge_clean=0
+  local orig_conflict_files=""
+  local conflict_diff_raw=""
+  local base_touch_log=""
+
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin "$base_branch" >&2 || true
+    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
+        "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2 || true
+    fi
+
+    if [[ -e "${resolve_wt}/.git" ]]; then
+      "$GIT_BIN" -C "$resolve_wt" merge --abort >/dev/null 2>&1 || true
+      "$GIT_BIN" -C "$resolve_wt" checkout --detach --force "$head_sha" >&2
+      "$GIT_BIN" -C "$resolve_wt" clean -fd >/dev/null 2>&1 || true
+    else
+      "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$resolve_wt" "$head_sha" >&2
+    fi
+  ) 9>"$REPO_GIT_LOCK"
+
+  if "$GIT_BIN" -C "$resolve_wt" merge --no-commit --no-ff "$base_ref" >/dev/null 2>&1; then
+    merge_clean=1
+  fi
+
+  if (( merge_clean == 1 )); then
+    abort_resolve_wt
+    emit_triage_json "clean" "$head_sha" "实时合并演练无冲突" "" ""
+    return 0
+  fi
+
+  orig_conflict_files="$("$GIT_BIN" -C "$resolve_wt" diff --name-only --diff-filter=U 2>/dev/null | "$SORT_BIN" -u || true)"
+  if [[ -z "$orig_conflict_files" ]]; then
+    abort_resolve_wt
+    emit_triage_json "requeue_dev" "" "git merge 未能自动合并且未列出明确冲突文件，需开发介入检查" "" ""
+    return 0
+  fi
+
+  if [[ "$AUTO_RESOLVE_TRIVIAL_CONFLICT" != "1" ]]; then
+    abort_resolve_wt
+    emit_triage_json "requeue_dev" "" "已关闭终审自动解简单冲突（AUTO_RESOLVE_TRIVIAL_CONFLICT=0）" "$orig_conflict_files" ""
+    return 0
+  fi
+
+  conflict_diff_raw="$("$GIT_BIN" -C "$resolve_wt" diff 2>/dev/null || true)"
+  local conflict_diff_snippet="${conflict_diff_raw:0:30000}"
+  base_touch_log="$("$GIT_BIN" -C "$resolve_wt" log --oneline -n 15 "${head_sha}..${base_ref}" 2>/dev/null || true)"
+
+  local triage_schema="${final_dir}/conflict-schema.json"
+  local triage_prompt="${final_dir}/conflict-prompt-${stage_tag}-${run_ts}.md"
+  local triage_events="${final_dir}/conflict-events-${stage_tag}-${run_ts}.jsonl"
+  local triage_decision="${final_dir}/conflict-decision-${stage_tag}-${run_ts}.json"
+  write_conflict_triage_schema "$triage_schema"
+
+  "$CAT_BIN" > "$triage_prompt" <<EOF
+你是本流水线的 **终审冲突分诊与合并处理官（Final Gate Conflict Resolver）**。
+PR #${pr_num}（\`${head_branch}\` @ \`${head_sha:0:10}\` -> \`${base_branch}\`）已通过代码评审与 E2E 验收，但当前与最新 \`${base_ref}\` 演练合并时出现以下冲突。
+
+**核心原则：不要把可直接处理的机械冲突盲目转交 \`changes-requested\` 浪费整轮开发与 E2E 回归；但凡涉及实质逻辑/契约冲突或会使 E2E 结论失效，也绝不可强行凑合。**
+
+## 冲突文件清单（仅限以下文件存在未合并冲突）
+\`\`\`text
+${orig_conflict_files}
+\`\`\`
+
+## 主干 \`${base_ref}\` 新增提交（\`${head_sha:0:10}..${base_ref}\`）
+\`\`\`text
+${base_touch_log:-"(无)"}
+\`\`\`
+
+## 当前冲突片段（git diff）
+\`\`\`diff
+${conflict_diff_snippet:-"(空)"}
+\`\`\`
+
+## 分诊与处理规则（务必严格遵守）
+1. **先判断冲突是否属于「可直接处理的简单/机械冲突」**：
+   - ✅ **可直接处理（\`action: "resolved"\`）**：
+     - 相邻行各自独立新增（如 import/export、路由/菜单/模块注册、配置项、枚举、测试列表、文档/CHANGELOG、锁文件或并列独立代码块）；
+     - 保留双方有效改动即可唯一确定结果，**不改变本 PR 的核心业务逻辑，也不影响既有 E2E 验收结论**；
+     - 无需修改冲突文件清单以外的任何文件。
+   - ❌ **必须转交开发（\`action: "requeue_dev"\`）**：
+     - 双方修改了同一段核心业务逻辑、同一函数实现/签名、数据结构、状态机或 API 契约；
+     - 消解冲突需要重新设计逻辑、修改非冲突文件、修改测试预期，或会导致既有 E2E 验收失效；
+     - 二进制文件冲突或复杂的删改冲突无法明确裁定。
+2. **若判定为可直接处理**：
+   - 在当前工作区（\`${resolve_wt}\`）**仅编辑上述冲突文件清单中的文件**，彻底消解全部 \`<<<<<<<\` / \`=======\` / \`>>>>>>>\` 冲突标记，完整保留主干与 PR 双方的有效改动；
+   - **禁止**修改非冲突文件，**禁止**遗留未追踪临时文件，**禁止**执行 \`git add\` / \`git commit\` / \`git push\`（由外层宿主机校验后统一提交并推送）；
+   - 如改动涉及代码文件，可按需运行最小语法/类型检查或相关单测（无需运行 E2E），把检查结果写入 \`verification_note\`；
+   - 输出 \`action: "resolved"\`。
+3. **若判定为实质性冲突不可直接处理**：
+   - 不要强行修改或提交；输出 \`action: "requeue_dev"\`，并在 \`reason\` 中写明具体冲突逻辑与开发处理建议。
+4. 最终输出必须严格符合 JSON Schema。
+EOF
+
+  printf '[%s] PR #%s (%s) 检测到合并冲突，启动 Codex 终审冲突分诊（判断可直接解决还是退回开发）...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$pr_num" "$stage_tag" >&2
+
+  local -a c_args=(
+    exec
+    -s workspace-write
+    -C "$resolve_wt"
+    --output-schema "$triage_schema"
+    -o "$triage_decision"
+    --json
+    --color never
+  )
+  [[ -n "$CODEX_MODEL" ]] && c_args+=(-m "$CODEX_MODEL")
+  [[ -n "$CODEX_REASONING_EFFORT" ]] && c_args+=(-c "model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"")
+  c_args+=(-)
+
+  local c_ok=0
+  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CONFLICT_RESOLVE_TIMEOUT" "$CODEX_BIN" "${c_args[@]}" < "$triage_prompt" > "$triage_events"; then
+    if [[ -s "$triage_decision" ]] && "$JQ_BIN" -e '.action == "resolved" or .action == "requeue_dev" or .action == "blocked"' "$triage_decision" >/dev/null 2>&1; then
+      c_ok=1
+    fi
+  fi
+
+  if (( c_ok == 0 )); then
+    abort_resolve_wt
+    emit_triage_json "requeue_dev" "" "Codex 冲突分诊/消解超时或输出异常，为安全起见转交开发处理" "$orig_conflict_files" ""
+    return 0
+  fi
+
+  local t_action t_reason t_verify
+  t_action="$("$JQ_BIN" -r '.action' "$triage_decision")"
+  t_reason="$("$JQ_BIN" -r '.reason // ""' "$triage_decision")"
+  t_verify="$("$JQ_BIN" -r '.verification_note // ""' "$triage_decision")"
+
+  if [[ "$t_action" != "resolved" ]]; then
+    abort_resolve_wt
+    emit_triage_json "$t_action" "" "$t_reason" "$orig_conflict_files" "$t_verify"
+    return 0
+  fi
+
+  # 宿主机确定性安全校验：
+  # 1. 不允许遗留未追踪文件
+  local untracked=""
+  untracked="$("$GIT_BIN" -C "$resolve_wt" ls-files --others --exclude-standard 2>/dev/null || true)"
+  if [[ -n "$untracked" ]]; then
+    abort_resolve_wt
+    emit_triage_json "requeue_dev" "" "冲突消解校验失败：产生了未追踪文件（${untracked}），已中止并转交开发处理" "$orig_conflict_files" "$t_verify"
+    return 0
+  fi
+
+  # 2. 不允许修改冲突清单之外的文件
+  local wt_modified="" extra_touched=""
+  wt_modified="$("$GIT_BIN" -C "$resolve_wt" diff --name-only 2>/dev/null | "$SORT_BIN" -u || true)"
+  if [[ -n "$wt_modified" ]]; then
+    extra_touched="$("$COMM_BIN" -23 <(printf '%s\n' "$wt_modified") <(printf '%s\n' "$orig_conflict_files") || true)"
+    if [[ -n "$extra_touched" ]]; then
+      abort_resolve_wt
+      emit_triage_json "requeue_dev" "" "冲突消解校验失败：改动超出了冲突文件范围（额外修改：${extra_touched}），不属于机械冲突，已转交开发处理" "$orig_conflict_files" "$t_verify"
+      return 0
+    fi
+  fi
+
+  # 3. 确认每个冲突文件均无残留冲突标记
+  local _cf=""
+  while IFS= read -r _cf; do
+    [[ -z "$_cf" ]] && continue
+    if [[ -f "${resolve_wt}/${_cf}" ]]; then
+      if "$GREP_BIN" -qE '^(<<<<<<< |=======$|>>>>>>> )' "${resolve_wt}/${_cf}"; then
+        abort_resolve_wt
+        emit_triage_json "requeue_dev" "" "冲突消解校验失败：文件 ${_cf} 仍残留 Git 冲突标记，已转交开发处理" "$orig_conflict_files" "$t_verify"
+        return 0
+      fi
+    fi
+  done <<<"$orig_conflict_files"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] 终审已本地验证可安全消解简单冲突（不执行 commit/push）: %s\n' "$orig_conflict_files" >&2
+    abort_resolve_wt
+    emit_triage_json "dry_run_resolved" "$head_sha" "$t_reason" "$orig_conflict_files" "$t_verify"
+    return 0
+  fi
+
+  # 4. 宿主机暂存、提交合并提交并推送到 PR 分支（加 flock）
+  local new_sha=""
+  local push_ok=0
+  local commit_err=""
+  (
+    "$FLOCK_BIN" -x 9
+    while IFS= read -r _cf; do
+      [[ -z "$_cf" ]] && continue
+      if [[ -e "${resolve_wt}/${_cf}" ]]; then
+        "$GIT_BIN" -C "$resolve_wt" add -- "$_cf"
+      else
+        "$GIT_BIN" -C "$resolve_wt" rm -f -- "$_cf" >/dev/null 2>&1 || true
+      fi
+    done <<<"$orig_conflict_files"
+
+    local still_unmerged=""
+    still_unmerged="$("$GIT_BIN" -C "$resolve_wt" diff --name-only --diff-filter=U 2>/dev/null || true)"
+    if [[ -n "$still_unmerged" ]]; then
+      printf '仍存在未解决冲突文件: %s\n' "$still_unmerged" >&2
+      exit 1
+    fi
+
+    "$GIT_BIN" -C "$resolve_wt" commit -m "Merge branch '${base_branch}' into ${head_branch} (final-gate trivial conflict resolution)" >&2
+    local committed_sha=""
+    committed_sha="$("$GIT_BIN" -C "$resolve_wt" rev-parse HEAD)"
+    local parent1=""
+    parent1="$("$GIT_BIN" -C "$resolve_wt" rev-parse "${committed_sha}^1")"
+    if [[ "$parent1" != "$head_sha" ]]; then
+      printf '合并提交父节点校验失败: parent1=%s expected=%s\n' "$parent1" "$head_sha" >&2
+      exit 1
+    fi
+
+    "$GIT_BIN" -C "$resolve_wt" push origin "HEAD:refs/heads/${head_branch}" >&2
+    printf '%s\n' "$committed_sha" > "${final_dir}/.resolved-sha-${stage_tag}-${run_ts}"
+  ) 9>"$REPO_GIT_LOCK" && push_ok=1 || commit_err="提交或推送合并提交失败"
+
+  if (( push_ok == 0 )) || [[ ! -s "${final_dir}/.resolved-sha-${stage_tag}-${run_ts}" ]]; then
+    abort_resolve_wt
+    emit_triage_json "requeue_dev" "" "终审直接消解冲突后${commit_err:-推送失败}（可能远端分支已有新提交），已转交开发处理" "$orig_conflict_files" "$t_verify"
+    return 0
+  fi
+
+  IFS= read -r new_sha < "${final_dir}/.resolved-sha-${stage_tag}-${run_ts}"
+  printf '[%s] PR #%s (%s) 终审已直接消解简单冲突并推送合并提交 %s（原 E2E 提交 %s）\n' \
+    "$("$DATE_BIN" '+%F %T')" "$pr_num" "$stage_tag" "${new_sha:0:10}" "${head_sha:0:10}" >&2
+  emit_triage_json "resolved" "$new_sha" "$t_reason" "$orig_conflict_files" "$t_verify"
+}
+
 requeue_for_conflict() {
   local pr_num="$1"
   local issue_num="$2"
@@ -596,17 +893,8 @@ while true; do
   merge_state="$("$JQ_BIN" -r '.mergeStateStatus // ""' <<<"$next_pr_json")"
   issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
 
-  # 1. 前置冲突拦截（GitHub 侧状态）
-  if [[ "$mergeable" == "CONFLICTING" || "$merge_state" == "DIRTY" ]]; then
-    requeue_for_conflict "$pr_num" "$issue_num" "$head_branch" "$base_branch" \
-      "Codex 终审门禁前置拦截：存在合并冲突" \
-      "- GitHub 合并状态为 \`${mergeable:-CONFLICTING}\` / \`${merge_state:-DIRTY}\`。" \
-      "conflict-requeued"
-    "$SLEEP_BIN" 5
-    continue
-  fi
-
-  # 2. 前置检查 CI 状态（若仍有进行中的 Check，稍后重试，避免抢跑）
+  # 1. 前置检查 CI 状态（若仍有进行中的 Check，稍后重试，避免抢跑）
+  # （注意：合并冲突不再盲目退回，待第 3 步本地演练与分诊判断可直接解决还是转交开发）
   ci_pending_count="$("$JQ_BIN" -r '
     [(.statusCheckRollup // [])[] |
       ((.status // .state // "") | ascii_upcase) |
@@ -671,7 +959,9 @@ while true; do
     continue
   fi
 
-  # 3.1 本地确定性合并演练（git merge-tree）：即便 GitHub mergeable 为 UNKNOWN 也能提前捕获真实冲突
+  # 3.1 本地确定性合并演练（git merge-tree）+ 冲突分诊（简单机械冲突就地消解，实质冲突才退回开发）
+  resolved_from_sha=""
+  resolved_conflict_note=""
   merge_sim_json="$(inspect_git_merge_state "$base_branch" "$head_sha" 0)"
   mt_status="$("$JQ_BIN" -r '.status // "unknown"' <<<"$merge_sim_json")"
   mt_behind="$("$JQ_BIN" -r '.behind_count // 0' <<<"$merge_sim_json")"
@@ -683,14 +973,61 @@ while true; do
   mt_base_commits="$("$JQ_BIN" -r '.base_commits // ""' <<<"$merge_sim_json")"
   mt_pr_commits="$("$JQ_BIN" -r '.pr_commits // ""' <<<"$merge_sim_json")"
 
-  if [[ "$mt_status" == "conflict" ]]; then
-    conflict_detail_md="- 本地 \`git merge-tree\` 演练发现 PR 最新提交（\`${head_sha:0:10}\`）与 \`origin/${base_branch}\` 存在真实合并冲突："$'\n''```text'$'\n'"${mt_conflict_files}${mt_conflict_detail}"$'\n''```'
-    requeue_for_conflict "$pr_num" "$issue_num" "$head_branch" "$base_branch" \
-      "Codex 终审门禁前置拦截：本地合并演练检测到冲突" \
-      "$conflict_detail_md" \
-      "git-merge-tree-conflict"
-    "$SLEEP_BIN" 5
-    continue
+  if [[ "$mt_status" == "conflict" || "$mergeable" == "CONFLICTING" || "$merge_state" == "DIRTY" ]]; then
+    triage_json="$(triage_and_resolve_conflict "$pr_num" "$head_branch" "$base_branch" "$head_sha" "$final_dir" "$run_ts" "pre-review")"
+    t_outcome="$("$JQ_BIN" -r '.outcome // "requeue_dev"' <<<"$triage_json")"
+    t_new_sha="$("$JQ_BIN" -r '.new_head_sha // ""' <<<"$triage_json")"
+    t_reason="$("$JQ_BIN" -r '.reason // ""' <<<"$triage_json")"
+    t_cfiles="$("$JQ_BIN" -r '.conflict_files // ""' <<<"$triage_json")"
+    t_vnote="$("$JQ_BIN" -r '.verification_note // ""' <<<"$triage_json")"
+
+    if [[ "$t_outcome" == "resolved" && -n "$t_new_sha" ]]; then
+      resolved_from_sha="$head_sha"
+      head_sha="$t_new_sha"
+      resolved_conflict_note="终审前置合并演练检测到简单机械冲突，已由 final-gate 就地消解并推送合并提交 \`${head_sha:0:10}\`（第一父提交保留原 E2E 验收提交 \`${resolved_from_sha:0:10}\`）。冲突文件：\`${t_cfiles//$'\n'/, }\`；说明：${t_reason}${t_vnote:+；校验：${t_vnote}}"
+      final_wt="$(prepare_final_worktree "$pr_num" "$head_branch" "$head_sha")" || true
+      merge_sim_json="$(inspect_git_merge_state "$base_branch" "$head_sha" 0)"
+      mt_status="$("$JQ_BIN" -r '.status // "unknown"' <<<"$merge_sim_json")"
+      mt_behind="$("$JQ_BIN" -r '.behind_count // 0' <<<"$merge_sim_json")"
+      mt_ahead="$("$JQ_BIN" -r '.ahead_count // 0' <<<"$merge_sim_json")"
+      mt_merge_commits="$("$JQ_BIN" -r '.merge_commit_count // 0' <<<"$merge_sim_json")"
+      mt_overlap_files="$("$JQ_BIN" -r '.overlap_files // ""' <<<"$merge_sim_json")"
+      mt_base_commits="$("$JQ_BIN" -r '.base_commits // ""' <<<"$merge_sim_json")"
+      mt_pr_commits="$("$JQ_BIN" -r '.pr_commits // ""' <<<"$merge_sim_json")"
+    elif [[ "$t_outcome" == "dry_run_resolved" ]]; then
+      resolved_conflict_note="[DRY_RUN] 终审判定前置冲突为简单机械冲突，可就地消解（原因：${t_reason}）。"
+    elif [[ "$t_outcome" == "clean" ]]; then
+      printf '[%s] PR #%s 实时本地合并演练无冲突（GitHub mergeable 状态滞后），继续终审...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num"
+    elif [[ "$t_outcome" == "blocked" ]]; then
+      block_md="$("$CAT_BIN" <<EOF
+### Codex 终审门禁冲突分诊拦截：需人工处理
+
+- PR #${pr_num}（\`${head_branch}\` -> \`${base_branch}\`）存在合并冲突，终审分诊判定需人工介入：${t_reason}
+\`\`\`text
+${t_cfiles:-$mt_conflict_files}
+\`\`\`
+EOF
+)"
+      printf '%s\n' "$block_md" | gh_state comment pr "$pr_num" - "$FINAL_GATE_COMMENT_MARKER" || true
+      gh_state set-state pr "$pr_num" blocked || true
+      if [[ -n "$issue_num" ]]; then
+        gh_state set-state issue "$issue_num" blocked || true
+        printf '%s\n' "$block_md" | gh_state comment issue "$issue_num" - "$FINAL_GATE_COMMENT_MARKER" || true
+      fi
+      end_ts="$("$DATE_BIN" '+%F %T')"
+      printf '[%s] [codex-final-gate] PR #%s (Issue #%s) -> conflict-blocked\n' "$end_ts" "$pr_num" "${issue_num:-?}" >> "$ACTIVITY_LOG"
+      "$SLEEP_BIN" 5
+      continue
+    else
+      conflict_detail_md="- 终审冲突分诊结论：**不可直接机械合并，需开发介入处理并复验**。"$'\n'"- 分诊原因：${t_reason:-存在实质性代码冲突}"$'\n'"- 冲突文件："$'\n''```text'$'\n'"${t_cfiles:-${mt_conflict_files}${mt_conflict_detail}}"$'\n''```'
+      requeue_for_conflict "$pr_num" "$issue_num" "$head_branch" "$base_branch" \
+        "Codex 终审门禁冲突分诊：实质性冲突退回开发" \
+        "$conflict_detail_md" \
+        "substantive-conflict-requeued"
+      "$SLEEP_BIN" 5
+      continue
+    fi
   fi
 
   # 拉取仓库允许的合并方式配置（失败时默认三者均允许）
@@ -720,10 +1057,15 @@ while true; do
   if ev_out="$(prepare_evidence_checkout)" && [[ -n "$ev_out" ]]; then
     ev_wt="${ev_out%%$'\t'*}"
     ev_branch_sha="${ev_out#*$'\t'}"
-    # 优先精确匹配当前 head_sha 的归档目录，否则回退取最新一条归档记录供比对
+    # 优先精确匹配当前 head_sha（或终审就地解冲突前的原 E2E 提交 resolved_from_sha）的归档目录
     for _d in "${ev_wt}/pr-${pr_num}/"*"-${head_sha:0:10}"; do
       [[ -d "$_d" ]] && ev_entry_dir="$_d"
     done
+    if [[ -z "$ev_entry_dir" && -n "$resolved_from_sha" ]]; then
+      for _d in "${ev_wt}/pr-${pr_num}/"*"-${resolved_from_sha:0:10}"; do
+        [[ -d "$_d" ]] && ev_entry_dir="$_d"
+      done
+    fi
     if [[ -z "$ev_entry_dir" ]]; then
       for _d in "${ev_wt}/pr-${pr_num}/"*; do
         [[ -d "$_d" ]] && ev_entry_dir="$_d"
@@ -737,7 +1079,12 @@ while true; do
         ev_manifest_json="$("$CAT_BIN" "${ev_entry_dir}/manifest.json")"
         ev_tested_sha="$("$JQ_BIN" -r '.tested_sha // ""' "${ev_entry_dir}/manifest.json" 2>/dev/null || true)"
         ev_result_verdict="$("$JQ_BIN" -r '.verdict // ""' "${ev_entry_dir}/manifest.json" 2>/dev/null || true)"
-        [[ "$ev_tested_sha" == "$head_sha" ]] && ev_sha_matched=1
+        if [[ "$ev_tested_sha" == "$head_sha" ]]; then
+          ev_sha_matched=1
+        elif [[ -n "$resolved_from_sha" && "$ev_tested_sha" == "$resolved_from_sha" ]]; then
+          _p1="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)"
+          [[ "$_p1" == "$ev_tested_sha" ]] && ev_sha_matched=1
+        fi
       fi
       if [[ -f "${ev_entry_dir}/result.json" ]]; then
         ev_result_json="$("$CAT_BIN" "${ev_entry_dir}/result.json")"
@@ -818,7 +1165,8 @@ ${issue_section}
 ## 远端 QA 证据核对结果（分支 \`${E2E_EVIDENCE_BRANCH}\` @ \`${ev_branch_sha:0:10}\`）
 - 证据归档目录（本地只读检出）: \`${ev_entry_dir:-(未找到)}\`
 - 证据 GitHub 永久直链: ${ev_web_url:-(无)}
-- 证据 manifest.tested_sha: \`${ev_tested_sha:-(缺失)}\`（与 PR head_sha 是否严格一致: \`${ev_sha_matched}\`）
+- 证据 manifest.tested_sha: \`${ev_tested_sha:-(缺失)}\`（与 PR head_sha 或其第一父提交是否严格一致: \`${ev_sha_matched}\`）
+${resolved_conflict_note:+- 终审机械冲突就地消解记录: ${resolved_conflict_note}}
 - 敏感文件名预检: ${ev_sensitive_files:-"(未发现 secrets.json/.env/.key/.pem 等敏感文件名)"}
 
 ### manifest.json
@@ -848,7 +1196,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 \`\`\`
 
 ## 终审准则（务必严格遵守）
-1. **核对最终代码与 SHA**：当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出；尤其重点检查 E2E 打回后新增的修改提交是否干净、无回归、无调试代码残留。同时核对 \`manifest.tested_sha == ${head_sha}\`（若不一致，说明最新代码未经 E2E 复验，不得放行 \`merge\`）。
+1. **核对最终代码与 SHA**：当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出；尤其重点检查 E2E 打回后新增的修改提交是否干净、无回归、无调试代码残留。同时核对 \`manifest.tested_sha == ${head_sha}\`（若由本终审刚就地消解机械冲突生成了合并提交，允许 \`head_sha^1 == manifest.tested_sha\`，此时重点核对合并提交未破坏原逻辑；否则说明最新代码未经 E2E 复验，不得放行 \`merge\`）。
 2. **核对 Issue 与 QA 证据闭环**：按需检查 \`${ev_entry_dir}\` 中的真实日志与报告，确认 Issue 核心验收标准均有真实代码与 QA 证据闭环，且证据目录无敏感凭据泄漏、无未清理临时文件。
 3. **核对合并冲突风险并裁定合并方式（\`merge_method\`）**：
    - 若 \`origin/${base_branch}\` 已有新提交（\`behind > 0\`）且与本 PR **修改了重叠文件或关联接口**，务必通过只读 \`git diff\` / \`git log\` 评估是否存在**语义冲突风险**（即便 Git 自动合并不报错，逻辑上也可能互相破坏）；若存在语义冲突风险或主干变更需要重新 E2E 回归，必须输出 \`request_changes\` 要求先同步主干再验证，不得盲目合入。
@@ -943,6 +1291,9 @@ EOF
   merged_ok=0
   record_checked_sha=1
 
+  if [[ -n "$resolved_conflict_note" ]]; then
+    extra_notice+=$'\n\n'"> ℹ️ 机械冲突就地消解：${resolved_conflict_note}"
+  fi
   if [[ -n "$merge_method_adjust_note" && "$effective_merge_method" != "NONE" ]]; then
     extra_notice+=$'\n\n'"> ℹ️ 合并方式安全调整：${merge_method_adjust_note}"
   fi
@@ -952,25 +1303,58 @@ EOF
     final_action="${LABEL_PREFIX}blocked (hard-gate)"
     extra_notice+=$'\n\n'"#### ⚠️ 确定性硬门禁拦截（未自动合并）"$'\n'"${hard_gate_errors}"
   elif [[ "$verdict" == "merge" ]]; then
-    # 合并前最后一次实时拉取 origin/<base_branch> 并重跑 git merge-tree 冲突演练，防止终审期间主干新提交引发冲突
+    # 合并前最后一次实时拉取 origin/<base_branch> 并重跑 git merge-tree 冲突演练；
+    # 若终审期间主干产生冲突，同样先分诊：简单机械冲突直接就地消解并推送后再合并，仅实质冲突才退回开发
     recheck_conflict=0
+    recheck_block=0
     recheck_conflict_md=""
     if [[ "$AUTO_MERGE" == "1" ]]; then
       recheck_json="$(inspect_git_merge_state "$base_branch" "$head_sha" 1)"
       recheck_status="$("$JQ_BIN" -r '.status // "unknown"' <<<"$recheck_json")"
       if [[ "$recheck_status" == "conflict" ]]; then
-        recheck_conflict=1
-        recheck_files="$("$JQ_BIN" -r '.conflict_files // ""' <<<"$recheck_json")"
-        recheck_detail="$("$JQ_BIN" -r '.conflict_detail // ""' <<<"$recheck_json")"
-        recheck_conflict_md=$'\n''```text'$'\n'"${recheck_files}${recheck_detail}"$'\n''```'
+        recheck_triage="$(triage_and_resolve_conflict "$pr_num" "$head_branch" "$base_branch" "$head_sha" "$final_dir" "$run_ts" "pre-merge")"
+        rt_outcome="$("$JQ_BIN" -r '.outcome // "requeue_dev"' <<<"$recheck_triage")"
+        rt_new_sha="$("$JQ_BIN" -r '.new_head_sha // ""' <<<"$recheck_triage")"
+        rt_reason="$("$JQ_BIN" -r '.reason // ""' <<<"$recheck_triage")"
+        rt_cfiles="$("$JQ_BIN" -r '.conflict_files // ""' <<<"$recheck_triage")"
+        rt_vnote="$("$JQ_BIN" -r '.verification_note // ""' <<<"$recheck_triage")"
+
+        if [[ "$rt_outcome" == "resolved" && -n "$rt_new_sha" ]]; then
+          resolved_from_sha="${resolved_from_sha:-$head_sha}"
+          head_sha="$rt_new_sha"
+          mt_merge_commits=$((mt_merge_commits + 1))
+          _mm_re="$(resolve_safe_merge_method "$effective_merge_method" "$allow_merge_commit" "$allow_squash_merge" "$allow_rebase_merge" "$mt_merge_commits")"
+          effective_merge_method="${_mm_re%%$'\t'*}"
+          _mm_re_note="${_mm_re#*$'\t'}"
+          [[ -n "$_mm_re_note" && "$effective_merge_method" != "NONE" ]] && \
+            extra_notice+=$'\n\n'"> ℹ️ 合并方式安全调整：${_mm_re_note}"
+          extra_notice+=$'\n\n'"> ℹ️ 合并前实时复检发现简单机械冲突，已由 final-gate 就地消解并推送合并提交 \`${head_sha:0:10}\`（冲突文件：\`${rt_cfiles//$'\n'/, }\`；说明：${rt_reason}${rt_vnote:+；校验：${rt_vnote}}），随后直接完成自动合入。"
+        elif [[ "$rt_outcome" == "clean" || "$rt_outcome" == "dry_run_resolved" ]]; then
+          [[ "$rt_outcome" == "dry_run_resolved" ]] && \
+            extra_notice+=$'\n\n'"> ℹ️ [DRY_RUN] 合并前实时冲突可由 final-gate 就地消解（原因：${rt_reason}）。"
+        elif [[ "$rt_outcome" == "blocked" ]]; then
+          recheck_block=1
+          recheck_conflict_md="- 合并前冲突分诊判定需人工处理：${rt_reason}"$'\n''```text'$'\n'"${rt_cfiles}"$'\n''```'
+        else
+          recheck_conflict=1
+          recheck_conflict_md="- 分诊原因：${rt_reason:-存在实质性冲突}"$'\n''```text'$'\n'"${rt_cfiles}"$'\n''```'
+        fi
       fi
     fi
 
-    if (( recheck_conflict == 1 )); then
+    if (( recheck_block == 1 )); then
+      final_state="blocked"
+      final_action="${LABEL_PREFIX}blocked (pre-merge-conflict-blocked)"
+      extra_notice+=$'\n\n'"#### ⚠️ 合并前冲突分诊拦截（需人工处理）"$'\n'"${recheck_conflict_md}"
+    elif (( recheck_conflict == 1 )); then
       final_state="changes-requested"
-      final_action="${LABEL_PREFIX}changes-requested (pre-merge-conflict)"
+      final_action="${LABEL_PREFIX}changes-requested (pre-merge-substantive-conflict)"
       record_checked_sha=0
-      extra_notice+=$'\n\n'"#### ⚠️ 合并前实时冲突复检拦截（未合并）"$'\n'"- 终审期间 \`origin/${base_branch}\` 产生新提交，实时 \`git merge-tree\` 演练发现以下冲突：${recheck_conflict_md}"$'\n'"- 已退回 \`${LABEL_PREFIX}changes-requested\`，交由开发循环自动合入主干解决冲突并复验。"
+      extra_notice+=$'\n\n'"#### ⚠️ 合并前实时冲突分诊：实质性冲突退回开发（未合并）"$'\n'"${recheck_conflict_md}"$'\n'"- 已退回 \`${LABEL_PREFIX}changes-requested\`，交由开发循环合入主干解决冲突并重新验证。"
+    elif [[ "$effective_merge_method" == "NONE" ]]; then
+      final_state="blocked"
+      final_action="${LABEL_PREFIX}blocked (no-usable-merge-method)"
+      extra_notice+=$'\n\n'"#### ⚠️ 合并前校验拦截：无可用合并方式"
     else
       # 先更新规范化 PR 标题与最终正文
       [[ -z "$new_pr_title" ]] && new_pr_title="$pr_title"

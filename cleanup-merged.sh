@@ -158,13 +158,14 @@ run_cleanup_pass() {
     has_agy_non_done="$("$JQ_BIN" -r --arg prefix "$LABEL_PREFIX" --arg done_lbl "${LABEL_PREFIX}done" \
       'if any(.labels[]?.name; startswith($prefix) and . != $done_lbl) then "1" else "0" end' <<<"$row")"
 
-    local wt_issue="" wt_review wt_e2e wt_final has_local_wt=0
+    local wt_issue="" wt_review wt_e2e wt_final wt_final_resolve has_local_wt=0
     wt_review="${WORKTREE_ROOT}/review-pr-${pr_num}"
     wt_e2e="${WORKTREE_ROOT}/e2e-pr-${pr_num}"
     wt_final="${WORKTREE_ROOT}/final-pr-${pr_num}"
+    wt_final_resolve="${WORKTREE_ROOT}/final-resolve-pr-${pr_num}"
     [[ -n "$issue_num" ]] && wt_issue="${WORKTREE_ROOT}/issue-${issue_num}"
 
-    if [[ -d "$wt_review" || -d "$wt_e2e" || -d "$wt_final" ]] || [[ -n "$wt_issue" && -d "$wt_issue" ]]; then
+    if [[ -d "$wt_review" || -d "$wt_e2e" || -d "$wt_final" || -d "$wt_final_resolve" ]] || [[ -n "$wt_issue" && -d "$wt_issue" ]]; then
       has_local_wt=1
     fi
 
@@ -192,6 +193,9 @@ run_cleanup_pass() {
     fi
     if [[ -d "$wt_final" ]]; then
       remove_worktree_safe "$wt_final" && removed_items+=" final-pr-${pr_num}"
+    fi
+    if [[ -d "$wt_final_resolve" ]]; then
+      remove_worktree_safe "$wt_final_resolve" && removed_items+=" final-resolve-pr-${pr_num}"
     fi
 
     # 仅在本地分支存在且以 BRANCH_PREFIX 开头时安全删除（用 -d 而非 -D，仅删已合并分支）
