@@ -56,10 +56,11 @@ E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
 FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-comment -->}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
-PRINT_TIMEOUT="${PRINT_TIMEOUT:-15m}"
+PRINT_TIMEOUT="${PRINT_TIMEOUT:-20m}"
 AGY_MODE="${AGY_MODE:-accept-edits}"   # accept-edits | auto | plan（默认 accept-edits 避免账号无 auto 权限告警）
 AGY_SKIP_PERMISSIONS="${AGY_SKIP_PERMISSIONS:-1}" # 在 --sandbox 内免本地交互确认自动推进（1=启用，0=关闭）
-AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-high}"  # 默认使用 Gemini 4 Hydrogen (High)
+AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-xhigh}" # 默认使用 Gemini 4 Hydrogen (XHigh)；也可切为 gemini-4-neon-xhigh
+AGY_EFFORT="${AGY_EFFORT:-}" # 可选：显式传递 --effort (low|medium|high|xhigh|max)
 
 "$MKDIR_BIN" -p "$GONGCAO_HOME" "$REPOS_ROOT" "$STATE_BASE"
 
@@ -140,7 +141,7 @@ printf '  状态根目录 : %s\n' "$STATE_ROOT"
 printf '  Worktree 根: %s\n' "$WORKTREE_ROOT"
 printf '  会话记录根 : %s\n' "$SESSIONS_ROOT"
 printf '  过滤标签   : %s\n' "${FILTER_LABEL:-(无)}"
-printf '  运行模型   : %s (mode=%s, skip_permissions=%s)\n' "${AGY_MODEL:-(agy 默认)}" "$AGY_MODE" "$AGY_SKIP_PERMISSIONS"
+printf '  运行模型   : %s (effort=%s, mode=%s, skip_permissions=%s)\n' "${AGY_MODEL:-(agy 默认)}" "${AGY_EFFORT:-(随模型默认)}" "$AGY_MODE" "$AGY_SKIP_PERMISSIONS"
 printf '  GitHub同步 : %s (AUTO_PUSH_PR=%s, DRY_RUN=%s)\n' "$GH_SYNC_ENABLED" "$AUTO_PUSH_PR" "$DRY_RUN"
 
 LABELS_READY=0
@@ -569,6 +570,9 @@ EOF
   fi
   if [[ -n "$AGY_MODEL" ]]; then
     agy_args+=(--model "$AGY_MODEL")
+  fi
+  if [[ -n "$AGY_EFFORT" ]]; then
+    agy_args+=(--effort "$AGY_EFFORT")
   fi
   if [[ -n "$existing_conv_id" ]]; then
     agy_args=(--conversation "$existing_conv_id" "${agy_args[@]}")

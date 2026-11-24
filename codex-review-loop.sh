@@ -30,6 +30,8 @@ DATE_BIN="$(resolve_bin date)"
 SLEEP_BIN="$(resolve_bin sleep)"
 CAT_BIN="$(resolve_bin cat)"
 HEAD_BIN="$(resolve_bin head)"
+FIND_BIN="$(resolve_bin find)"
+SORT_BIN="$(resolve_bin sort)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
 
@@ -45,6 +47,9 @@ AUTO_CLONE="${AUTO_CLONE:-1}"            # 未克隆时自动只读克隆到 ~/.
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 REVIEW_LABEL="${REVIEW_LABEL:-${LABEL_PREFIX}in-review}"
 REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
+E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
+E2E_EVIDENCE_BRANCH="${E2E_EVIDENCE_BRANCH:-qa/e2e-evidence}"
+ALLOW_SKIP_E2E="${ALLOW_SKIP_E2E:-1}"     # 1=评审确认免 E2E 或已有祖先提交 E2E 通过时直接转 agy:e2e-skipped -> final-gate；0=一律转 agy:approved
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.2-sol}" # 默认使用 GPT-6.2-Sol
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 xhigh
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
@@ -121,8 +126,8 @@ printf '  Codex 命令 : %s (model=%s, effort=%s, sandbox=%s)\n' \
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  评审档案根 : %s\n' "$REVIEWS_ROOT"
-printf '  监听标签   : %s (MAX_REVIEW_ROUNDS=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
-  "$REVIEW_LABEL" "$MAX_REVIEW_ROUNDS" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
+printf '  监听标签   : %s (MAX_REVIEW_ROUNDS=%s, ALLOW_SKIP_E2E=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
+  "$REVIEW_LABEL" "$MAX_REVIEW_ROUNDS" "$ALLOW_SKIP_E2E" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -151,6 +156,8 @@ write_review_schema() {
   "required": [
     "verdict",
     "summary",
+    "e2e_decision",
+    "e2e_decision_reason",
     "requirements_coverage",
     "blocking_issues",
     "non_blocking_notes"
@@ -161,6 +168,13 @@ write_review_schema() {
       "enum": ["approve", "request_changes"]
     },
     "summary": {
+      "type": "string"
+    },
+    "e2e_decision": {
+      "type": "string",
+      "enum": ["run_e2e", "skip_not_needed", "skip_already_passed"]
+    },
+    "e2e_decision_reason": {
       "type": "string"
     },
     "requirements_coverage": {
@@ -247,6 +261,116 @@ prepare_review_worktree() {
   printf '%s' "$wt_dir"
 }
 
+# 检查远端 QA 证据分支是否已有本 PR 或关联 Issue 的 E2E 通过记录，并计算与当前 head_sha 的祖先/增量关系
+inspect_prior_e2e_evidence() {
+  local pr_num="$1"
+  local issue_num="$2"
+  local head_sha="$3"
+  local ev_wt="${WORKTREE_ROOT}/review-evidence"
+
+  (
+    "$FLOCK_BIN" -x 9
+    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$E2E_EVIDENCE_BRANCH" >/dev/null 2>&1 || true
+
+    if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}"; then
+      if [[ -e "${ev_wt}/.git" ]]; then
+        "$GIT_BIN" -C "$ev_wt" checkout --detach --force "origin/${E2E_EVIDENCE_BRANCH}" >/dev/null 2>&1 || true
+        "$GIT_BIN" -C "$ev_wt" clean -fd >/dev/null 2>&1 || true
+      else
+        "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$ev_wt" "origin/${E2E_EVIDENCE_BRANCH}" >/dev/null 2>&1 || true
+      fi
+    fi
+  ) 9>"$REPO_GIT_LOCK"
+
+  local has_pass=0
+  local tested_sha=""
+  local is_ancestor=0
+  local rel_dir=""
+  local branch_sha=""
+  local delta_stat=""
+  local delta_commits=""
+  local best_dir=""
+
+  if [[ -e "${ev_wt}/.git" ]]; then
+    branch_sha="$("$GIT_BIN" -C "$ev_wt" rev-parse HEAD 2>/dev/null || true)"
+    local mf entry_dir entry_verdict rj_verdict best_ts="" entry_ts=""
+
+    if [[ -d "${ev_wt}/pr-${pr_num}" ]]; then
+      while IFS= read -r mf; do
+        [[ -f "$mf" ]] || continue
+        entry_dir="${mf%/manifest.json}"
+        entry_verdict="$("$JQ_BIN" -r '.verdict // ""' "$mf" 2>/dev/null || true)"
+        if [[ -f "${entry_dir}/result.json" ]]; then
+          rj_verdict="$("$JQ_BIN" -r '.verdict // ""' "${entry_dir}/result.json" 2>/dev/null || true)"
+          [[ -n "$rj_verdict" ]] && entry_verdict="$rj_verdict"
+        fi
+        if [[ "$entry_verdict" == "pass" ]]; then
+          has_pass=1
+          best_dir="$entry_dir"
+        fi
+      done < <("$FIND_BIN" "${ev_wt}/pr-${pr_num}" -mindepth 2 -maxdepth 2 -name manifest.json 2>/dev/null | "$SORT_BIN")
+    fi
+
+    # 若当前 PR 目录下尚未找到，则回退按 issue_number 检索（适配相同 Issue 先前 PR 已跑过 E2E 的情况）
+    if (( has_pass == 0 )) && [[ -n "$issue_num" ]]; then
+      while IFS= read -r mf; do
+        [[ -f "$mf" ]] || continue
+        if ! "$JQ_BIN" -e --arg inum "$issue_num" '((.issue_number // "") | tostring) == $inum' "$mf" >/dev/null 2>&1; then
+          continue
+        fi
+        entry_dir="${mf%/manifest.json}"
+        entry_verdict="$("$JQ_BIN" -r '.verdict // ""' "$mf" 2>/dev/null || true)"
+        if [[ -f "${entry_dir}/result.json" ]]; then
+          rj_verdict="$("$JQ_BIN" -r '.verdict // ""' "${entry_dir}/result.json" 2>/dev/null || true)"
+          [[ -n "$rj_verdict" ]] && entry_verdict="$rj_verdict"
+        fi
+        if [[ "$entry_verdict" == "pass" ]]; then
+          entry_ts="${entry_dir##*/}"
+          if [[ -z "$best_ts" || "$entry_ts" > "$best_ts" || "$entry_ts" == "$best_ts" ]]; then
+            has_pass=1
+            best_dir="$entry_dir"
+            best_ts="$entry_ts"
+          fi
+        fi
+      done < <("$FIND_BIN" "$ev_wt" -mindepth 3 -maxdepth 3 -name manifest.json 2>/dev/null | "$SORT_BIN")
+    fi
+
+    if (( has_pass == 1 )) && [[ -n "$best_dir" ]]; then
+      rel_dir="${best_dir#${ev_wt}/}"
+      tested_sha="$("$JQ_BIN" -r '.tested_sha // ""' "${best_dir}/manifest.json" 2>/dev/null || true)"
+      if [[ -n "$tested_sha" ]] && "$GIT_BIN" -C "$REPO_ROOT" merge-base --is-ancestor "$tested_sha" "$head_sha" 2>/dev/null; then
+        is_ancestor=1
+        if [[ "$tested_sha" == "$head_sha" ]]; then
+          delta_stat="(无新增改动，与已通过 E2E 的提交完全一致)"
+          delta_commits="(无)"
+        else
+          delta_stat="$("$GIT_BIN" -C "$REPO_ROOT" diff --stat "${tested_sha}..${head_sha}" 2>/dev/null || true)"
+          delta_commits="$("$GIT_BIN" -C "$REPO_ROOT" log --oneline -n 20 "${tested_sha}..${head_sha}" 2>/dev/null || true)"
+        fi
+      fi
+    fi
+  fi
+
+  "$JQ_BIN" -n \
+    --arg has_pass "$has_pass" \
+    --arg tested_sha "$tested_sha" \
+    --arg is_ancestor "$is_ancestor" \
+    --arg rel_dir "$rel_dir" \
+    --arg branch_sha "$branch_sha" \
+    --arg delta_stat "$delta_stat" \
+    --arg delta_commits "$delta_commits" \
+    '{
+      has_pass: ($has_pass == "1"),
+      tested_sha: $tested_sha,
+      is_ancestor: ($is_ancestor == "1"),
+      rel_dir: $rel_dir,
+      branch_sha: $branch_sha,
+      delta_stat: $delta_stat,
+      delta_commits: $delta_commits
+    }'
+}
+
 render_review_markdown() {
   local verdict_file="$1"
   local pr_num="$2"
@@ -254,8 +378,19 @@ render_review_markdown() {
   local head_sha="$4"
   local round="$5"
   local final_state="$6"
+  local eff_e2e_decision="$7"
+  local e2e_reused_sha="$8"
+  local e2e_downgrade_note="$9"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
+
+  local meta_json
+  meta_json="$("$JQ_BIN" -c -n \
+    --arg head_sha "$head_sha" \
+    --arg verdict "$("$JQ_BIN" -r '.verdict' "$verdict_file")" \
+    --arg e2e_decision "$eff_e2e_decision" \
+    --arg e2e_reused_sha "$e2e_reused_sha" \
+    '{head_sha: $head_sha, verdict: $verdict, e2e_decision: $e2e_decision, e2e_reused_sha: $e2e_reused_sha}')"
 
   "$JQ_BIN" -r \
     --arg pr "$pr_num" \
@@ -264,6 +399,9 @@ render_review_markdown() {
     --arg round "$round" \
     --arg max_rounds "$MAX_REVIEW_ROUNDS" \
     --arg state "${LABEL_PREFIX}${final_state}" \
+    --arg eff_e2e "$eff_e2e_decision" \
+    --arg e2e_note "$e2e_downgrade_note" \
+    --arg meta_json "$meta_json" \
     --arg model "${CODEX_MODEL:-(codex 默认)}${CODEX_REASONING_EFFORT:+ (${CODEX_REASONING_EFFORT})}" \
     --arg now "$now_ts" \
     '
@@ -271,6 +409,11 @@ render_review_markdown() {
     "### Codex 独立评审报告\n\n"
     + "| 字段 | 值 |\n| --- | --- |\n"
     + "| 评审结论 | `" + .verdict + "` -> `" + $state + "` |\n"
+    + (if .verdict == "approve" then
+        "| E2E 路由 | `" + $eff_e2e + "`（" + (((.e2e_decision_reason // "") + $e2e_note) | esc) + "） |\n"
+      else
+        ""
+      end)
     + "| 关联 Issue | #" + $issue + " |\n"
     + "| 评审 Commit | `" + $sha + "` |\n"
     + "| 评审轮次 | " + $round + " / " + $max_rounds + " |\n"
@@ -296,6 +439,7 @@ render_review_markdown() {
       else
         "- 无"
       end)
+    + "\n\n<!-- codex-review-meta:" + $meta_json + " -->"
     ' "$verdict_file"
 }
 
@@ -432,6 +576,22 @@ EOF
     continue
   fi
 
+  # 检查本 PR 或关联 Issue 是否已有通过 E2E 的远端归档证据及增量改动
+  prior_e2e_json="$(inspect_prior_e2e_evidence "$pr_num" "$issue_num" "$head_sha")"
+  prior_e2e_has_pass="$("$JQ_BIN" -r '.has_pass' <<<"$prior_e2e_json")"
+  prior_e2e_sha="$("$JQ_BIN" -r '.tested_sha // ""' <<<"$prior_e2e_json")"
+  prior_e2e_is_ancestor="$("$JQ_BIN" -r '.is_ancestor' <<<"$prior_e2e_json")"
+  prior_e2e_rel="$("$JQ_BIN" -r '.rel_dir // ""' <<<"$prior_e2e_json")"
+  prior_e2e_branch_sha="$("$JQ_BIN" -r '.branch_sha // ""' <<<"$prior_e2e_json")"
+  prior_e2e_delta_stat="$("$JQ_BIN" -r '.delta_stat // ""' <<<"$prior_e2e_json")"
+  prior_e2e_delta_commits="$("$JQ_BIN" -r '.delta_commits // ""' <<<"$prior_e2e_json")"
+
+  prev_e2e_comment="$(gh_state get-comment pr "$pr_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+  if [[ -z "$prev_e2e_comment" && -n "$issue_num" ]]; then
+    prev_e2e_comment="$(gh_state get-comment issue "$issue_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+  fi
+  prev_e2e_snippet="${prev_e2e_comment:0:8000}"
+
   pr_diff_raw="$(gh_state get-pr-diff "$pr_num" 2>/dev/null || true)"
   # 使用纯 Bash 切片截断，避免 set -o pipefail 下 printf | head 触发 SIGPIPE (141) 退出
   pr_diff_snippet="${pr_diff_raw:0:MAX_DIFF_BYTES}"
@@ -479,6 +639,21 @@ ${pr_body:-"(empty)"}
 ## 关联 Issue 要求
 ${issue_section}${prev_review_section}
 
+## 既有 E2E 验收状态与免测判断依据
+- 是否存在通过的远端 QA 证据（\`${E2E_EVIDENCE_BRANCH}\`）: \`${prior_e2e_has_pass}\`
+- 已通过 E2E 的提交 SHA: \`${prior_e2e_sha:-(无)}\`（是否当前 PR 提交 \`${head_sha:0:10}\` 的祖先: \`${prior_e2e_is_ancestor}\`）
+- 证据归档目录: \`${prior_e2e_rel:-(无)}\`（分支快照 \`${prior_e2e_branch_sha:0:10}\`）
+- 自已通过 E2E 提交以来的增量提交（\`${prior_e2e_sha:0:10}..${head_sha:0:10}\`）:
+\`\`\`text
+${prior_e2e_delta_commits:-"(无或未关联)"}
+\`\`\`
+- 自已通过 E2E 提交以来的增量 diff 统计:
+\`\`\`text
+${prior_e2e_delta_stat:-"(无或未关联)"}
+\`\`\`
+- 最近一次 E2E 验收评论摘录:
+${prev_e2e_snippet:-"(无 E2E 验收评论)"}
+
 ## PR Diff 摘录
 \`\`\`diff
 ${pr_diff_snippet:-"(空 diff)"}
@@ -488,6 +663,10 @@ ${pr_diff_snippet:-"(空 diff)"}
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出，请按需阅读完整源文件、调用点与相关单元测试以核实证据，不要轻信 PR 描述中的自我声明。
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
 3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。
+3.1 **E2E 路由裁定（\`e2e_decision\` 与 \`e2e_decision_reason\`）**（当 \`verdict == "request_changes"\` 时固定输出 \`run_e2e\`；当 \`verdict == "approve"\` 且开启 \`ALLOW_SKIP_E2E=1\` 时决定是否跳过 E2E 直达终审）：
+   - \`run_e2e\`（默认保守选项）：涉及运行时代码/接口/数据库/前端交互/运行配置改动，且尚未针对当前运行时行为完成 E2E 验收（或上次 E2E 通过后的新改动影响了运行时行为）。
+   - \`skip_not_needed\`：本次整个 PR 仅改动文档（\`docs/\`、\`*.md\`）、注释、纯单元测试、静态检查/格式化或构建元数据，完全不改变运行时行为，或原始 Issue 明确说明无需 E2E。
+   - \`skip_already_passed\`：本 PR 或关联 Issue **已经通过过 E2E 验收**（\`has_pass=true\` 且 \`is_ancestor=true\`），且自已通过 E2E 的提交（\`${prior_e2e_sha:-(无)}\`）之后无新增改动或增量改动全部为非运行时改动（文档、单测、命名整理、注释等），不破坏既有 E2E 结论，可直接进入 \`final-gate\` 避免重复 E2E。
 4. **严格区分阻塞项与范围外建议（务实分级，禁止范围蔓延）**：
    - 仅将「违反原始 Issue 明确验收标准、真实运行崩溃（如空指针 / \`TypeError\`）、或本次改动引入的真实数据正确性/安全回归、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
    - **以下情况若认为有参考价值，一律放入 \`non_blocking_notes\`（作为非阻塞项记录），不得阻塞通过**：
@@ -537,12 +716,33 @@ EOF
   fi
 
   verdict="$("$JQ_BIN" -r '.verdict' "$verdict_file")"
+  raw_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // "run_e2e"' "$verdict_file")"
+  e2e_decision_reason="$("$JQ_BIN" -r '.e2e_decision_reason // ""' "$verdict_file")"
   "$CAT_BIN" "$verdict_file" > "${review_dir}/last_verdict.json"
   final_pr_state=""
   extra_notice=""
+  effective_e2e_decision="run_e2e"
+  e2e_reused_sha=""
+  e2e_downgrade_note=""
 
   if [[ "$verdict" == "approve" ]]; then
-    final_pr_state="approved"
+    effective_e2e_decision="$raw_e2e_decision"
+    if [[ "$ALLOW_SKIP_E2E" != "1" ]]; then
+      effective_e2e_decision="run_e2e"
+    elif [[ "$effective_e2e_decision" == "skip_already_passed" ]]; then
+      if [[ "$prior_e2e_has_pass" == "true" && "$prior_e2e_is_ancestor" == "true" && -n "$prior_e2e_sha" ]]; then
+        e2e_reused_sha="$prior_e2e_sha"
+      else
+        effective_e2e_decision="run_e2e"
+        e2e_downgrade_note="（安全回退：未查到作为当前提交祖先的已通过 E2E 证据，仍需执行 E2E）"
+      fi
+    fi
+
+    if [[ "$effective_e2e_decision" == "skip_not_needed" || "$effective_e2e_decision" == "skip_already_passed" ]]; then
+      final_pr_state="e2e-skipped"
+    else
+      final_pr_state="approved"
+    fi
   else
     if (( current_round >= MAX_REVIEW_ROUNDS )); then
       final_pr_state="blocked"
@@ -552,7 +752,7 @@ EOF
     fi
   fi
 
-  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state")${extra_notice}"
+  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note")${extra_notice}"
   printf '%s\n' "$review_md" > "$comment_file"
 
   # 写回 PR 评审评论与状态
@@ -561,9 +761,9 @@ EOF
 
   # 同步关联 Issue 状态（先写评论再切标签，避免开发循环在评论写入前就拉取到 changes-requested）
   if [[ -n "$issue_num" ]]; then
-    if [[ "$final_pr_state" == "approved" ]]; then
+    if [[ "$final_pr_state" == "approved" || "$final_pr_state" == "e2e-skipped" ]]; then
       printf '%s\n' "$review_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
-      gh_state set-state issue "$issue_num" approved || true
+      gh_state set-state issue "$issue_num" "$final_pr_state" || true
     elif [[ "$final_pr_state" == "blocked" ]]; then
       printf '%s\n' "$review_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
       gh_state set-state issue "$issue_num" blocked || true
@@ -590,6 +790,9 @@ EOF
     --arg reasoning_effort "$CODEX_REASONING_EFFORT" \
     --argjson round "$current_round" \
     --arg verdict "$verdict" \
+    --arg e2e_decision "$effective_e2e_decision" \
+    --arg e2e_decision_reason "${e2e_decision_reason}${e2e_downgrade_note}" \
+    --arg e2e_reused_sha "$e2e_reused_sha" \
     --arg final_state "$final_pr_state" \
     --arg updated_at "$iso_now" \
     '{
@@ -603,6 +806,9 @@ EOF
       reasoning_effort: $reasoning_effort,
       round: $round,
       verdict: $verdict,
+      e2e_decision: $e2e_decision,
+      e2e_decision_reason: $e2e_decision_reason,
+      e2e_reused_sha: $e2e_reused_sha,
       final_state: $final_state,
       updated_at: $updated_at
     }' > "$meta_file"

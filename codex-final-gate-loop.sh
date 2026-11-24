@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # 独立 Codex 终审合入门禁循环（Final Gate / Release Reviewer，默认 gpt-6.2-sol + xhigh，read-only）
-# 监听带 agy:e2e-passed 标签的 Open PR，进行「Issue 需求 + 最终代码 + 远端 QA 证据 + CI/合并状态」
+# 监听带 agy:e2e-passed 或 agy:e2e-skipped 标签的 Open PR，进行「Issue 需求 + 最终代码 + 远端 QA 证据 + CI/合并状态」
 # 四位一体终审对账：
 #   - merge           -> 更新规范 PR 标题/正文 -> 发布终审签核评论 -> Draft 转 Ready -> 自动合并（AUTO_MERGE=1, MERGE_METHOD=merge）-> 标 agy:done
+#   - require_e2e     -> 免测退回：无需回退开发，直接切 agy:approved 交由 E2E 循环执行实测
 #   - request_changes -> 发布终审问题清单 -> PR 与关联 Issue 切 agy:changes-requested（超限切 blocked）
 #   - blocked         -> 切 agy:blocked 交人工裁决
 
@@ -47,7 +48,8 @@ REPO_NAME="${REPO_NAME:-}"                   # 可选：~/.gongcao/repos/<REPO_N
 REPO_DIR="${REPO_DIR:-}"                     # 可选：显式本地仓库路径
 AUTO_CLONE="${AUTO_CLONE:-1}"
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
-FINAL_GATE_LABEL="${FINAL_GATE_LABEL:-${LABEL_PREFIX}e2e-passed}" # 默认监听 E2E 通过的 PR
+FINAL_GATE_LABEL="${FINAL_GATE_LABEL:-}"     # 兼容旧变量；留空时同时监听 e2e-passed 与 e2e-skipped
+FINAL_GATE_LABELS="${FINAL_GATE_LABELS:-${FINAL_GATE_LABEL:-${LABEL_PREFIX}e2e-passed,${LABEL_PREFIX}e2e-skipped}}"
 FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-comment -->}"
 E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
 REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
@@ -138,7 +140,7 @@ printf '  终审档案根 : %s\n' "$FINAL_ROOT"
 printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, DRY_RUN=%s\n' \
   "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$DRY_RUN"
 printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s)\n' \
-  "$FINAL_GATE_LABEL" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS"
+  "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -179,7 +181,7 @@ write_final_gate_schema() {
   "properties": {
     "verdict": {
       "type": "string",
-      "enum": ["merge", "request_changes", "blocked"]
+      "enum": ["merge", "require_e2e", "request_changes", "blocked"]
     },
     "summary": { "type": "string" },
     "merge_method": {
@@ -845,9 +847,29 @@ while true; do
     fi
   fi
 
-  prs_json=""
-  if ! prs_json="$(gh_state list-prs open "$FINAL_GATE_LABEL" "$PR_LIMIT")" \
-    || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$prs_json"; then
+  prs_json="[]"
+  poll_failed=0
+  _prs_chunks=""
+  IFS=',' read -r -a _fg_labels <<<"$FINAL_GATE_LABELS"
+  for _fg_lbl in "${_fg_labels[@]}"; do
+    _fg_lbl="${_fg_lbl#"${_fg_lbl%%[![:space:]]*}"}"
+    _fg_lbl="${_fg_lbl%"${_fg_lbl##*[![:space:]]}"}"
+    [[ -z "$_fg_lbl" ]] && continue
+    _one_prs=""
+    if ! _one_prs="$(gh_state list-prs open "$_fg_lbl" "$PR_LIMIT")" \
+      || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$_one_prs"; then
+      poll_failed=1
+      break
+    fi
+    _prs_chunks+="${_one_prs}"$'\n'
+  done
+  if (( poll_failed == 0 )) && [[ -n "$_prs_chunks" ]]; then
+    if ! prs_json="$("$JQ_BIN" -s 'add | unique_by(.number)' <<<"$_prs_chunks" 2>/dev/null)"; then
+      poll_failed=1
+    fi
+  fi
+
+  if (( poll_failed == 1 )) || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$prs_json"; then
     consecutive_poll_errors=$((consecutive_poll_errors + 1))
     wait_sec="$(calc_backoff "$consecutive_poll_errors")"
     printf '[%s] 警告：拉取待终审 PR 列表失败（连续第 %d 次），%ss 后重试...\n' \
@@ -891,6 +913,8 @@ while true; do
   head_sha="$("$JQ_BIN" -r '.headRefOid' <<<"$next_pr_json")"
   mergeable="$("$JQ_BIN" -r '.mergeable // ""' <<<"$next_pr_json")"
   merge_state="$("$JQ_BIN" -r '.mergeStateStatus // ""' <<<"$next_pr_json")"
+  pr_is_e2e_skipped="$("$JQ_BIN" -r --arg skip_lbl "${LABEL_PREFIX}e2e-skipped" --arg pass_lbl "${LABEL_PREFIX}e2e-passed" \
+    'if any(.labels[]?.name; . == $skip_lbl) and (any(.labels[]?.name; . == $pass_lbl) | not) then "1" else "0" end' <<<"$next_pr_json")"
   issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
 
   # 1. 前置检查 CI 状态（若仍有进行中的 Check，稍后重试，避免抢跑）
@@ -1040,6 +1064,47 @@ EOF
   allow_squash_merge="$("$JQ_BIN" -r '.allow_squash_merge' <<<"$repo_merge_json")"
   allow_rebase_merge="$("$JQ_BIN" -r '.allow_rebase_merge' <<<"$repo_merge_json")"
 
+  # 先拉取既有代码评审与 E2E 评论，并解析 <!-- codex-review-meta:... -->（供复用证据定位与 e2e-skipped 硬门禁校验）
+  prev_review_comment="$(gh_state get-comment pr "$pr_num" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
+  prev_e2e_comment="$(gh_state get-comment pr "$pr_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+  if [[ -z "$prev_e2e_comment" && -n "$issue_num" ]]; then
+    prev_e2e_comment="$(gh_state get-comment issue "$issue_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+  fi
+
+  rm_head_sha=""
+  rm_verdict=""
+  rm_e2e_decision=""
+  rm_e2e_reused_sha=""
+  review_skip_valid=0
+  _rm_line=""
+  _rm_json=""
+  while IFS= read -r _line; do
+    if [[ "$_line" == *"<!-- codex-review-meta:"* ]]; then
+      _rm_line="$_line"
+    fi
+  done <<<"$prev_review_comment"
+  if [[ -n "$_rm_line" ]]; then
+    _rm_json="${_rm_line#*<!-- codex-review-meta:}"
+    _rm_json="${_rm_json%%-->*}"
+    _rm_json="${_rm_json%"${_rm_json##*[![:space:]]}"}"
+    if "$JQ_BIN" -e 'type == "object"' >/dev/null 2>&1 <<<"$_rm_json"; then
+      rm_head_sha="$("$JQ_BIN" -r '.head_sha // ""' <<<"$_rm_json")"
+      rm_verdict="$("$JQ_BIN" -r '.verdict // ""' <<<"$_rm_json")"
+      rm_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // ""' <<<"$_rm_json")"
+      rm_e2e_reused_sha="$("$JQ_BIN" -r '.e2e_reused_sha // ""' <<<"$_rm_json")"
+    fi
+  fi
+
+  if [[ "$pr_is_e2e_skipped" == "1" && "$rm_verdict" == "approve" ]] \
+    && [[ "$rm_e2e_decision" == "skip_not_needed" || "$rm_e2e_decision" == "skip_already_passed" ]]; then
+    if [[ "$rm_head_sha" == "$head_sha" ]]; then
+      review_skip_valid=1
+    elif [[ -n "$resolved_from_sha" && "$rm_head_sha" == "$resolved_from_sha" ]]; then
+      _rm_p1="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)"
+      [[ "$_rm_p1" == "$rm_head_sha" ]] && review_skip_valid=1
+    fi
+  fi
+
   ev_wt=""
   ev_branch_sha=""
   ev_entry_dir=""
@@ -1049,6 +1114,8 @@ EOF
   ev_tested_sha=""
   ev_result_verdict=""
   ev_sha_matched=0
+  ev_is_ancestor=0
+  ev_delta_stat=""
   ev_sensitive_files=""
   ev_file_list=""
   ev_web_url=""
@@ -1057,7 +1124,11 @@ EOF
   if ev_out="$(prepare_evidence_checkout)" && [[ -n "$ev_out" ]]; then
     ev_wt="${ev_out%%$'\t'*}"
     ev_branch_sha="${ev_out#*$'\t'}"
-    # 优先精确匹配当前 head_sha（或终审就地解冲突前的原 E2E 提交 resolved_from_sha）的归档目录
+    # 检索优先顺序：
+    #   1) current head_sha
+    #   2) resolved_from_sha（就地消解机械冲突前的原 commit）
+    #   3) rm_e2e_reused_sha（评审认定可复用的同 PR 或同 Issue 先前通过 E2E 的 commit）
+    #   4) pr-<N> 最新归档回退
     for _d in "${ev_wt}/pr-${pr_num}/"*"-${head_sha:0:10}"; do
       [[ -d "$_d" ]] && ev_entry_dir="$_d"
     done
@@ -1065,6 +1136,16 @@ EOF
       for _d in "${ev_wt}/pr-${pr_num}/"*"-${resolved_from_sha:0:10}"; do
         [[ -d "$_d" ]] && ev_entry_dir="$_d"
       done
+    fi
+    if [[ -z "$ev_entry_dir" && -n "$rm_e2e_reused_sha" ]]; then
+      for _d in "${ev_wt}/pr-${pr_num}/"*"-${rm_e2e_reused_sha:0:10}"; do
+        [[ -d "$_d" ]] && ev_entry_dir="$_d"
+      done
+      if [[ -z "$ev_entry_dir" ]]; then
+        for _d in "${ev_wt}/pr-"*"/"*"-${rm_e2e_reused_sha:0:10}"; do
+          [[ -d "$_d" ]] && ev_entry_dir="$_d"
+        done
+      fi
     fi
     if [[ -z "$ev_entry_dir" ]]; then
       for _d in "${ev_wt}/pr-${pr_num}/"*; do
@@ -1085,6 +1166,12 @@ EOF
           _p1="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)"
           [[ "$_p1" == "$ev_tested_sha" ]] && ev_sha_matched=1
         fi
+        if [[ -n "$ev_tested_sha" ]] && "$GIT_BIN" -C "$REPO_ROOT" merge-base --is-ancestor "$ev_tested_sha" "$head_sha" 2>/dev/null; then
+          ev_is_ancestor=1
+          if [[ "$ev_tested_sha" != "$head_sha" ]]; then
+            ev_delta_stat="$("$GIT_BIN" -C "$REPO_ROOT" diff --stat "${ev_tested_sha}..${head_sha}" 2>/dev/null || true)"
+          fi
+        fi
       fi
       if [[ -f "${ev_entry_dir}/result.json" ]]; then
         ev_result_json="$("$CAT_BIN" "${ev_entry_dir}/result.json")"
@@ -1096,7 +1183,7 @@ EOF
     fi
   fi
 
-  # 4. 拉取关联 Issue、历史评审与 E2E 评论、以及完整 PR diff
+  # 4. 拉取关联 Issue 以及完整 PR diff
   issue_section="（未识别到关联 Issue）"
   if [[ -n "$issue_num" ]]; then
     if issue_json="$(gh_state get-issue "$issue_num" 2>/dev/null)"; then
@@ -1116,23 +1203,36 @@ EOF
     fi
   fi
 
-  prev_review_comment="$(gh_state get-comment pr "$pr_num" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
-  prev_e2e_comment="$(gh_state get-comment pr "$pr_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
-
   pr_diff_raw="$(gh_state get-pr-diff "$pr_num" 2>/dev/null || true)"
   pr_diff_snippet="${pr_diff_raw:0:MAX_DIFF_BYTES}"
   if (( ${#pr_diff_raw} > MAX_DIFF_BYTES )); then
     pr_diff_snippet="${pr_diff_snippet}"$'\n\n'"... (diff 已截断，请在当前只读工作区使用 git diff origin/${base_branch}...HEAD 查看完整变更)"
   fi
 
+  ev_delta_section=""
+  if [[ -n "$ev_delta_stat" ]]; then
+    ev_delta_section="- 自 \`${ev_tested_sha:0:10}\` 以来的增量改动统计:"$'\n''```text'$'\n'"${ev_delta_stat}"$'\n''```'
+  fi
+
+  if [[ "$pr_is_e2e_skipped" != "1" ]]; then
+    e2e_entry_mode_desc="${LABEL_PREFIX}e2e-passed（已完成当前提交的独立 E2E 验收）"
+  elif [[ "$rm_e2e_decision" == "skip_not_needed" ]]; then
+    e2e_entry_mode_desc="${LABEL_PREFIX}e2e-skipped / skip_not_needed（独立评审确认纯非运行时改动免 E2E；评审签核匹配=${review_skip_valid}）"
+  elif [[ "$rm_e2e_decision" == "skip_already_passed" ]]; then
+    e2e_entry_mode_desc="${LABEL_PREFIX}e2e-skipped / skip_already_passed（独立评审确认复用先前已通过 E2E 提交 \`${rm_e2e_reused_sha:0:10}\`；评审签核匹配=${review_skip_valid}）"
+  else
+    e2e_entry_mode_desc="${LABEL_PREFIX}e2e-skipped（未检测到匹配的评审免测元数据）"
+  fi
+
   "$CAT_BIN" > "$prompt_file" <<EOF
-你是本流水线的**终审合入门禁官（Final Gate / Release Reviewer）**。本 PR 已通过 E2E 验收，请你从发布合入角度，对 **原始 Issue、最终代码、远端 QA 证据、CI 状态与 PR 信息** 做最后一次全面对账，决定是否满足合入要求，并生成最终规范化的 PR 标题、PR 正文与 Issue 收口说明。
+你是本流水线的**终审合入门禁官（Final Gate / Release Reviewer）**。本 PR 通过 \`${e2e_entry_mode_desc}\` 进入终审，请你从发布合入角度，对 **原始 Issue、最终代码、远端 QA 证据/免测依据、CI 状态与 PR 信息** 做最后一次全面对账，决定是否满足合入要求，并生成最终规范化的 PR 标题、PR 正文与 Issue 收口说明。
 
 ## PR 基本信息
 - PR: #${pr_num} (${pr_url})
 - 当前标题: ${pr_title}
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 最终 Commit SHA: \`${head_sha}\`
+- E2E 入场模式: ${e2e_entry_mode_desc}
 - Draft 状态: \`${is_draft}\`（注：自动化流水线默认先创建 Draft PR，终审放行后由外层脚本自动转为 Ready，\`isDraft=true\` 属于正常状态，不是阻塞项）
 - 自动合入授权: \`AUTO_MERGE=${AUTO_MERGE}\`（当为 \`1\` 时，仓库 Owner 已明确授权本终审在技术与证据条件满足时代表 Owner 自动解除 Draft 并执行合并）
 - 可合并性: \`${mergeable:-UNKNOWN}\` / \`${merge_state:-UNKNOWN}\`
@@ -1166,7 +1266,8 @@ ${issue_section}
 ## 远端 QA 证据核对结果（分支 \`${E2E_EVIDENCE_BRANCH}\` @ \`${ev_branch_sha:0:10}\`）
 - 证据归档目录（本地只读检出）: \`${ev_entry_dir:-(未找到)}\`
 - 证据 GitHub 永久直链: ${ev_web_url:-(无)}
-- 证据 manifest.tested_sha: \`${ev_tested_sha:-(缺失)}\`（与 PR head_sha 或其第一父提交是否严格一致: \`${ev_sha_matched}\`）
+- 证据 manifest.tested_sha: \`${ev_tested_sha:-(缺失)}\`（与 PR head_sha 或其第一父提交是否严格一致: \`${ev_sha_matched}\`，是否当前提交祖先: \`${ev_is_ancestor}\`）
+${ev_delta_section:-- 自已通过 E2E 提交以来的增量改动: (无或未适用)}
 ${resolved_conflict_note:+- 终审机械冲突就地消解记录: ${resolved_conflict_note}}
 - 敏感文件名预检: ${ev_sensitive_files:-"(未发现 secrets.json/.env/.key/.pem 等敏感文件名)"}
 
@@ -1197,8 +1298,12 @@ ${pr_diff_snippet:-"(空 diff)"}
 \`\`\`
 
 ## 终审准则（务必严格遵守）
-1. **核对最终代码与 SHA**：当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出；尤其重点检查 E2E 打回后新增的修改提交是否干净、无回归、无调试代码残留。同时核对 \`manifest.tested_sha == ${head_sha}\`（若由本终审刚就地消解机械冲突生成了合并提交，允许 \`head_sha^1 == manifest.tested_sha\`，此时重点核对合并提交未破坏原逻辑；否则说明最新代码未经 E2E 复验，不得放行 \`merge\`）。
-2. **核对 Issue 与 QA 证据闭环**：按需检查 \`${ev_entry_dir}\` 中的真实日志与报告，确认 Issue 核心验收标准均有真实代码与 QA 证据闭环，且证据目录无敏感凭据泄漏、无未清理临时文件。
+1. **核对最终代码与 SHA**：当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出；重点检查改动是否干净、无回归、无调试代码残留：
+   - 当入场模式为 \`agy:e2e-passed\` 时：核对 \`manifest.tested_sha == ${head_sha}\`（或由本终审刚就地消解机械冲突生成了合并提交，允许 \`head_sha^1 == manifest.tested_sha\`）；若不一致，说明最新代码未经 E2E 复验，输出 \`require_e2e\` 或拒绝 \`merge\`。
+   - 当入场模式为 \`agy:e2e-skipped\` 且评审签核匹配（\`${review_skip_valid} == 1\`）时：
+     - 若为 \`skip_not_needed\`：复核整个 PR diff 确实全部为非运行时改动（文档、注释、纯单元测试、静态配置/元数据等）；若确认属实，**不要因为缺少 QA 证据归档而阻止合入**，可直接放行 \`merge\`；若发现包含影响运行时行为的代码改动，必须输出 \`verdict: "require_e2e"\`（将直接转 \`agy:approved\` 进入 E2E，无需打回开发）。
+     - 若为 \`skip_already_passed\`：复核先前的 E2E 归档（\`${ev_tested_sha:-(缺失)}\`）结论为 \`pass\`、属于当前提交的祖先，且增量改动（\`${ev_tested_sha:0:10}..${head_sha:0:10}\`）确实不破坏既有 E2E 结论；若确认属实，可直接放行 \`merge\`；若增量改动影响了运行时行为需重新 E2E，必须输出 \`verdict: "require_e2e"\`。
+2. **核对 Issue 与 QA 证据/免测闭环**：按需检查 \`${ev_entry_dir}\` 中的真实日志与报告（\`skip_not_needed\` 除外），确认 Issue 核心验收标准均有真实代码与验收闭环，且证据目录无敏感凭据泄漏、无未清理临时文件。
 3. **核对合并冲突风险并裁定合并方式（\`merge_method\`）**：
    - 若 \`origin/${base_branch}\` 已有新提交（\`behind > 0\`）且与本 PR **修改了重叠文件或关联接口**，务必通过只读 \`git diff\` / \`git log\` 评估是否存在**语义冲突风险**（即便 Git 自动合并不报错，逻辑上也可能互相破坏）；若存在语义冲突风险或主干变更需要重新 E2E 回归，必须输出 \`request_changes\` 要求先同步主干再验证，不得盲目合入。
    - 请结合仓库允许的合并策略、PR 提交历史与冲突风险，裁定最终 \`merge_method\`（\`merge\` / \`squash\` / \`rebase\`）并在 \`merge_method_reason\` 中简明说明理由：
@@ -1210,6 +1315,7 @@ ${pr_diff_snippet:-"(空 diff)"}
    - **严禁以“缺少 Owner 人工二次确认/授权”阻止合入**：当 \`AUTO_MERGE=1\` 时，仓库 Owner 已将满足技术与验收标准后的最终合入决策权正式授权给本 \`final-gate\`。Issue 模板或完成标准中常见的常规措辞（如“保留 Owner 合入决定”、“由 Owner 决定是否合入”、“等待人工合并”等）均视为由本 \`final-gate\` 代行把关，**不得**因此输出 \`blocked\` 或 \`request_changes\`（仅在 PR/Issue 明确出现紧急暂停指令如 \`DO NOT MERGE\` / \`HOLD\` / \`暂勿合入\` 时才拦截）。
    - **严禁以未改动文件的既有缺陷或脱离 Issue 范围的极端假想反例阻塞已通过 Review+E2E 的 PR**：本 PR 已通过独立代码评审与真实引擎 E2E 验收；\`final-gate\` 只因「违反原始 Issue 明确验收标准、本次 PR 改动直接引入的真实回归/崩溃、SHA 未对齐、缺少真实 QA 证据、敏感信息泄漏、真实/高风险合并冲突、或 CI 失败」才拒绝 \`merge\`。对于 PR 未修改文件的既有历史行为、或未经实测复现的极罕见理论边界（例如奇异反斜杠表名、毫秒级 TOCTOU 竞态等），**一律归入 \`non_blocking_notes\` 作为后续独立跟进建议，绝不得列为 \`blocking_issues\` 打回 \`request_changes\`**。
    - 仅当存在上述明确阻塞项时拒绝 \`merge\`：
+     - 本 PR 实际上仍需真实 E2E 验收/复验（例如 \`agy:e2e-skipped\` 误判或 SHA 未覆盖运行时变更） -> 输出 \`require_e2e\`（直接进 E2E 队列，不打回开发）；
      - 可通过修改代码/同步主干/补充测试解决的问题 -> 输出 \`request_changes\`；
      - 环境/CI 基础设施异常、证据泄漏需人工清理或需人工决策 -> 输出 \`blocked\`。
 5. **生成规范化的最终 PR 信息与 Issue 说明**：
@@ -1239,7 +1345,7 @@ EOF
   codex_ok=0
   codex_rc=0
   if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
-    if [[ -s "$decision_file" ]] && "$JQ_BIN" -e '.verdict == "merge" or .verdict == "request_changes" or .verdict == "blocked"' "$decision_file" >/dev/null 2>&1; then
+    if [[ -s "$decision_file" ]] && "$JQ_BIN" -e '.verdict == "merge" or .verdict == "require_e2e" or .verdict == "request_changes" or .verdict == "blocked"' "$decision_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
   else
@@ -1273,11 +1379,28 @@ EOF
   # 5. 确定性硬门禁兜底（防止 LLM 误放行）
   hard_gate_errors=""
   if [[ "$verdict" == "merge" ]]; then
-    if [[ "$REQUIRE_EVIDENCE_SHA_MATCH" == "1" && "$ev_sha_matched" != "1" ]]; then
-      hard_gate_errors+="- 硬门禁拦截：远端 QA 证据 \`tested_sha\` (\`${ev_tested_sha:-缺失}\`) 与 PR 最新 \`head_sha\` (\`${head_sha}\`) 不一致。"$'\n'
-    fi
-    if [[ "$REQUIRE_EVIDENCE_SHA_MATCH" == "1" && "$ev_result_verdict" != "pass" ]]; then
-      hard_gate_errors+="- 硬门禁拦截：远端 QA 证据结论为 \`${ev_result_verdict:-缺失}\`，并非 \`pass\`。"$'\n'
+    if [[ "$REQUIRE_EVIDENCE_SHA_MATCH" == "1" ]]; then
+      if [[ "$pr_is_e2e_skipped" == "1" ]]; then
+        if [[ "$review_skip_valid" != "1" ]]; then
+          hard_gate_errors+="- 硬门禁拦截：PR 带 \`${LABEL_PREFIX}e2e-skipped\` 标签，但缺少匹配当前 \`head_sha\`（\`${head_sha:0:10}\`）的有效评审免测签核（可能评审后有新提交）。"$'\n'
+        elif [[ "$rm_e2e_decision" == "skip_already_passed" ]]; then
+          if [[ -z "$ev_tested_sha" || "$ev_result_verdict" != "pass" || "$ev_is_ancestor" != "1" ]] \
+            || [[ -n "$rm_e2e_reused_sha" && "$ev_tested_sha" != "$rm_e2e_reused_sha" ]]; then
+            hard_gate_errors+="- 硬门禁拦截：\`skip_already_passed\` 复用的 QA 证据无效（\`verdict=${ev_result_verdict:-缺失}\`, \`tested_sha=${ev_tested_sha:-缺失}\`, \`reused_sha=${rm_e2e_reused_sha:-缺失}\`, \`is_ancestor=${ev_is_ancestor}\`）。"$'\n'
+          fi
+        elif [[ "$rm_e2e_decision" == "skip_not_needed" ]]; then
+          : # 评审已针对当前 SHA 签核非运行时改动免测，无需 QA 证据归档
+        else
+          hard_gate_errors+="- 硬门禁拦截：\`${LABEL_PREFIX}e2e-skipped\` 的评审路由类型无效（\`${rm_e2e_decision:-缺失}\`）。"$'\n'
+        fi
+      else
+        if [[ "$ev_sha_matched" != "1" ]]; then
+          hard_gate_errors+="- 硬门禁拦截：远端 QA 证据 \`tested_sha\` (\`${ev_tested_sha:-缺失}\`) 与 PR 最新 \`head_sha\` (\`${head_sha}\`) 不一致。"$'\n'
+        fi
+        if [[ "$ev_result_verdict" != "pass" ]]; then
+          hard_gate_errors+="- 硬门禁拦截：远端 QA 证据结论为 \`${ev_result_verdict:-缺失}\`，并非 \`pass\`。"$'\n'
+        fi
+      fi
     fi
     if [[ -n "$ev_sensitive_files" ]]; then
       hard_gate_errors+="- 硬门禁拦截：QA 证据目录中检测到疑似敏感文件（\`${ev_sensitive_files}\`），请清理后再合入。"$'\n'
@@ -1400,6 +1523,11 @@ EOF
         final_action="${LABEL_PREFIX}ready-to-merge (method=${effective_merge_method}, awaiting manual merge)"
       fi
     fi
+  elif [[ "$verdict" == "require_e2e" ]]; then
+    final_state="approved"
+    final_action="${LABEL_PREFIX}approved (require-e2e)"
+    record_checked_sha=0
+    extra_notice+=$'\n\n'"> ℹ️ 终审评估当前改动仍需执行真实 E2E 验收（无需打回开发），已直接切换为 \`${LABEL_PREFIX}approved\` 交由 E2E 循环处理。"
   elif [[ "$verdict" == "blocked" ]]; then
     final_state="blocked"
     final_action="${LABEL_PREFIX}blocked"
@@ -1427,7 +1555,7 @@ EOF
     if [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" ]] && [[ -n "$issue_closing_note" ]]; then
       issue_comment_md="${final_md}"$'\n\n'"#### Issue 验收收口说明"$'\n'"${issue_closing_note}"
     fi
-    if [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" || "$final_state" == "blocked" ]]; then
+    if [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" || "$final_state" == "blocked" || "$final_state" == "approved" ]]; then
       printf '%s\n' "$issue_comment_md" | gh_state comment issue "$issue_num" - "$FINAL_GATE_COMMENT_MARKER" || true
       gh_state set-state issue "$issue_num" "$final_state" || true
     elif [[ "$final_state" == "changes-requested" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then

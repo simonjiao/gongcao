@@ -52,6 +52,7 @@ STATES=(
   "changes-requested|e99695|Reviewer, E2E, or Final Gate requested changes; awaiting follow-up fixes"
   "approved|2ea44f|Independent code review passed; ready for E2E verification"
   "e2e-passed|006b75|Independent E2E verification passed; ready for final gate sign-off"
+  "e2e-skipped|0075ca|Code review confirmed E2E is unnecessary or prior E2E remains valid; routed directly to final gate"
   "ready-to-merge|0e8a16|Final gate passed; ready for merge"
   "blocked|d93f0b|Blocked or failed during automation; needs human attention"
   "done|5319e7|Completed"
@@ -67,7 +68,7 @@ usage() {
   gh-state.sh list-prs [state] [label] [limit]
   gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
-  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|ready-to-merge|blocked|done>
+  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|e2e-skipped|ready-to-merge|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | -> [marker]
   gh-state.sh get-comment <issue|pr> <number> [marker]
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
