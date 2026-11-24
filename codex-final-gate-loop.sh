@@ -68,6 +68,9 @@ REQUIRE_CI_PASS="${REQUIRE_CI_PASS:-1}"      # 1=硬校验 CI 无失败且无进
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}"
 MAX_FINAL_ROUNDS="${MAX_FINAL_ROUNDS:-2}"    # 终审最大打回轮次，超过切 blocked
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}"
+CREATE_FOLLOWUP_ISSUES="${CREATE_FOLLOWUP_ISSUES:-1}" # 1=合并成功后自动将必要非阻塞项创建为后续追踪 Issue；0=仅保留在评论
+MAX_FOLLOWUP_ISSUES="${MAX_FOLLOWUP_ISSUES:-3}"       # 单次合入最多创建的后续追踪 Issue 数量上限（防刷单）
+FOLLOWUP_ISSUE_LABELS="${FOLLOWUP_ISSUE_LABELS:-}"    # 可选逗号分隔标签（默认留空，严禁默认附带 agy:todo 以防自举循环）
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"
@@ -137,8 +140,8 @@ printf '  Codex 命令 : %s (model=%s, effort=%s, sandbox=%s, timeout=%s)\n' \
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  终审档案根 : %s\n' "$FINAL_ROOT"
-printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, DRY_RUN=%s\n' \
-  "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$DRY_RUN"
+printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), DRY_RUN=%s\n' \
+  "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$DRY_RUN"
 printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s)\n' \
   "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS"
 
@@ -176,7 +179,8 @@ write_final_gate_schema() {
     "pr_body",
     "issue_closing_note",
     "blocking_issues",
-    "non_blocking_notes"
+    "non_blocking_notes",
+    "follow_up_issues"
   ],
   "properties": {
     "verdict": {
@@ -223,6 +227,21 @@ write_final_gate_schema() {
     "non_blocking_notes": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "follow_up_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slug", "title", "priority", "reason", "body"],
+        "properties": {
+          "slug": { "type": "string" },
+          "title": { "type": "string" },
+          "priority": { "type": "string", "enum": ["P1", "P2", "P3"] },
+          "reason": { "type": "string" },
+          "body": { "type": "string" }
+        }
+      }
     }
   }
 }
@@ -1214,6 +1233,18 @@ EOF
     ev_delta_section="- 自 \`${ev_tested_sha:0:10}\` 以来的增量改动统计:"$'\n''```text'$'\n'"${ev_delta_stat}"$'\n''```'
   fi
 
+  open_issues_md="- (未获取到现有 Open Issues)"
+  if _oi_json="$(gh_state list-issues open "" 50 2>/dev/null)" \
+    && "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$_oi_json"; then
+    open_issues_md="$("$JQ_BIN" -r '
+      if length == 0 then
+        "- (当前无 Open Issues)"
+      else
+        [.[] | "- #" + (.number | tostring) + ": " + .title] | join("\n")
+      end
+    ' <<<"$_oi_json")"
+  fi
+
   if [[ "$pr_is_e2e_skipped" != "1" ]]; then
     e2e_entry_mode_desc="${LABEL_PREFIX}e2e-passed（已完成当前提交的独立 E2E 验收）"
   elif [[ "$rm_e2e_decision" == "skip_not_needed" ]]; then
@@ -1262,6 +1293,9 @@ ${mt_base_commits:+$'\n'"- 目标分支 \`origin/${base_branch}\` 自公共祖�
 
 ## 关联 Issue 要求
 ${issue_section}
+
+## 当前仓库已有 Open Issues（用于后续追踪去重，严禁重复建单）
+${open_issues_md}
 
 ## 远端 QA 证据核对结果（分支 \`${E2E_EVIDENCE_BRANCH}\` @ \`${ev_branch_sha:0:10}\`）
 - 证据归档目录（本地只读检出）: \`${ev_entry_dir:-(未找到)}\`
@@ -1323,6 +1357,11 @@ ${pr_diff_snippet:-"(空 diff)"}
    - \`pr_title\`：简洁清晰、符合仓库提交/PR 风格。
    - \`pr_body\`：完整规范的中文 PR 正文（Markdown），必须包含：① 改动摘要与根因；② 验证范围与结果（区分内部单测与真实 E2E 验收）；③ 固定验收 Commit SHA（\`${head_sha}\`）与远端 QA 证据永久直链（${ev_web_url:-(无)}）；④ 已知限制或未验证项；⑤ 末尾保留 \`Closes #${issue_num:-N}\`（如有关联 Issue）。
    - \`issue_closing_note\`：简明的 Issue 最终收口评论（关联 PR、固定 SHA、QA 证据直链、已知未覆盖项）。
+5.1 **必要时生成后续追踪 Issue（\`follow_up_issues\`）**：
+   - 仅当 \`verdict == "merge"\` 时评估哪些非阻塞发现**确有必要**沉淀为独立的后续追踪 Issue（其他结论固定输出空数组 \`[]\`）。
+   - **应建单**：终审发现的真实既有隐患（例如 PR 未修改文件中的历史缺陷）、明确延后的功能/安全/可靠性/测试覆盖缺口，且具备明确代码定位与验收标准，且**未在上方 Open Issues 列表中重复存在**。
+   - **严禁建单**（仅保留在 \`non_blocking_notes\`）：过程性执行记录（重试、清理日志、手动 CI 工作流说明、单测数量来源说明）、已合入 PR 的历史分支命名等琐碎事项、或已有 Open Issue 追踪的问题。
+   - 最多输出 ${MAX_FOLLOWUP_ISSUES} 条；每条需提供简短英文唯一标识 \`slug\`（如 \`pg-zero-column-snapshot\`）、清晰中文 \`title\`、\`priority\`（\`P1\` / \`P2\` / \`P3\`）、简明 \`reason\` 与完整可执行的 Markdown \`body\`（含问题证据、建议改动范围与验收标准）；无必要建单时必须输出 \`[]\`。
 6. 最终输出必须严格符合 JSON Schema。
 EOF
 
@@ -1543,6 +1582,61 @@ EOF
     fi
   fi
 
+  # 仅在 PR 成功合并且开启后续建单时，为必要的非阻塞发现幂等创建追踪 Issue
+  created_followups_md=""
+  created_followups_json="[]"
+  if [[ "$CREATE_FOLLOWUP_ISSUES" == "1" ]] && (( merged_ok == 1 )); then
+    max_fu=0
+    [[ "$MAX_FOLLOWUP_ISSUES" =~ ^[0-9]+$ ]] && max_fu="$MAX_FOLLOWUP_ISSUES"
+    follow_up_count="$("$JQ_BIN" -r --argjson max "$max_fu" '(.follow_up_issues // []) | if length > $max then $max else length end' "$decision_file")"
+    for (( idx = 0; idx < follow_up_count; idx++ )); do
+      fu_slug="$("$JQ_BIN" -r --argjson i "$idx" '(.follow_up_issues[$i].slug // "")' "$decision_file")"
+      fu_title="$("$JQ_BIN" -r --argjson i "$idx" '(.follow_up_issues[$i].title // "")' "$decision_file")"
+      fu_priority="$("$JQ_BIN" -r --argjson i "$idx" '(.follow_up_issues[$i].priority // "P2")' "$decision_file")"
+      fu_reason="$("$JQ_BIN" -r --argjson i "$idx" '(.follow_up_issues[$i].reason // "")' "$decision_file")"
+      fu_body="$("$JQ_BIN" -r --argjson i "$idx" '(.follow_up_issues[$i].body // "")' "$decision_file")"
+      [[ -z "$fu_title" || -z "$fu_body" ]] && continue
+
+      safe_slug="${fu_slug//[^a-zA-Z0-9._-]/-}"
+      [[ -z "$safe_slug" ]] && safe_slug="item-$((idx + 1))"
+      fu_dedup_key="<!-- gongcao-followup-key:pr-${pr_num}:${safe_slug} -->"
+      fu_body_file="${final_dir}/followup-${run_ts}-$((idx + 1)).md"
+
+      "$CAT_BIN" > "$fu_body_file" <<EOF
+### 来源与追踪上下文
+- 来源 PR: #${pr_num} (${pr_url})
+- 关联原 Issue: #${issue_num:-无}
+- 合并提交: \`${head_sha:0:10}\`
+- 优先级: \`${fu_priority}\`
+
+### 追踪原因
+${fu_reason:-"Final Gate 终审合入时沉淀的独立后续改进项。"}
+
+### 问题描述与建议范围
+${fu_body}
+
+${fu_dedup_key}
+EOF
+
+      if fu_out="$(gh_state create-issue "$fu_title" "$fu_body_file" "$FOLLOWUP_ISSUE_LABELS" "$fu_dedup_key")" && [[ -n "$fu_out" ]]; then
+        IFS=$'\t' read -r fu_num fu_url fu_status <<<"$fu_out"
+        created_followups_md+="- [${fu_priority}] #${fu_num} ${fu_title} (${fu_url}) — \`${fu_status}\`"$'\n'
+        created_followups_json="$("$JQ_BIN" -c \
+          --arg num "$fu_num" \
+          --arg title "$fu_title" \
+          --arg priority "$fu_priority" \
+          --arg url "$fu_url" \
+          --arg status "$fu_status" \
+          --arg slug "$safe_slug" \
+          '. + [{number: ($num | tonumber? // $num), title: $title, priority: $priority, url: $url, status: $status, slug: $slug}]' \
+          <<<"$created_followups_json")"
+      fi
+    done
+    if [[ -n "$created_followups_md" ]]; then
+      extra_notice+=$'\n\n'"#### 后续追踪 Issue（由 Final Gate 自动创建）"$'\n'"${created_followups_md%$'\n'}"
+    fi
+  fi
+
   final_md="$(render_final_gate_markdown "$decision_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_action" "$ev_web_url" "$effective_merge_method")${extra_notice}"
   printf '%s\n' "$final_md" > "$comment_file"
 
@@ -1586,6 +1680,7 @@ EOF
     --arg merge_method_reason "$merge_method_reason" \
     --arg final_state "$final_state" \
     --argjson merged "$merged_ok" \
+    --argjson follow_up_issues "$created_followups_json" \
     --arg updated_at "$iso_now" \
     '{
       pr_number: $pr_number,
@@ -1602,6 +1697,7 @@ EOF
       merge_method_reason: $merge_method_reason,
       final_state: $final_state,
       merged: ($merged == 1),
+      follow_up_issues: $follow_up_issues,
       updated_at: $updated_at
     }' > "$meta_file"
 

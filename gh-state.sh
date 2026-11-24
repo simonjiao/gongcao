@@ -76,6 +76,7 @@ usage() {
   gh-state.sh mark-pr-ready <pr_number>
   gh-state.sh merge-pr <pr_number> [merge|squash|rebase] [expected_head_sha]
   gh-state.sh get-repo-merge-settings
+  gh-state.sh create-issue <title> <body_file> [labels_csv] [dedup_key]
 
 环境变量:
   GONGCAO_HOME    主工作目录（默认 ~/.gongcao）
@@ -609,6 +610,74 @@ cmd_get_repo_merge_settings() {
   run_gh api "repos/${repo_slug}" --jq '{allow_merge_commit: (if .allow_merge_commit == null then true else .allow_merge_commit end), allow_squash_merge: (if .allow_squash_merge == null then true else .allow_squash_merge end), allow_rebase_merge: (if .allow_rebase_merge == null then true else .allow_rebase_merge end)}'
 }
 
+cmd_create_issue() {
+  local title="${1:-}"
+  local body_file="${2:-}"
+  local labels_csv="${3:-}"
+  local dedup_key="${4:-}"
+
+  if [[ -z "$title" || -z "$body_file" || ! -f "$body_file" ]]; then
+    printf '错误：create-issue 参数无效（需要 <title> <body_file> [labels_csv] [dedup_key]）\n' >&2
+    exit 2
+  fi
+
+  local body=""
+  body="$("$CAT_BIN" "$body_file")"
+  if [[ -n "$dedup_key" && "$body" != *"$dedup_key"* ]]; then
+    body="${body}"$'\n\n'"${dedup_key}"
+  fi
+
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+
+  # 幂等去重：若已有含相同追踪标记的 Open Issue，直接返回既有记录
+  if [[ -n "$dedup_key" && "$DRY_RUN" != "1" ]]; then
+    local existing_json=""
+    existing_json="$(run_gh api --paginate "repos/${repo_slug}/issues?state=open&per_page=100" --jq '.[] | select(.pull_request == null)' 2>/dev/null || true)"
+    if [[ -n "$existing_json" ]]; then
+      local match_json="" existing_num="" existing_url=""
+      match_json="$("$JQ_BIN" -rs --arg key "$dedup_key" \
+        '[.[] | select((.body // "") | contains($key))] | first // empty' \
+        <<<"$existing_json")"
+      if [[ -n "$match_json" ]]; then
+        existing_num="$("$JQ_BIN" -r '.number // empty' <<<"$match_json")"
+        existing_url="$("$JQ_BIN" -r '.html_url // .url // empty' <<<"$match_json")"
+        if [[ -n "$existing_num" ]]; then
+          printf '已存在同追踪键的 Open Issue #%s: %s，跳过重复创建\n' "$existing_num" "$existing_url" >&2
+          printf '%s\t%s\texisting\n' "$existing_num" "$existing_url"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  local payload=""
+  if [[ -n "$labels_csv" ]]; then
+    payload="$("$JQ_BIN" -c -n \
+      --arg title "$title" \
+      --arg body "$body" \
+      --arg labels_csv "$labels_csv" \
+      '($labels_csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | unique) as $lbls |
+       if ($lbls | length) > 0 then {title: $title, body: $body, labels: $lbls} else {title: $title, body: $body} end')"
+  else
+    payload="$("$JQ_BIN" -c -n --arg title "$title" --arg body "$body" '{title: $title, body: $body}')"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[DRY_RUN] POST repos/%s/issues (title=%q, labels=%q, dedup_key=%q)\n' \
+      "$repo_slug" "$title" "$labels_csv" "$dedup_key" >&2
+    printf '0\t(dry-run-issue)\tdry-run\n'
+    return 0
+  fi
+
+  local created_json="" created_num="" created_url=""
+  created_json="$(run_gh_stdin "$payload" api -X POST "repos/${repo_slug}/issues" --input -)"
+  created_num="$("$JQ_BIN" -r '.number // empty' <<<"$created_json")"
+  created_url="$("$JQ_BIN" -r '.html_url // .url // empty' <<<"$created_json")"
+  printf '已创建后续追踪 Issue #%s: %s\n' "$created_num" "$created_url" >&2
+  printf '%s\t%s\tcreated\n' "$created_num" "$created_url"
+}
+
 main() {
   local subcmd="${1:-}"
   shift || true
@@ -628,6 +697,7 @@ main() {
     mark-pr-ready)           cmd_mark_pr_ready "$@" ;;
     merge-pr)                cmd_merge_pr "$@" ;;
     get-repo-merge-settings) cmd_get_repo_merge_settings "$@" ;;
+    create-issue)            cmd_create_issue "$@" ;;
     -h|--help|"")
       usage
       [[ -n "$subcmd" ]] && exit 0 || exit 2
