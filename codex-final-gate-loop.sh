@@ -1298,6 +1298,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 \`\`\`
 
 ## 终审准则（务必严格遵守）
+0. **运行环境与数据源约束**：你当前运行在离线 \`read-only\` 沙箱中，网络与本地 \`gh\` CLI 权限已被有意禁用；所有实时 GitHub PR、Issue、CI Checks、标签与评论快照以及远端 QA 证据分支检出均已由外层宿主机脚本通过 \`gh-state.sh\` 完整注入本提示词及只读工作区。**禁止在沙箱内调用 \`gh\` 命令**，也不要在 \`non_blocking_notes\` 或总结中记录“沙箱拒绝 \`gh\` / 无网权限”等无效环境噪声。
 1. **核对最终代码与 SHA**：当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出；重点检查改动是否干净、无回归、无调试代码残留：
    - 当入场模式为 \`agy:e2e-passed\` 时：核对 \`manifest.tested_sha == ${head_sha}\`（或由本终审刚就地消解机械冲突生成了合并提交，允许 \`head_sha^1 == manifest.tested_sha\`）；若不一致，说明最新代码未经 E2E 复验，输出 \`require_e2e\` 或拒绝 \`merge\`。
    - 当入场模式为 \`agy:e2e-skipped\` 且评审签核匹配（\`${review_skip_valid} == 1\`）时：
