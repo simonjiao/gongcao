@@ -752,14 +752,14 @@ EOF
   printf '%s\n' "$e2e_md" | gh_state comment pr "$pr_num" - "$E2E_COMMENT_MARKER" || true
   gh_state set-state pr "$pr_num" "$final_state" || true
 
-  # 同步关联 Issue 状态
+  # 同步关联 Issue 状态（先写评论再切标签，避免开发循环在评论写入前就拉取到 changes-requested）
   if [[ -n "$issue_num" ]]; then
     if [[ "$final_state" == "e2e-passed" || "$final_state" == "blocked" ]]; then
+      printf '%s\n' "$e2e_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
       gh_state set-state issue "$issue_num" "$final_state" || true
-      printf '%s\n' "$e2e_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
     elif [[ "$final_state" == "changes-requested" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
-      gh_state set-state issue "$issue_num" changes-requested || true
       printf '%s\n' "$e2e_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
+      gh_state set-state issue "$issue_num" changes-requested || true
     fi
   fi
 
