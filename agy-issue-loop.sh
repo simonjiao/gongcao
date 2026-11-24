@@ -56,7 +56,12 @@ E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
 FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-comment -->}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
-PRINT_TIMEOUT="${PRINT_TIMEOUT:-20m}"
+PRINT_TIMEOUT="${PRINT_TIMEOUT:-40m}"  # xhigh 模型推理更深且需覆盖后端编译测试，默认 40 分钟
+MAX_TIMEOUT_RETRIES="${MAX_TIMEOUT_RETRIES:-2}" # 触发 --print-timeout 超时后自动续接原会话重试次数上限（共最多 1+N 次）
+MAX_QUOTA_RETRIES="${MAX_QUOTA_RETRIES:-6}"     # 触发 429/RESOURCE_EXHAUSTED 配额限流或可重试 API 报错时的自动等待重试次数上限
+QUOTA_RETRY_BUFFER_SEC="${QUOTA_RETRY_BUFFER_SEC:-15}" # 配额重置倒计时额外缓冲秒数
+QUOTA_DEFAULT_WAIT_SEC="${QUOTA_DEFAULT_WAIT_SEC:-120}" # 未解析出 Resets in 时的默认冷却等待秒数
+MAX_QUOTA_WAIT_SEC="${MAX_QUOTA_WAIT_SEC:-3600}"       # 单次冷却等待上限（超过则直接转 blocked 避免无限长睡）
 AGY_MODE="${AGY_MODE:-accept-edits}"   # accept-edits | auto | plan（默认 accept-edits 避免账号无 auto 权限告警）
 AGY_SKIP_PERMISSIONS="${AGY_SKIP_PERMISSIONS:-1}" # 在 --sandbox 内免本地交互确认自动推进（1=启用，0=关闭）
 AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-xhigh}" # 默认使用 Gemini 4 Hydrogen (XHigh)；也可切为 gemini-4-neon-xhigh
@@ -141,7 +146,7 @@ printf '  状态根目录 : %s\n' "$STATE_ROOT"
 printf '  Worktree 根: %s\n' "$WORKTREE_ROOT"
 printf '  会话记录根 : %s\n' "$SESSIONS_ROOT"
 printf '  过滤标签   : %s\n' "${FILTER_LABEL:-(无)}"
-printf '  运行模型   : %s (effort=%s, mode=%s, skip_permissions=%s)\n' "${AGY_MODEL:-(agy 默认)}" "${AGY_EFFORT:-(随模型默认)}" "$AGY_MODE" "$AGY_SKIP_PERMISSIONS"
+printf '  运行模型   : %s (effort=%s, mode=%s, timeout=%s, timeout_retries=%s, quota_retries=%s, skip_permissions=%s)\n' "${AGY_MODEL:-(agy 默认)}" "${AGY_EFFORT:-(随模型默认)}" "$AGY_MODE" "$PRINT_TIMEOUT" "$MAX_TIMEOUT_RETRIES" "$MAX_QUOTA_RETRIES" "$AGY_SKIP_PERMISSIONS"
 printf '  GitHub同步 : %s (AUTO_PUSH_PR=%s, DRY_RUN=%s)\n' "$GH_SYNC_ENABLED" "$AUTO_PUSH_PR" "$DRY_RUN"
 
 LABELS_READY=0
@@ -260,8 +265,21 @@ extract_conversation_id() {
   local id=""
   while IFS= read -r line; do
     [[ -n "$line" ]] && id="$line"
-  done < <("$JQ_BIN" -R -r 'fromjson? | (.conversation_id // .conversationId // .session_id // .sessionId // empty)' "$events_file" 2>/dev/null || true)
+  done < <("$JQ_BIN" -R -r 'fromjson? | (.conversation_id // .conversationId // .session_id // .sessionId // .step_update.conversation_id // .result.conversation_id // empty)' "$events_file" 2>/dev/null || true)
   printf '%s' "$id"
+}
+
+parse_reset_wait_seconds() {
+  local raw="" dur="" h=0 m=0 s=0
+  raw="$("$GREP_BIN" -hoiE 'resets in[[:space:]]+[0-9]+[hms]([0-9]+[ms])*' "$@" 2>/dev/null | "$GREP_BIN" -m 1 -oiE '[0-9]+[hms]([0-9]+[ms])*$' || true)"
+  [[ -n "$raw" ]] || return 1
+  dur="$raw"
+  if [[ "$dur" =~ ([0-9]+)[hH] ]]; then h=$((10#${BASH_REMATCH[1]})); fi
+  if [[ "$dur" =~ ([0-9]+)[mM] ]]; then m=$((10#${BASH_REMATCH[1]})); fi
+  if [[ "$dur" =~ ([0-9]+)[sS] ]]; then s=$((10#${BASH_REMATCH[1]})); fi
+  local total=$(( h * 3600 + m * 60 + s ))
+  (( total > 0 )) || return 1
+  printf '%s' "$total"
 }
 
 write_session_meta() {
@@ -557,48 +575,161 @@ EOF
   write_session_meta "$meta_file" "$number" "$title" "$url" "$state" "$labels" \
     "$branch" "$wt_dir" "$existing_conv_id" "" "in-progress" "$iso_now"
 
-  agy_args=(
-    -p "$prompt"
-    --mode "$AGY_MODE"
-    --sandbox
-    --print-timeout "$PRINT_TIMEOUT"
-    --output-format stream-json
-    --log-file "$cli_log_file"
-  )
-  if [[ "$AGY_SKIP_PERMISSIONS" == "1" ]]; then
-    agy_args+=(--dangerously-skip-permissions)
-  fi
-  if [[ -n "$AGY_MODEL" ]]; then
-    agy_args+=(--model "$AGY_MODEL")
-  fi
-  if [[ -n "$AGY_EFFORT" ]]; then
-    agy_args+=(--effort "$AGY_EFFORT")
-  fi
-  if [[ -n "$existing_conv_id" ]]; then
-    agy_args=(--conversation "$existing_conv_id" "${agy_args[@]}")
-    printf '[%s] 续接 Issue #%s 历史会话 (%s)，worktree: %s\n' \
-      "$("$DATE_BIN" '+%F %T')" "$number" "$existing_conv_id" "$wt_dir"
-  else
-    printf '[%s] 启动 Issue #%s 新会话，worktree: %s\n' \
-      "$("$DATE_BIN" '+%F %T')" "$number" "$wt_dir"
-  fi
-
-  # 2. 在独立 worktree 内执行 agy，保留完整会话事件流
+  # 2. 在独立 worktree 内执行 agy，若触发 --print-timeout 超时或 429 配额限流则在上限内自动续接原会话重试
   agy_start_sec=$SECONDS
   run_ok=0
-  if (cd -- "$wt_dir" && "$AGY_BIN" "${agy_args[@]}") | "$TEE_BIN" "$run_events_file" >> "$events_file"; then
-    run_ok=1
-  fi
-  agy_elapsed=$((SECONDS - agy_start_sec))
-  printf '[%s] Issue #%s agy 执行结束 (ok=%d, 耗时 %ds)，开始后处理（commit / push / 更新状态）...\n' \
-    "$("$DATE_BIN" '+%F %T')" "$number" "$run_ok" "$agy_elapsed"
+  timed_out=0
+  timeout_retries=0
+  quota_hit=0
+  quota_wait_exceeded=0
+  quota_retries=0
+  last_quota_wait=0
+  attempt=0
+  max_t_retries=0
+  [[ "$MAX_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] && max_t_retries="$MAX_TIMEOUT_RETRIES"
+  max_q_retries=0
+  [[ "$MAX_QUOTA_RETRIES" =~ ^[0-9]+$ ]] && max_q_retries="$MAX_QUOTA_RETRIES"
+  current_conv_id="$existing_conv_id"
+  current_prompt="$prompt"
 
-  # 提取并持久化 conversation_id
-  new_conv_id="$(extract_conversation_id "$run_events_file")"
-  final_conv_id="${new_conv_id:-$existing_conv_id}"
-  if [[ -n "$final_conv_id" ]]; then
-    printf '%s\n' "$final_conv_id" > "$conv_id_file"
-  fi
+  while true; do
+    attempt=$((attempt + 1))
+    attempt_events_file="${session_dir}/events-${run_ts}-try${attempt}.jsonl"
+    attempt_stderr_file="${session_dir}/stderr-${run_ts}-try${attempt}.log"
+    attempt_cli_log="${session_dir}/agy-cli-${run_ts}-try${attempt}.log"
+
+    agy_args=(
+      -p "$current_prompt"
+      --mode "$AGY_MODE"
+      --sandbox
+      --print-timeout "$PRINT_TIMEOUT"
+      --output-format stream-json
+      --log-file "$attempt_cli_log"
+    )
+    if [[ "$AGY_SKIP_PERMISSIONS" == "1" ]]; then
+      agy_args+=(--dangerously-skip-permissions)
+    fi
+    if [[ -n "$AGY_MODEL" ]]; then
+      agy_args+=(--model "$AGY_MODEL")
+    fi
+    if [[ -n "$AGY_EFFORT" ]]; then
+      agy_args+=(--effort "$AGY_EFFORT")
+    fi
+    if [[ -n "$current_conv_id" ]]; then
+      agy_args=(--conversation "$current_conv_id" "${agy_args[@]}")
+      printf '[%s] 续接 Issue #%s 历史会话 (%s, 第 %d 次尝试)，worktree: %s\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$current_conv_id" "$attempt" "$wt_dir"
+    else
+      printf '[%s] 启动 Issue #%s 新会话 (第 %d 次尝试)，worktree: %s\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "$wt_dir"
+    fi
+
+    attempt_ok=0
+    if (cd -- "$wt_dir" && "$AGY_BIN" "${agy_args[@]}" 2>"$attempt_stderr_file") | "$TEE_BIN" "$attempt_events_file" >> "$events_file"; then
+      attempt_ok=1
+    fi
+
+    if (( attempt_ok == 0 )) && [[ -s "$attempt_stderr_file" ]]; then
+      "$CAT_BIN" "$attempt_stderr_file" >&2
+    fi
+
+    # 每次尝试后立即提取并持久化 conversation_id（供超时续接或人工接管）
+    new_conv_id="$(extract_conversation_id "$attempt_events_file")"
+    if [[ -n "$new_conv_id" ]]; then
+      current_conv_id="$new_conv_id"
+      printf '%s\n' "$current_conv_id" > "$conv_id_file"
+    fi
+
+    if (( attempt_ok == 1 )); then
+      run_ok=1
+      break
+    fi
+
+    # 若 Agent 已主动写入 blocked 文件，不再重试
+    if [[ -s "$blocked_tmp" ]]; then
+      break
+    fi
+
+    is_timeout=0
+    if "$GREP_BIN" -qE '"reason":"print_timeout"|"status":"DEADLINE_EXCEEDED"|print timeout after' "$attempt_stderr_file" "$attempt_events_file" 2>/dev/null; then
+      is_timeout=1
+      timed_out=1
+    fi
+
+    is_quota_error=0
+    if "$GREP_BIN" -qiE 'RESOURCE_EXHAUSTED|"error_code":429|code 429|Individual quota reached|rate limit' "$attempt_stderr_file" "$attempt_events_file" 2>/dev/null; then
+      is_quota_error=1
+      quota_hit=1
+    fi
+
+    is_retryable_api_error=0
+    if (( is_quota_error == 0 && is_timeout == 0 )) && "$GREP_BIN" -qE '"retryable":true' "$attempt_stderr_file" "$attempt_events_file" 2>/dev/null; then
+      is_retryable_api_error=1
+    fi
+
+    if (( is_timeout == 1 && timeout_retries < max_t_retries )); then
+      timeout_retries=$((timeout_retries + 1))
+      printf '[%s] 警告：Issue #%s 第 %d 次执行触发 --print-timeout (%s) 超时，3s 后自动续接原会话 (%s) 重试（第 %d/%d 次重试）...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "$PRINT_TIMEOUT" "${current_conv_id:-new}" "$timeout_retries" "$max_t_retries" >&2
+      if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
+        post_status_comment issue "$number" "in-progress" "$branch" "$current_conv_id" "" \
+          "第 ${attempt} 次执行触发 ${PRINT_TIMEOUT} 超时，已保留全部代码进度并自动续接原会话重试（第 ${timeout_retries}/${max_t_retries} 次重试）。"
+      fi
+      current_prompt="$("$CAT_BIN" <<EOF
+上一次执行因达到 ${PRINT_TIMEOUT} 超时限制（--print-timeout）被中断，这是第 ${timeout_retries}/${max_t_retries} 次自动续接重试。
+
+### 重要续接要求
+1. 你仍在原 worktree（\`${wt_dir}\`）及分支（\`${branch}\`）中，**前面已完成的代码修改全部保留在工作区**，不要从头推倒重做。
+2. 请先运行 \`git status\` 和 \`git diff --stat\` 核对已有改动，从中断处继续完成剩余修改与必要的内部验证（不要运行 E2E，也不要执行 \`git add / git commit / git push\`）。
+3. 完成后将简明中文总结写入 ${summary_tmp}（可选：commit message 写入 ${commit_msg_tmp}）；若确有阻塞无法继续，将阻塞原因写入 ${blocked_tmp}。
+EOF
+)"
+      "$SLEEP_BIN" 3
+      continue
+    fi
+
+    if (( is_quota_error == 1 )); then
+      wait_sec="$QUOTA_DEFAULT_WAIT_SEC"
+      if parsed_wait="$(parse_reset_wait_seconds "$attempt_stderr_file" "$attempt_events_file")"; then
+        wait_sec=$(( parsed_wait + QUOTA_RETRY_BUFFER_SEC ))
+      fi
+      last_quota_wait="$wait_sec"
+      if (( wait_sec > MAX_QUOTA_WAIT_SEC )); then
+        quota_wait_exceeded=1
+        printf '[%s] 警告：Issue #%s 触发配额限流，预计冷却 %ss 超过单次等待上限 %ss，停止自动等待并转 blocked。\n' \
+          "$("$DATE_BIN" '+%F %T')" "$number" "$wait_sec" "$MAX_QUOTA_WAIT_SEC" >&2
+        break
+      fi
+      if (( quota_retries < max_q_retries )); then
+        quota_retries=$((quota_retries + 1))
+        printf '[%s] 警告：Issue #%s 第 %d 次执行触发 HTTP 429 / RESOURCE_EXHAUSTED 配额限流，等待 %ss 后自动续接原会话 (%s) 重试（第 %d/%d 次配额等待）...\n' \
+          "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "$wait_sec" "${current_conv_id:-new}" "$quota_retries" "$max_q_retries" >&2
+        if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
+          post_status_comment issue "$number" "in-progress" "$branch" "$current_conv_id" "" \
+            "第 ${attempt} 次执行触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED），已保留全部进度与会话，等待 ${wait_sec}s 后自动续接重试（第 ${quota_retries}/${max_q_retries} 次配额等待）。"
+        fi
+        "$SLEEP_BIN" "$wait_sec"
+        continue
+      fi
+    fi
+
+    if (( is_retryable_api_error == 1 && quota_retries < max_q_retries )); then
+      quota_retries=$((quota_retries + 1))
+      wait_sec=$(( 30 * quota_retries ))
+      (( wait_sec > 300 )) && wait_sec=300
+      printf '[%s] 警告：Issue #%s 第 %d 次执行遇到可重试接口异常，%ss 后自动续接原会话 (%s) 重试（第 %d/%d 次）...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "$wait_sec" "${current_conv_id:-new}" "$quota_retries" "$max_q_retries" >&2
+      "$SLEEP_BIN" "$wait_sec"
+      continue
+    fi
+
+    break
+  done
+
+  final_conv_id="$current_conv_id"
+  agy_elapsed=$((SECONDS - agy_start_sec))
+  printf '[%s] Issue #%s agy 执行结束 (ok=%d, 超时重试=%d/%d, 限流重试=%d/%d, 耗时 %ds)，开始后处理（commit / push / 更新状态）...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$number" "$run_ok" "$timeout_retries" "$max_t_retries" "$quota_retries" "$max_q_retries" "$agy_elapsed"
 
   summary_text=""
   if [[ -s "$summary_tmp" ]]; then
@@ -642,7 +773,15 @@ EOF
   if (( run_ok == 0 )); then
     (( merge_in_progress == 1 )) && "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
     final_status="blocked"
-    status_detail="Agent 执行异常退出，已停止推进并保留 worktree 与会话记录；排查或补充信息后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    if (( quota_wait_exceeded == 1 )); then
+      status_detail="Agent 触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED），预计重置等待 ${last_quota_wait}s 超过单次自动冷却上限（${MAX_QUOTA_WAIT_SEC}s），已暂停并保留 worktree 与会话记录；配额恢复后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    elif (( quota_hit == 1 )); then
+      status_detail="Agent 多次触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED）并已耗尽自动冷却重试（${quota_retries}/${max_q_retries} 次），已暂停并保留 worktree 与会话记录；配额恢复后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    elif (( timed_out == 1 )); then
+      status_detail="Agent 执行多次触及 ${PRINT_TIMEOUT} 超时限制并已耗尽自动重试（${timeout_retries}/${max_t_retries} 次），已停止推进并保留 worktree 与会话记录；可将标签改回 \`${LABEL_PREFIX}todo\` 从当前进度继续续接。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    else
+      status_detail="Agent 执行异常退出，已停止推进并保留 worktree 与会话记录；排查或补充信息后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    fi
   elif [[ -n "$blocked_reason" ]]; then
     (( merge_in_progress == 1 )) && "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
     final_status="blocked"
@@ -733,12 +872,12 @@ EOF
 
   finish_iso="$("$DATE_BIN" --iso-8601=seconds)"
   if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
-    gh_state set-state issue "$number" "$final_status" || true
     post_status_comment issue "$number" "$final_status" "$branch" "$final_conv_id" "$pr_url" "$status_detail"
+    gh_state set-state issue "$number" "$final_status" || true
     # 若阻塞且该分支已有对应 open PR，同步将 PR 标记为 blocked 并更新 PR 评论
     if [[ "$final_status" == "blocked" && -n "$existing_pr_num" ]]; then
-      gh_state set-state pr "$existing_pr_num" blocked || true
       post_status_comment pr "$existing_pr_num" blocked "$branch" "$final_conv_id" "$existing_pr_url" "$status_detail"
+      gh_state set-state pr "$existing_pr_num" blocked || true
     fi
   fi
 
