@@ -898,7 +898,7 @@ while true; do
   fi
   consecutive_poll_errors=0
 
-  # 找出第一条最新 head_sha 尚未终审过的 PR
+  # 按 PR 编号升序（FIFO）找出第一条最新 head_sha 尚未终审过的 PR
   next_pr_json=""
   while IFS= read -r row; do
     pnum="$("$JQ_BIN" -r '.number' <<<"$row")"
@@ -909,7 +909,7 @@ while true; do
     fi
     next_pr_json="$row"
     break
-  done < <("$JQ_BIN" -c '.[]' <<<"$prs_json")
+  done < <("$JQ_BIN" -c 'sort_by(.number) | .[]' <<<"$prs_json")
 
   if [[ -z "$next_pr_json" ]]; then
     if (( idle_announced == 0 )); then

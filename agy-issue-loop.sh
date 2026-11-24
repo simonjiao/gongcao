@@ -398,7 +398,7 @@ while true; do
   fi
   consecutive_poll_errors=0
 
-  # 找出第一个待处理的 issue
+  # 按编号升序（FIFO）找出第一条待处理的 issue
   next_issue_json=""
   while IFS= read -r row; do
     num="$("$JQ_BIN" -r '.number' <<<"$row")"
@@ -406,7 +406,7 @@ while true; do
       next_issue_json="$row"
       break
     fi
-  done < <("$JQ_BIN" -c '.[]' <<<"$issues_json")
+  done < <("$JQ_BIN" -c 'sort_by(.number) | .[]' <<<"$issues_json")
 
   if [[ -z "$next_issue_json" ]]; then
     if (( idle_announced == 0 )); then
