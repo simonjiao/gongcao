@@ -1133,7 +1133,8 @@ EOF
 - 当前标题: ${pr_title}
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 最终 Commit SHA: \`${head_sha}\`
-- Draft 状态: \`${is_draft}\`
+- Draft 状态: \`${is_draft}\`（注：自动化流水线默认先创建 Draft PR，终审放行后由外层脚本自动转为 Ready，\`isDraft=true\` 属于正常状态，不是阻塞项）
+- 自动合入授权: \`AUTO_MERGE=${AUTO_MERGE}\`（当为 \`1\` 时，仓库 Owner 已明确授权本终审在技术与证据条件满足时代表 Owner 自动解除 Draft 并执行合并）
 - 可合并性: \`${mergeable:-UNKNOWN}\` / \`${merge_state:-UNKNOWN}\`
 - 终审轮次: 第 ${current_round} / ${MAX_FINAL_ROUNDS} 轮
 
@@ -1204,9 +1205,12 @@ ${pr_diff_snippet:-"(空 diff)"}
      - 仓库允许且无冲突时，**默认优先使用 \`${MERGE_METHOD}\`**（通常是 \`merge\`，保留分支历史与 merge commit）；
      - **严禁在包含 merge commit（\`merge_commits > 0\`）或存在多提交重放冲突风险的分支上选择 \`rebase\`**；
      - 必须选择仓库允许的合并方式（若 \`merge\` 被禁用则选 \`squash\` 或可用的方式）；若分支经历多轮修补包含大量零碎修复提交且仓库允许 \`squash\`，可在说明理由后选择 \`squash\` 或保持 \`merge\`。
-4. **务实终审，拒绝吹毛求疵**：不要为超出 Issue 范围的次要风格或理论边缘输入阻止合入（可写入 \`non_blocking_notes\`）；但凡存在**真实功能缺陷、SHA 未对齐、缺少真实 QA 证据、敏感信息泄漏、语义/合并冲突风险、或 CI 失败**，必须拒绝 \`merge\`：
-   - 可通过修改代码/同步主干/补充测试解决的问题 -> 输出 \`request_changes\`；
-   - 环境/CI 基础设施异常、证据泄漏需人工清理或需人工决策 -> 输出 \`blocked\`。
+4. **终审授权边界与务实原则（严禁流程性误拦截）**：
+   - **严禁以 PR 为 Draft 状态阻止合入**：本流水线开发阶段固定创建 Draft PR，终审判定 \`merge\` 后由宿主机脚本自动解除 Draft 并执行合并。
+   - **严禁以“缺少 Owner 人工二次确认/授权”阻止合入**：当 \`AUTO_MERGE=1\` 时，仓库 Owner 已将满足技术与验收标准后的最终合入决策权正式授权给本 \`final-gate\`。Issue 模板或完成标准中常见的常规措辞（如“保留 Owner 合入决定”、“由 Owner 决定是否合入”、“等待人工合并”等）均视为由本 \`final-gate\` 代行把关，**不得**因此输出 \`blocked\` 或 \`request_changes\`（仅在 PR/Issue 明确出现紧急暂停指令如 \`DO NOT MERGE\` / \`HOLD\` / \`暂勿合入\` 时才拦截）。
+   - 不要为超出 Issue 范围的次要风格或理论边缘输入阻止合入（可写入 \`non_blocking_notes\`）；但凡存在**真实功能缺陷、SHA 未对齐、缺少真实 QA 证据、敏感信息泄漏、语义/合并冲突风险、或 CI 失败**，必须拒绝 \`merge\`：
+     - 可通过修改代码/同步主干/补充测试解决的问题 -> 输出 \`request_changes\`；
+     - 环境/CI 基础设施异常、证据泄漏需人工清理或需人工决策 -> 输出 \`blocked\`。
 5. **生成规范化的最终 PR 信息与 Issue 说明**：
    - \`pr_title\`：简洁清晰、符合仓库提交/PR 风格。
    - \`pr_body\`：完整规范的中文 PR 正文（Markdown），必须包含：① 改动摘要与根因；② 验证范围与结果（区分内部单测与真实 E2E 验收）；③ 固定验收 Commit SHA（\`${head_sha}\`）与远端 QA 证据永久直链（${ev_web_url:-(无)}）；④ 已知限制或未验证项；⑤ 末尾保留 \`Closes #${issue_num:-N}\`（如有关联 Issue）。
