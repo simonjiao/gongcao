@@ -34,6 +34,7 @@ FIND_BIN="$(resolve_bin find)"
 SORT_BIN="$(resolve_bin sort)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
+SHA256SUM_BIN="$(resolve_bin sha256sum)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -55,7 +56,7 @@ CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 x
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"    # 单次 codex 评审超时上限，防止进程卡死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
-MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-5}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # 评审不通过时是否同步将关联 Issue 切为 changes-requested（触发 agy 自动修复）
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -145,6 +146,17 @@ calc_backoff() {
   local wait_sec=$(( POLL_INTERVAL * (1 << shift) ))
   (( wait_sec > MAX_BACKOFF )) && wait_sec="$MAX_BACKOFF"
   printf '%s' "$wait_sec"
+}
+
+# 生成“提交 SHA + PR 正文内容摘要”去重键：
+# 既能防止 set-state 失败导致死循环，又允许“同 SHA 仅补齐 PR 验证证据/更新正文后重新进入 in-review”被正常复审
+compute_review_key() {
+  local sha="$1"
+  local body="$2"
+  local body_hash=""
+  body_hash="$(printf '%s' "$body" | "$SHA256SUM_BIN")"
+  body_hash="${body_hash%% *}"
+  printf '%s:%s' "$sha" "${body_hash:0:16}"
 }
 
 write_review_schema() {
@@ -466,13 +478,16 @@ while true; do
   fi
   consecutive_poll_errors=0
 
-  # 按 PR 编号升序（FIFO）找出第一条最新 head_sha 尚未评审过的 PR
+  # 按 PR 编号升序（FIFO）找出第一条当前 (head_sha, body) 尚未评审过的 PR
   next_pr_json=""
   while IFS= read -r row; do
     pnum="$("$JQ_BIN" -r '.number' <<<"$row")"
     psha="$("$JQ_BIN" -r '.headRefOid // empty' <<<"$row")"
+    pbody="$("$JQ_BIN" -r '.body // ""' <<<"$row")"
+    pkey=""
+    [[ -n "$psha" ]] && pkey="$(compute_review_key "$psha" "$pbody")"
     sha_file="${REVIEWS_ROOT}/pr-${pnum}/reviewed_shas.txt"
-    if [[ -n "$psha" && -f "$sha_file" ]] && "$GREP_BIN" -qx "$psha" "$sha_file"; then
+    if [[ -n "$pkey" && -f "$sha_file" ]] && "$GREP_BIN" -qx "$pkey" "$sha_file"; then
       continue
     fi
     next_pr_json="$row"
@@ -773,9 +788,10 @@ EOF
     fi
   fi
 
-  # 记录已评审的 head_sha（DRY_RUN=0 时记录，防止同 SHA 重复评审）
+  # 记录已评审的 (head_sha, body_hash)（DRY_RUN=0 时记录，防止同内容重复评审）
+  review_key="$(compute_review_key "$head_sha" "$pr_body")"
   if [[ "$DRY_RUN" != "1" ]]; then
-    printf '%s\n' "$head_sha" >> "$sha_file"
+    printf '%s\n' "$review_key" >> "$sha_file"
   fi
 
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
