@@ -61,7 +61,8 @@ CODEX_E2E_SANDBOX="${CODEX_E2E_SANDBOX:-danger-full-access}"
 CODEX_E2E_BYPASS_APPROVALS="${CODEX_E2E_BYPASS_APPROVALS:-1}" # 1=传 --dangerously-bypass-approvals-and-sandbox；0=仅传 -s "$CODEX_E2E_SANDBOX"
 CODEX_TIMEOUT="${CODEX_TIMEOUT:-30m}"        # 单次 E2E 验收超时上限，防止环境挂死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-40000}"    # 嵌入 prompt 的 diff 最大字节数
-MAX_E2E_ROUNDS="${MAX_E2E_ROUNDS:-2}"        # 最大自动 E2E 失败打回轮数，超过则切 blocked
+MAX_E2E_ROUNDS="${MAX_E2E_ROUNDS:-3}"        # 最大连续 E2E fail 打回轮数（pass 后清零，blocked 环境受阻不计入），超过则切 blocked
+MAX_TOTAL_E2E_ROUNDS="${MAX_TOTAL_E2E_ROUNDS:-6}" # 单 PR 生命周期硬性总 E2E 轮次上限，防止死循环
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # E2E 代码缺陷 fail 时是否将关联 Issue 切为 changes-requested
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -138,8 +139,8 @@ printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  E2E 档案根 : %s\n' "$E2E_ROOT"
 printf '  E2E 环境档 : %s\n' "${E2E_ENV_FILE:-(按仓库自身文档)}"
 printf '  证据归档   : %s (branch=%s, max=%sMB)\n' "$PUBLISH_EVIDENCE" "$E2E_EVIDENCE_BRANCH" "$MAX_EVIDENCE_FILE_MB"
-printf '  监听标签   : %s (MAX_E2E_ROUNDS=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
-  "$E2E_TARGET_LABEL" "$MAX_E2E_ROUNDS" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
+printf '  监听标签   : %s (MAX_E2E_ROUNDS=%s, MAX_TOTAL_E2E_ROUNDS=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
+  "$E2E_TARGET_LABEL" "$MAX_E2E_ROUNDS" "$MAX_TOTAL_E2E_ROUNDS" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -402,6 +403,7 @@ render_e2e_markdown() {
   local evidence_branch="${9:-}"
   local evidence_sha="${10:-}"
   local evidence_files_md="${11:-}"
+  local cycle_round="${12:-$round}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
@@ -415,7 +417,9 @@ render_e2e_markdown() {
     --arg issue "${issue_num:-(未关联)}" \
     --arg sha "${head_sha:0:10}" \
     --arg round "$round" \
+    --arg cycle_round "$cycle_round" \
     --arg max_rounds "$MAX_E2E_ROUNDS" \
+    --arg max_total_rounds "$MAX_TOTAL_E2E_ROUNDS" \
     --arg state "${LABEL_PREFIX}${final_state}" \
     --arg model "${CODEX_MODEL:-(codex 默认)}${CODEX_REASONING_EFFORT:+ (${CODEX_REASONING_EFFORT})}" \
     --arg evidence_cell "$evidence_cell" \
@@ -428,7 +432,7 @@ render_e2e_markdown() {
     + "| E2E 结论 | `" + .verdict + "` -> `" + $state + "` |\n"
     + "| 关联 Issue | #" + $issue + " |\n"
     + "| 验收 Commit | `" + $sha + "` |\n"
-    + "| E2E 轮次 | " + $round + " / " + $max_rounds + " |\n"
+    + "| E2E 轮次 | 本周期 " + $cycle_round + " / " + $max_rounds + "（累计 " + $round + " / " + $max_total_rounds + "） |\n"
     + "| 验收模型 | `" + $model + "` |\n"
     + "| 验收环境 | " + (.environment | esc) + " |\n"
     + "| QA 证据 | " + $evidence_cell + " |\n"
@@ -562,6 +566,28 @@ EOF
   done < "$sha_file"
   current_round=$((prev_rounds + 1))
 
+  consec_file="${e2e_dir}/consecutive_failures.txt"
+  prev_consecutive_failures=0
+  if [[ -f "$consec_file" ]]; then
+    _raw_consec="$(<"$consec_file")"
+    _raw_consec="${_raw_consec//$'\r'/}"
+    _raw_consec="${_raw_consec//$'\n'/}"
+    if [[ "$_raw_consec" =~ ^[0-9]+$ ]]; then
+      prev_consecutive_failures="$_raw_consec"
+    fi
+  else
+    for _rf in "${e2e_dir}"/result-*.json; do
+      [[ -s "$_rf" ]] || continue
+      _v="$("$JQ_BIN" -r '.verdict // empty' "$_rf" 2>/dev/null || true)"
+      if [[ "$_v" == "pass" ]]; then
+        prev_consecutive_failures=0
+      elif [[ "$_v" == "fail" ]]; then
+        prev_consecutive_failures=$((prev_consecutive_failures + 1))
+      fi
+    done
+  fi
+  cycle_round=$((prev_consecutive_failures + 1))
+
   run_ts="$("$DATE_BIN" '+%Y%m%d-%H%M%S')"
   artifacts_dir="${e2e_dir}/artifacts-${run_ts}"
   "$MKDIR_BIN" -p "$artifacts_dir"
@@ -593,8 +619,8 @@ EOF
     fi
   fi
 
-  printf '[%s] 开始 Codex E2E 验收 PR #%s (Issue #%s, sha=%s, 第 %d/%d 轮)...\n' \
-    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$current_round" "$MAX_E2E_ROUNDS"
+  printf '[%s] 开始 Codex E2E 验收 PR #%s (Issue #%s, sha=%s, 本周期第 %d/%d 轮, 累计第 %d/%d 轮)...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$cycle_round" "$MAX_E2E_ROUNDS" "$current_round" "$MAX_TOTAL_E2E_ROUNDS"
 
   if ! e2e_wt="$(prepare_e2e_worktree "$pr_num" "$head_branch" "$head_sha")"; then
     printf '[%s] 警告：为 PR #%s 准备 E2E worktree 失败，%ss 后重试...\n' \
@@ -624,7 +650,7 @@ EOF
 - 标题: ${pr_title}
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 验收 Commit: \`${head_sha}\`
-- E2E 轮次: 第 ${current_round} 轮
+- E2E 轮次: 本周期第 ${cycle_round} / ${MAX_E2E_ROUNDS} 轮（累计第 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮）
 
 ### PR 描述
 ${pr_body:-"(empty)"}
@@ -698,22 +724,28 @@ EOF
   final_state=""
   extra_notice=""
 
+  new_consecutive_failures="$prev_consecutive_failures"
   if [[ "$verdict" == "pass" ]]; then
+    new_consecutive_failures=0
     final_state="e2e-passed"
   elif [[ "$verdict" == "blocked" ]]; then
     final_state="blocked"
     extra_notice=$'\n\n'"> ⚠️ E2E 验收因环境或外部依赖条件受阻，状态已切为 \`${LABEL_PREFIX}blocked\`；环境就绪后将 PR 标签改回 \`${E2E_TARGET_LABEL}\` 即可重跑 E2E。"
   else
-    if (( current_round >= MAX_E2E_ROUNDS )); then
+    new_consecutive_failures="$cycle_round"
+    if (( cycle_round >= MAX_E2E_ROUNDS )); then
       final_state="blocked"
-      extra_notice=$'\n\n'"> ⚠️ 已达到最大自动 E2E 失败打回轮次（${MAX_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
+      extra_notice=$'\n\n'"> ⚠️ 已达到最大连续 E2E 失败打回轮次（连续 ${cycle_round} / ${MAX_E2E_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
+    elif (( current_round >= MAX_TOTAL_E2E_ROUNDS )); then
+      final_state="blocked"
+      extra_notice=$'\n\n'"> ⚠️ 已达到单 PR 最大总 E2E 轮次上限（累计 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
     else
       final_state="changes-requested"
     fi
   fi
 
   # 先渲染基础验收报告，供归档分支留存
-  base_e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir")${extra_notice}"
+  base_e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "" "" "" "" "$cycle_round")${extra_notice}"
   printf '%s\n' "$base_e2e_md" > "$comment_file"
 
   # 将 QA 证据归档推送到独立远程分支（不污染生产分支），生成可点击的 GitHub 直链
@@ -745,7 +777,7 @@ EOF
   fi
 
   # 带上远端证据直链重新渲染最终评论报告
-  e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "$evidence_url" "$E2E_EVIDENCE_BRANCH" "$evidence_sha" "$evidence_files_md")${extra_notice}"
+  e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "$evidence_url" "$E2E_EVIDENCE_BRANCH" "$evidence_sha" "$evidence_files_md" "$cycle_round")${extra_notice}"
   printf '%s\n' "$e2e_md" > "$comment_file"
 
   # 写回 PR E2E 验收报告与状态
@@ -763,9 +795,10 @@ EOF
     fi
   fi
 
-  # 仅在 pass 或 fail（且非 DRY_RUN）时记录已验证 SHA；blocked 环境阻塞时不锁定该 SHA，方便人工修好环境后直接重跑
+  # 仅在 pass 或 fail（且非 DRY_RUN）时记录已验证 SHA 与连续失败计数；blocked 环境阻塞时不锁定该 SHA，方便人工修好环境后直接重跑
   if [[ "$DRY_RUN" != "1" && "$verdict" != "blocked" ]]; then
     printf '%s\n' "$head_sha" >> "$sha_file"
+    printf '%d\n' "$new_consecutive_failures" > "$consec_file"
   fi
 
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
@@ -783,6 +816,9 @@ EOF
     --arg evidence_commit "$evidence_sha" \
     --arg evidence_url "$evidence_url" \
     --argjson round "$current_round" \
+    --argjson cycle_round "$cycle_round" \
+    --argjson consecutive_failures "$new_consecutive_failures" \
+    --argjson max_total_rounds "$MAX_TOTAL_E2E_ROUNDS" \
     --arg verdict "$verdict" \
     --arg final_state "$final_state" \
     --arg updated_at "$iso_now" \
@@ -800,6 +836,9 @@ EOF
       evidence_commit: $evidence_commit,
       evidence_url: $evidence_url,
       round: $round,
+      cycle_round: $cycle_round,
+      consecutive_failures: $consecutive_failures,
+      max_total_rounds: $max_total_rounds,
       verdict: $verdict,
       final_state: $final_state,
       updated_at: $updated_at
@@ -808,8 +847,8 @@ EOF
   total_elapsed=$((SECONDS - task_start_sec))
   end_ts="$("$DATE_BIN" '+%F %T')"
   printf '\n============================================================\n'
-  printf '[%s] [DONE] PR #%s Codex E2E 验收完成 (第 %d/%d 轮, 耗时 %ds)\n' \
-    "$end_ts" "$pr_num" "$current_round" "$MAX_E2E_ROUNDS" "$total_elapsed"
+  printf '[%s] [DONE] PR #%s Codex E2E 验收完成 (本周期第 %d/%d 轮, 累计第 %d/%d 轮, 耗时 %ds)\n' \
+    "$end_ts" "$pr_num" "$cycle_round" "$MAX_E2E_ROUNDS" "$current_round" "$MAX_TOTAL_E2E_ROUNDS" "$total_elapsed"
   printf '  E2E 结论 : %s -> %s%s\n' "$verdict" "$LABEL_PREFIX" "$final_state"
   printf '  关联Issue: #%s | Commit: %s\n' "${issue_num:-?}" "${head_sha:0:10}"
   printf '  QA 证据  : %s\n' "${evidence_url:-$comment_file}"

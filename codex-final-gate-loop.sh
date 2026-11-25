@@ -66,7 +66,8 @@ CONFLICT_RESOLVE_TIMEOUT="${CONFLICT_RESOLVE_TIMEOUT:-10m}"
 REQUIRE_EVIDENCE_SHA_MATCH="${REQUIRE_EVIDENCE_SHA_MATCH:-1}" # 1=硬校验远端证据 tested_sha == head_sha
 REQUIRE_CI_PASS="${REQUIRE_CI_PASS:-1}"      # 1=硬校验 CI 无失败且无进行中检查
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}"
-MAX_FINAL_ROUNDS="${MAX_FINAL_ROUNDS:-2}"    # 终审最大打回轮次，超过切 blocked
+MAX_FINAL_ROUNDS="${MAX_FINAL_ROUNDS:-3}"    # 终审最大连续打回轮次（merge 后清零，require_e2e/blocked 不计入），超过切 blocked
+MAX_TOTAL_FINAL_ROUNDS="${MAX_TOTAL_FINAL_ROUNDS:-6}" # 单 PR 生命周期硬性总终审轮次上限，防止死循环
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}"
 CREATE_FOLLOWUP_ISSUES="${CREATE_FOLLOWUP_ISSUES:-1}" # 1=合并成功后自动将必要非阻塞项创建为后续追踪 Issue；0=仅保留在评论
 MAX_FOLLOWUP_ISSUES="${MAX_FOLLOWUP_ISSUES:-3}"       # 单次合入最多创建的后续追踪 Issue 数量上限（防刷单）
@@ -142,8 +143,8 @@ printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  终审档案根 : %s\n' "$FINAL_ROOT"
 printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), DRY_RUN=%s\n' \
   "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$DRY_RUN"
-printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s)\n' \
-  "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS"
+printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s, MAX_TOTAL_FINAL_ROUNDS=%s)\n' \
+  "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS" "$MAX_TOTAL_FINAL_ROUNDS"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -806,6 +807,7 @@ render_final_gate_markdown() {
   local final_action="$6"
   local evidence_url="$7"
   local eff_method="$8"
+  local cycle_round="${9:-$round}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
@@ -814,7 +816,9 @@ render_final_gate_markdown() {
     --arg issue "${issue_num:-(未关联)}" \
     --arg sha "${head_sha:0:10}" \
     --arg round "$round" \
+    --arg cycle_round "$cycle_round" \
     --arg max_rounds "$MAX_FINAL_ROUNDS" \
+    --arg max_total_rounds "$MAX_TOTAL_FINAL_ROUNDS" \
     --arg action "$final_action" \
     --arg ev_url "${evidence_url:-(无远端证据直链)}" \
     --arg eff_method "$eff_method" \
@@ -828,7 +832,7 @@ render_final_gate_markdown() {
     + "| 合并方式 | `" + $eff_method + "`（" + ((.merge_method_reason // "默认策略") | esc) + "） |\n"
     + "| 关联 Issue | #" + $issue + " |\n"
     + "| 终审 Commit | `" + $sha + "` |\n"
-    + "| 终审轮次 | " + $round + " / " + $max_rounds + " |\n"
+    + "| 终审轮次 | 本周期 " + $cycle_round + " / " + $max_rounds + "（累计 " + $round + " / " + $max_total_rounds + "） |\n"
     + "| 终审模型 | `" + $model + "` |\n"
     + "| QA 证据归档 | " + $ev_url + " |\n"
     + "| 终审时间 | " + $now + " |\n\n"
@@ -981,6 +985,28 @@ while true; do
   done < "$sha_file"
   current_round=$((prev_rounds + 1))
 
+  consec_file="${final_dir}/consecutive_rejections.txt"
+  prev_consecutive_rejections=0
+  if [[ -f "$consec_file" ]]; then
+    _raw_consec="$(<"$consec_file")"
+    _raw_consec="${_raw_consec//$'\r'/}"
+    _raw_consec="${_raw_consec//$'\n'/}"
+    if [[ "$_raw_consec" =~ ^[0-9]+$ ]]; then
+      prev_consecutive_rejections="$_raw_consec"
+    fi
+  else
+    for _df in "${final_dir}"/decision-*.json; do
+      [[ -s "$_df" ]] || continue
+      _v="$("$JQ_BIN" -r '.verdict // empty' "$_df" 2>/dev/null || true)"
+      if [[ "$_v" == "merge" ]]; then
+        prev_consecutive_rejections=0
+      elif [[ "$_v" == "request_changes" ]]; then
+        prev_consecutive_rejections=$((prev_consecutive_rejections + 1))
+      fi
+    done
+  fi
+  cycle_round=$((prev_consecutive_rejections + 1))
+
   run_ts="$("$DATE_BIN" '+%Y%m%d-%H%M%S')"
   schema_file="${final_dir}/schema.json"
   prompt_file="${final_dir}/prompt-${run_ts}.md"
@@ -992,8 +1018,8 @@ while true; do
   write_final_gate_schema "$schema_file"
 
   # 3. 准备 PR 代码只读 worktree + 远端 QA 证据分支只读检出
-  printf '[%s] 开始 Codex 终审合入核对 PR #%s (Issue #%s, sha=%s, 第 %d/%d 轮)...\n' \
-    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$current_round" "$MAX_FINAL_ROUNDS"
+  printf '[%s] 开始 Codex 终审合入核对 PR #%s (Issue #%s, sha=%s, 本周期第 %d/%d 轮, 累计第 %d/%d 轮)...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$cycle_round" "$MAX_FINAL_ROUNDS" "$current_round" "$MAX_TOTAL_FINAL_ROUNDS"
 
   if ! final_wt="$(prepare_final_worktree "$pr_num" "$head_branch" "$head_sha")"; then
     printf '[%s] 警告：为 PR #%s 准备终审 worktree 失败，%ss 后重试...\n' \
@@ -1267,7 +1293,7 @@ EOF
 - Draft 状态: \`${is_draft}\`（注：自动化流水线默认先创建 Draft PR，终审放行后由外层脚本自动转为 Ready，\`isDraft=true\` 属于正常状态，不是阻塞项）
 - 自动合入授权: \`AUTO_MERGE=${AUTO_MERGE}\`（当为 \`1\` 时，仓库 Owner 已明确授权本终审在技术与证据条件满足时代表 Owner 自动解除 Draft 并执行合并）
 - 可合并性: \`${mergeable:-UNKNOWN}\` / \`${merge_state:-UNKNOWN}\`
-- 终审轮次: 第 ${current_round} / ${MAX_FINAL_ROUNDS} 轮
+- 终审轮次: 本周期第 ${cycle_round} / ${MAX_FINAL_ROUNDS} 轮（累计第 ${current_round} / ${MAX_TOTAL_FINAL_ROUNDS} 轮）
 
 ### 当前 PR 正文
 ${pr_body:-"(empty)"}
@@ -1458,6 +1484,7 @@ EOF
   extra_notice=""
   merged_ok=0
   record_checked_sha=1
+  new_consecutive_rejections="$prev_consecutive_rejections"
 
   if [[ -n "$resolved_conflict_note" ]]; then
     extra_notice+=$'\n\n'"> ℹ️ 机械冲突就地消解：${resolved_conflict_note}"
@@ -1471,6 +1498,7 @@ EOF
     final_action="${LABEL_PREFIX}blocked (hard-gate)"
     extra_notice+=$'\n\n'"#### ⚠️ 确定性硬门禁拦截（未自动合并）"$'\n'"${hard_gate_errors}"
   elif [[ "$verdict" == "merge" ]]; then
+    new_consecutive_rejections=0
     # 合并前最后一次实时拉取 origin/<base_branch> 并重跑 git merge-tree 冲突演练；
     # 若终审期间主干产生冲突，同样先分诊：简单机械冲突直接就地消解并推送后再合并，仅实质冲突才退回开发
     recheck_conflict=0
@@ -1572,10 +1600,15 @@ EOF
     final_state="blocked"
     final_action="${LABEL_PREFIX}blocked"
   else
-    if (( current_round >= MAX_FINAL_ROUNDS )); then
+    new_consecutive_rejections="$cycle_round"
+    if (( cycle_round >= MAX_FINAL_ROUNDS )); then
       final_state="blocked"
       final_action="${LABEL_PREFIX}blocked (max-rounds)"
-      extra_notice+=$'\n\n'"> ⚠️ 已达到终审最大打回轮次（${MAX_FINAL_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
+      extra_notice+=$'\n\n'"> ⚠️ 已达到终审最大连续打回轮次（连续 ${cycle_round} / ${MAX_FINAL_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_FINAL_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
+    elif (( current_round >= MAX_TOTAL_FINAL_ROUNDS )); then
+      final_state="blocked"
+      final_action="${LABEL_PREFIX}blocked (max-total-rounds)"
+      extra_notice+=$'\n\n'"> ⚠️ 已达到单 PR 最大总终审轮次上限（累计 ${current_round} / ${MAX_TOTAL_FINAL_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
     else
       final_state="changes-requested"
       final_action="${LABEL_PREFIX}changes-requested"
@@ -1637,7 +1670,7 @@ EOF
     fi
   fi
 
-  final_md="$(render_final_gate_markdown "$decision_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_action" "$ev_web_url" "$effective_merge_method")${extra_notice}"
+  final_md="$(render_final_gate_markdown "$decision_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_action" "$ev_web_url" "$effective_merge_method" "$cycle_round")${extra_notice}"
   printf '%s\n' "$final_md" > "$comment_file"
 
   # 写回 PR 终审评论与状态
@@ -1662,6 +1695,7 @@ EOF
 
   if [[ "$DRY_RUN" != "1" && "$record_checked_sha" == "1" ]]; then
     printf '%s\n' "$head_sha" >> "$sha_file"
+    printf '%d\n' "$new_consecutive_rejections" > "$consec_file"
   fi
 
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
@@ -1675,6 +1709,9 @@ EOF
     --arg model "$CODEX_MODEL" \
     --arg reasoning_effort "$CODEX_REASONING_EFFORT" \
     --argjson round "$current_round" \
+    --argjson cycle_round "$cycle_round" \
+    --argjson consecutive_rejections "$new_consecutive_rejections" \
+    --argjson max_total_rounds "$MAX_TOTAL_FINAL_ROUNDS" \
     --arg verdict "$verdict" \
     --arg merge_method "$effective_merge_method" \
     --arg merge_method_reason "$merge_method_reason" \
@@ -1692,6 +1729,9 @@ EOF
       model: $model,
       reasoning_effort: $reasoning_effort,
       round: $round,
+      cycle_round: $cycle_round,
+      consecutive_rejections: $consecutive_rejections,
+      max_total_rounds: $max_total_rounds,
       verdict: $verdict,
       merge_method: $merge_method,
       merge_method_reason: $merge_method_reason,
@@ -1704,8 +1744,8 @@ EOF
   total_elapsed=$((SECONDS - task_start_sec))
   end_ts="$("$DATE_BIN" '+%F %T')"
   printf '\n============================================================\n'
-  printf '[%s] [DONE] PR #%s Codex 终审合入完成 (第 %d/%d 轮, 耗时 %ds)\n' \
-    "$end_ts" "$pr_num" "$current_round" "$MAX_FINAL_ROUNDS" "$total_elapsed"
+  printf '[%s] [DONE] PR #%s Codex 终审合入完成 (本周期第 %d/%d 轮, 累计第 %d/%d 轮, 耗时 %ds)\n' \
+    "$end_ts" "$pr_num" "$cycle_round" "$MAX_FINAL_ROUNDS" "$current_round" "$MAX_TOTAL_FINAL_ROUNDS" "$total_elapsed"
   printf '  终审结果 : %s -> %s (merge_method=%s)\n' "$verdict" "$final_action" "$effective_merge_method"
   printf '  关联Issue: #%s | Commit: %s\n' "${issue_num:-?}" "${head_sha:0:10}"
   [[ -n "$ev_web_url" ]] && printf '  QA 证据  : %s\n' "$ev_web_url"
