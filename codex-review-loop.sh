@@ -57,7 +57,8 @@ CODEX_REREVIEW_REASONING_EFFORT="${CODEX_REREVIEW_REASONING_EFFORT:-medium}" # �
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"    # 单次 codex 评审超时上限，防止进程卡死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
-MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大连续打回评审轮数（approve 后清零），超过则切 blocked 交人工裁决
+MAX_TOTAL_REVIEW_ROUNDS="${MAX_TOTAL_REVIEW_ROUNDS:-8}" # 单 PR 生命周期硬性总评审轮次上限，防止死循环
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # 评审不通过时是否同步将关联 Issue 切为 changes-requested（触发 agy 自动修复）
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -128,8 +129,8 @@ printf '  Codex 命令 : %s (model=%s, effort=%s, rereview_effort=%s, sandbox=%s
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  评审档案根 : %s\n' "$REVIEWS_ROOT"
-printf '  监听标签   : %s (MAX_REVIEW_ROUNDS=%s, ALLOW_SKIP_E2E=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
-  "$REVIEW_LABEL" "$MAX_REVIEW_ROUNDS" "$ALLOW_SKIP_E2E" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
+printf '  监听标签   : %s (MAX_REVIEW_ROUNDS=%s, MAX_TOTAL_REVIEW_ROUNDS=%s, ALLOW_SKIP_E2E=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
+  "$REVIEW_LABEL" "$MAX_REVIEW_ROUNDS" "$MAX_TOTAL_REVIEW_ROUNDS" "$ALLOW_SKIP_E2E" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -395,6 +396,7 @@ render_review_markdown() {
   local e2e_reused_sha="$8"
   local e2e_downgrade_note="$9"
   local eff_effort="${10:-$CODEX_REASONING_EFFORT}"
+  local cycle_round="${11:-$round}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
@@ -411,7 +413,9 @@ render_review_markdown() {
     --arg issue "${issue_num:-(未关联)}" \
     --arg sha "${head_sha:0:10}" \
     --arg round "$round" \
+    --arg cycle_round "$cycle_round" \
     --arg max_rounds "$MAX_REVIEW_ROUNDS" \
+    --arg max_total_rounds "$MAX_TOTAL_REVIEW_ROUNDS" \
     --arg state "${LABEL_PREFIX}${final_state}" \
     --arg eff_e2e "$eff_e2e_decision" \
     --arg e2e_note "$e2e_downgrade_note" \
@@ -430,7 +434,7 @@ render_review_markdown() {
       end)
     + "| 关联 Issue | #" + $issue + " |\n"
     + "| 评审 Commit | `" + $sha + "` |\n"
-    + "| 评审轮次 | " + $round + " / " + $max_rounds + " |\n"
+    + "| 评审轮次 | 本周期 " + $cycle_round + " / " + $max_rounds + "（累计 " + $round + " / " + $max_total_rounds + "） |\n"
     + "| 评审模型 | `" + $model + "` |\n"
     + "| 评审时间 | " + $now + " |\n\n"
     + "#### 总结\n" + .summary + "\n\n"
@@ -557,6 +561,28 @@ EOF
   done < "$sha_file"
   current_round=$((prev_rounds + 1))
 
+  consec_file="${review_dir}/consecutive_rejections.txt"
+  prev_consecutive_rejections=0
+  if [[ -f "$consec_file" ]]; then
+    _raw_consec="$(<"$consec_file")"
+    _raw_consec="${_raw_consec//$'\r'/}"
+    _raw_consec="${_raw_consec//$'\n'/}"
+    if [[ "$_raw_consec" =~ ^[0-9]+$ ]]; then
+      prev_consecutive_rejections="$_raw_consec"
+    fi
+  else
+    for _vf in "${review_dir}"/verdict-*.json; do
+      [[ -s "$_vf" ]] || continue
+      _v="$("$JQ_BIN" -r '.verdict // empty' "$_vf" 2>/dev/null || true)"
+      if [[ "$_v" == "approve" ]]; then
+        prev_consecutive_rejections=0
+      elif [[ "$_v" == "request_changes" ]]; then
+        prev_consecutive_rejections=$((prev_consecutive_rejections + 1))
+      fi
+    done
+  fi
+  cycle_round=$((prev_consecutive_rejections + 1))
+
   run_ts="$("$DATE_BIN" '+%Y%m%d-%H%M%S')"
   schema_file="${review_dir}/schema.json"
   prompt_file="${review_dir}/prompt-${run_ts}.md"
@@ -587,8 +613,8 @@ EOF
     fi
   fi
 
-  printf '[%s] 开始 Codex 独立评审 PR #%s (Issue #%s, sha=%s, 第 %d/%d 轮)...\n' \
-    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$current_round" "$MAX_REVIEW_ROUNDS"
+  printf '[%s] 开始 Codex 独立评审 PR #%s (Issue #%s, sha=%s, 本周期第 %d/%d 轮, 累计第 %d/%d 轮)...\n' \
+    "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$cycle_round" "$MAX_REVIEW_ROUNDS" "$current_round" "$MAX_TOTAL_REVIEW_ROUNDS"
 
   if ! review_wt="$(prepare_review_worktree "$pr_num" "$head_branch" "$head_sha")"; then
     printf '[%s] 警告：为 PR #%s 准备只读 worktree 失败，%ss 后重试...\n' \
@@ -624,23 +650,25 @@ EOF
   prev_review_section=""
   rereview_delta_section=""
   if (( current_round >= 2 )); then
-    prev_verdict_file="${review_dir}/last_verdict.json"
-    if [[ ! -s "$prev_verdict_file" ]]; then
-      prev_verdict_file=""
-      for _vf in "${review_dir}"/verdict-*.json; do
-        [[ -s "$_vf" ]] && prev_verdict_file="$_vf"
-      done
-    fi
-    if [[ -n "$prev_verdict_file" && -s "$prev_verdict_file" ]]; then
-      prev_blocking="$("$JQ_BIN" -r '
-        if (.blocking_issues | length) > 0 then
-          [.blocking_issues[] | "- [" + .severity + "] `" + .location + "`：" + .description + "（原建议：" + .suggestion + "）"] | join("\n")
-        else
-          "- (上一轮无阻塞项)"
-        end
-      ' "$prev_verdict_file" 2>/dev/null || true)"
-      if [[ -n "$prev_blocking" ]]; then
-        prev_review_section=$'\n\n'"## 上一轮阻塞问题清单（本轮重点核验收敛）"$'\n'"${prev_blocking}"
+    if (( cycle_round >= 2 )); then
+      prev_verdict_file="${review_dir}/last_verdict.json"
+      if [[ ! -s "$prev_verdict_file" ]]; then
+        prev_verdict_file=""
+        for _vf in "${review_dir}"/verdict-*.json; do
+          [[ -s "$_vf" ]] && prev_verdict_file="$_vf"
+        done
+      fi
+      if [[ -n "$prev_verdict_file" && -s "$prev_verdict_file" ]]; then
+        prev_blocking="$("$JQ_BIN" -r '
+          if (.blocking_issues | length) > 0 then
+            [.blocking_issues[] | "- [" + .severity + "] `" + .location + "`：" + .description + "（原建议：" + .suggestion + "）"] | join("\n")
+          else
+            "- (上一轮无阻塞项)"
+          end
+        ' "$prev_verdict_file" 2>/dev/null || true)"
+        if [[ -n "$prev_blocking" ]]; then
+          prev_review_section=$'\n\n'"## 上一轮阻塞问题清单（本轮重点核验收敛）"$'\n'"${prev_blocking}"
+        fi
       fi
     fi
 
@@ -668,7 +696,7 @@ EOF
 - 标题: ${pr_title}
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 最新 Commit: \`${head_sha}\`
-- 评审轮次: 第 ${current_round} / ${MAX_REVIEW_ROUNDS} 轮
+- 评审轮次: 本轮周期第 ${cycle_round} / ${MAX_REVIEW_ROUNDS} 轮（累计第 ${current_round} / ${MAX_TOTAL_REVIEW_ROUNDS} 轮）
 
 ### PR 描述
 ${pr_body:-"(empty)"}
@@ -713,7 +741,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 5. **复审硬性收敛门禁（第 2 轮及以上，务必严格执行）**：
    - **限定复审范围**：第 2 轮及以后复审只核验两件事：① 上一轮列出的阻塞问题是否已实质修复；② 本轮增量变更是否引入新的运行崩溃、明显逻辑错误或对原始 Issue 核心验收标准的回归。
    - **严禁“防御套娃”与移动球门**：当上一轮阻塞项已实质关闭、且原始 Issue 核心验收标准已满足时，**禁止针对开发按上一轮意见新增的降级/错误/防御代码继续深挖二阶、三阶极端边界并追加新的 \`blocking_issues\`**。此类有价值的次生发现一律写入 \`non_blocking_notes\`（终审合入时可自动建后续追踪 Issue）并给出 \`verdict: "approve"\`，让 PR 进入真实 E2E 验收。
-   - **终轮务实放行**：若已处于最后一轮自动复审（\`current_round >= MAX_REVIEW_ROUNDS\`），只要原始 Issue 核心验收已满足且无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E，避免无意义的 \`blocked\`。
+   - **终轮务实放行**：若已处于最后一轮自动复审（\`cycle_round >= MAX_REVIEW_ROUNDS\` 或 \`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`），只要原始 Issue 核心验收已满足且无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E，避免无意义的 \`blocked\`。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
 EOF
 
@@ -771,7 +799,9 @@ EOF
   e2e_reused_sha=""
   e2e_downgrade_note=""
 
+  new_consecutive_rejections=0
   if [[ "$verdict" == "approve" ]]; then
+    new_consecutive_rejections=0
     effective_e2e_decision="$raw_e2e_decision"
     if [[ "$ALLOW_SKIP_E2E" != "1" ]]; then
       effective_e2e_decision="run_e2e"
@@ -790,15 +820,19 @@ EOF
       final_pr_state="approved"
     fi
   else
-    if (( current_round >= MAX_REVIEW_ROUNDS )); then
+    new_consecutive_rejections="$cycle_round"
+    if (( cycle_round >= MAX_REVIEW_ROUNDS )); then
       final_pr_state="blocked"
-      extra_notice=$'\n\n'"> ⚠️ 已达到最大自动评审打回轮次（${MAX_REVIEW_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
+      extra_notice=$'\n\n'"> ⚠️ 已达到最大连续评审打回轮次（连续 ${cycle_round} / ${MAX_REVIEW_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_REVIEW_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
+    elif (( current_round >= MAX_TOTAL_REVIEW_ROUNDS )); then
+      final_pr_state="blocked"
+      extra_notice=$'\n\n'"> ⚠️ 已达到单 PR 最大总评审轮次上限（累计 ${current_round} / ${MAX_TOTAL_REVIEW_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
     else
       final_pr_state="changes-requested"
     fi
   fi
 
-  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort")${extra_notice}"
+  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort" "$cycle_round")${extra_notice}"
   printf '%s\n' "$review_md" > "$comment_file"
 
   # 写回 PR 评审评论与状态
@@ -819,10 +853,11 @@ EOF
     fi
   fi
 
-  # 记录已评审的 (head_sha, body_hash)（DRY_RUN=0 时记录，防止同内容重复评审）
+  # 记录已评审的 (head_sha, body_hash) 与连续打回计数（DRY_RUN=0 时记录，防止同内容重复评审）
   review_key="$(compute_review_key "$head_sha" "$pr_body")"
   if [[ "$DRY_RUN" != "1" ]]; then
     printf '%s\n' "$review_key" >> "$sha_file"
+    printf '%d\n' "$new_consecutive_rejections" > "$consec_file"
   fi
 
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
@@ -836,6 +871,9 @@ EOF
     --arg model "$CODEX_MODEL" \
     --arg reasoning_effort "$round_effort" \
     --argjson round "$current_round" \
+    --argjson cycle_round "$cycle_round" \
+    --argjson consecutive_rejections "$new_consecutive_rejections" \
+    --argjson max_total_rounds "$MAX_TOTAL_REVIEW_ROUNDS" \
     --arg verdict "$verdict" \
     --arg e2e_decision "$effective_e2e_decision" \
     --arg e2e_decision_reason "${e2e_decision_reason}${e2e_downgrade_note}" \
@@ -852,6 +890,9 @@ EOF
       model: $model,
       reasoning_effort: $reasoning_effort,
       round: $round,
+      cycle_round: $cycle_round,
+      consecutive_rejections: $consecutive_rejections,
+      max_total_rounds: $max_total_rounds,
       verdict: $verdict,
       e2e_decision: $e2e_decision,
       e2e_decision_reason: $e2e_decision_reason,
@@ -863,8 +904,8 @@ EOF
   total_elapsed=$((SECONDS - task_start_sec))
   end_ts="$("$DATE_BIN" '+%F %T')"
   printf '\n============================================================\n'
-  printf '[%s] [DONE] PR #%s Codex 评审完成 (第 %d/%d 轮, 耗时 %ds)\n' \
-    "$end_ts" "$pr_num" "$current_round" "$MAX_REVIEW_ROUNDS" "$total_elapsed"
+  printf '[%s] [DONE] PR #%s Codex 评审完成 (本周期第 %d/%d 轮, 累计第 %d/%d 轮, 耗时 %ds)\n' \
+    "$end_ts" "$pr_num" "$cycle_round" "$MAX_REVIEW_ROUNDS" "$current_round" "$MAX_TOTAL_REVIEW_ROUNDS" "$total_elapsed"
   printf '  评审结论 : %s -> %s%s\n' "$verdict" "$LABEL_PREFIX" "$final_pr_state"
   printf '  关联Issue: #%s | Commit: %s\n' "${issue_num:-?}" "${head_sha:0:10}"
   printf '  评审报告 : %s\n' "$comment_file"
