@@ -5,7 +5,7 @@ set -euo pipefail
 # 扫描近期已合并（merged）的 PR：
 #   1. 若 PR 或关联 Issue 仍带有非 done 的 agy:* 标签，将其切换为 agy:done；
 #   2. 在 flock 锁保护下安全清理本地对应的 issue-<N> / review-pr-<P> / e2e-pr-<P> / final-pr-<P> worktree
-#      及已合并的本地 agy/issue-<N> 分支（绝不强删未合并分支）。
+#      及已合并的本地语义分支 / 遗留 agy/issue-<N> 分支（绝不强删未合并分支）。
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
@@ -198,15 +198,48 @@ run_cleanup_pass() {
       remove_worktree_safe "$wt_final_resolve" && removed_items+=" final-resolve-pr-${pr_num}"
     fi
 
-    # 仅在本地分支存在且以 BRANCH_PREFIX 开头时安全删除（用 -d 而非 -D，仅删已合并分支）
-    if [[ "$head_branch" == "${BRANCH_PREFIX}"* ]] && "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${head_branch}"; then
-      if [[ "$DRY_RUN" == "1" ]]; then
-        printf '[DRY_RUN] %s -C %q branch -d %q\n' "$GIT_BIN" "$REPO_ROOT" "$head_branch" >&2
-      else
-        (
-          "$FLOCK_BIN" -x 9
-          "$GIT_BIN" -C "$REPO_ROOT" branch -d "$head_branch" >/dev/null 2>&1 || true
-        ) 9>"$REPO_GIT_LOCK"
+    # 安全清理已合并的本地工作分支（支持无编号语义分支、临时占位分支与遗留 agy/issue-* 分支；绝不删除主干或未合并分支）
+    if [[ -n "$head_branch" ]] && "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${head_branch}"; then
+      local current_root_branch=""
+      current_root_branch="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      local can_delete_branch=0
+
+      case "$head_branch" in
+        main|master|unidb|develop|dev|"$current_root_branch")
+          can_delete_branch=0
+          ;;
+        "${BRANCH_PREFIX}"*|_gongcao-wip/*)
+          can_delete_branch=1
+          ;;
+        *)
+          if [[ -n "$issue_num" ]]; then
+            local recorded_branch=""
+            local bfile="${STATE_ROOT}/sessions/issue-${issue_num}/branch_name"
+            local mfile="${STATE_ROOT}/sessions/issue-${issue_num}/meta.json"
+            if [[ -s "$bfile" ]]; then
+              IFS= read -r recorded_branch < "$bfile" || true
+            fi
+            if [[ -z "$recorded_branch" && -s "$mfile" ]]; then
+              recorded_branch="$("$JQ_BIN" -r '.branch // empty' "$mfile" 2>/dev/null || true)"
+            fi
+            [[ -n "$recorded_branch" && "$recorded_branch" == "$head_branch" ]] && can_delete_branch=1
+          fi
+          if (( can_delete_branch == 0 )) && (( has_local_wt == 1 || has_agy_non_done == 1 )) \
+            && [[ "$head_branch" =~ ^(fix|feat|docs|refactor|test|chore|perf)/ ]]; then
+            can_delete_branch=1
+          fi
+          ;;
+      esac
+
+      if (( can_delete_branch == 1 )); then
+        if [[ "$DRY_RUN" == "1" ]]; then
+          printf '[DRY_RUN] %s -C %q branch -d %q\n' "$GIT_BIN" "$REPO_ROOT" "$head_branch" >&2
+        else
+          (
+            "$FLOCK_BIN" -x 9
+            "$GIT_BIN" -C "$REPO_ROOT" branch -d "$head_branch" >/dev/null 2>&1 || true
+          ) 9>"$REPO_GIT_LOCK"
+        fi
       fi
     fi
 

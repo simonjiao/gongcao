@@ -34,7 +34,7 @@ REPO_NAME="${REPO_NAME:-}"             # 可选：直接指定 ~/.gongcao/repos/
 REPO_DIR="${REPO_DIR:-}"               # 可选：显式指定本地仓库路径；留空时按 REPO/REPO_NAME 定位到 ~/.gongcao/repos/
 AUTO_CLONE="${AUTO_CLONE:-1}"          # 指定 REPO 且本地尚未克隆时，是否自动 clone 到 ~/.gongcao/repos/（1=是，0=否）
 BASE_BRANCH="${BASE_BRANCH:-}"         # 创建 worktree/PR 的基准分支，留空自动探测 origin/HEAD 或当前 HEAD
-BRANCH_PREFIX="${BRANCH_PREFIX:-agy/issue-}"
+BRANCH_PREFIX="${BRANCH_PREFIX:-agy/issue-}" # 仅作历史遗留分支兼容识别与清理使用；新分支统一使用无 Issue 编号的语义命名 <type>/<slug>
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 GIT_FETCH="${GIT_FETCH:-1}"            # 创建或同步 worktree 前是否尝试 git fetch origin（1=是，0=否）
 AUTO_SYNC_BASE="${AUTO_SYNC_BASE:-1}"  # 启动/续跑前是否自动合并最新基准分支并把冲突交给 agy 解决（1=是，0=否）
@@ -186,10 +186,236 @@ strip_origin_prefix() {
   printf '%s' "${ref#origin/}"
 }
 
+# 解析已有 worktree / 会话 / 遗留分支名（未找到时返回空）
+resolve_existing_issue_branch() {
+  local issue_num="$1"
+  local session_dir="$2"
+  local wt_dir="$3"
+  local b=""
+
+  if [[ -e "${wt_dir}/.git" ]]; then
+    b="$("$GIT_BIN" -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -n "$b" && "$b" != "HEAD" ]]; then
+      printf '%s' "$b"
+      return 0
+    fi
+  fi
+
+  if [[ -s "${session_dir}/branch_name" ]]; then
+    IFS= read -r b < "${session_dir}/branch_name" || true
+    if [[ -n "$b" ]]; then
+      printf '%s' "$b"
+      return 0
+    fi
+  fi
+
+  if [[ -s "${session_dir}/meta.json" ]]; then
+    b="$("$JQ_BIN" -r '.branch // empty' "${session_dir}/meta.json" 2>/dev/null || true)"
+    if [[ -n "$b" ]]; then
+      printf '%s' "$b"
+      return 0
+    fi
+  fi
+
+  if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${BRANCH_PREFIX}${issue_num}" \
+    || "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${BRANCH_PREFIX}${issue_num}"; then
+    printf '%s' "${BRANCH_PREFIX}${issue_num}"
+    return 0
+  fi
+}
+
+is_placeholder_or_legacy_branch() {
+  local branch_name="$1"
+  [[ "$branch_name" == _gongcao-wip/* || "$branch_name" == "${BRANCH_PREFIX}"* ]]
+}
+
+infer_branch_type() {
+  local labels_text="$1"
+  local title_text="$2"
+  local commit_text="$3"
+
+  local re_commit='^[[:space:]]*([a-zA-Z]+)(\([^)]*\))?:'
+  if [[ "$commit_text" =~ $re_commit ]]; then
+    local ctype="${BASH_REMATCH[1],,}"
+    case "$ctype" in
+      fix|feat|docs|refactor|test|chore|perf)
+        printf '%s' "$ctype"
+        return 0
+        ;;
+    esac
+  fi
+
+  local combined="${labels_text} ${title_text}"
+  local low="${combined,,}"
+  if [[ "$low" =~ (bug|修复|漏报|误报|缺陷|崩溃|错误|异常) ]]; then
+    printf 'fix'
+  elif [[ "$low" =~ (docs?|文档|手册|指南) ]]; then
+    printf 'docs'
+  elif [[ "$low" =~ (refactor|重构) ]]; then
+    printf 'refactor'
+  elif [[ "$low" =~ (test|测试|vitest|qa) ]]; then
+    printf 'test'
+  elif [[ "$low" =~ (perf|性能|优化) ]]; then
+    printf 'perf'
+  elif [[ "$low" =~ (chore|ci|build|依赖|配置) ]]; then
+    printf 'chore'
+  elif [[ "$low" =~ (feat|feature|新增|支持|能力) ]]; then
+    printf 'feat'
+  else
+    printf 'fix'
+  fi
+}
+
+sanitize_branch_slug() {
+  local raw_text="$1"
+  local issue_num="$2"
+
+  local lower="${raw_text,,}"
+  local normalized="${lower//[^a-z0-9]/-}"
+  local -a parts=()
+  local -a kept=()
+  IFS='-' read -r -a parts <<<"$normalized"
+
+  local i=0 tok="" next_tok=""
+  while (( i < ${#parts[@]} )); do
+    tok="${parts[$i]}"
+    next_tok=""
+    (( i + 1 < ${#parts[@]} )) && next_tok="${parts[$((i + 1))]}"
+
+    if [[ -z "$tok" ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$tok" == "issue" || "$tok" == "pr" ]] && [[ "$next_tok" =~ ^[0-9]+$ ]]; then
+      i=$((i + 2))
+      continue
+    fi
+    if [[ "$tok" =~ ^[0-9]+$ || "$tok" =~ ^issue[0-9]+$ || "$tok" =~ ^pr[0-9]+$ ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    if [[ -n "$issue_num" && "$tok" == *"$issue_num"* ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    kept+=("$tok")
+    i=$((i + 1))
+  done
+
+  local joined=""
+  local k
+  for k in "${kept[@]}"; do
+    if [[ -n "$joined" ]]; then
+      joined+="-${k}"
+    else
+      joined="$k"
+    fi
+  done
+
+  joined="${joined:0:48}"
+  joined="${joined%-}"
+  printf '%s' "$joined"
+}
+
+derive_semantic_branch() {
+  local proposed="$1"
+  local commit_msg="$2"
+  local title="$3"
+  local labels_text="$4"
+  local issue_num="$5"
+  local wt_dir="$6"
+  local base_ref="$7"
+
+  # 清理引号、反引号、空白及误带的前缀
+  proposed="${proposed#refs/heads/}"
+  proposed="${proposed//\`/}"
+  proposed="${proposed//\"/}"
+  proposed="${proposed//\'/}"
+  proposed="${proposed#"${proposed%%[![:space:]]*}"}"
+  proposed="${proposed%"${proposed##*[![:space:]]}"}"
+
+  local btype="" raw_slug=""
+  if [[ "$proposed" =~ ^([a-zA-Z]+)/(.+)$ ]]; then
+    local ptype="${BASH_REMATCH[1],,}"
+    local prest="${BASH_REMATCH[2]}"
+    case "$ptype" in
+      fix|feat|docs|refactor|test|chore|perf)
+        btype="$ptype"
+        raw_slug="$prest"
+        ;;
+      *)
+        btype="$(infer_branch_type "$labels_text" "$title" "$commit_msg")"
+        raw_slug="$proposed"
+        ;;
+    esac
+  elif [[ -n "$proposed" ]]; then
+    btype="$(infer_branch_type "$labels_text" "$title" "$commit_msg")"
+    raw_slug="$proposed"
+  else
+    btype="$(infer_branch_type "$labels_text" "$title" "$commit_msg")"
+    local re_desc='^[[:space:]]*[a-zA-Z]+(\(([^)]*)\))?:[[:space:]]*(.+)$'
+    if [[ "$commit_msg" =~ $re_desc ]]; then
+      local cscope="${BASH_REMATCH[2]}"
+      local cdesc="${BASH_REMATCH[3]}"
+      raw_slug="${cscope:+${cscope} }${cdesc}"
+    else
+      raw_slug="$title"
+    fi
+  fi
+
+  local slug=""
+  slug="$(sanitize_branch_slug "$raw_slug" "$issue_num")"
+
+  if (( ${#slug} < 3 )) && [[ -n "$title" && "$raw_slug" != "$title" ]]; then
+    slug="$(sanitize_branch_slug "$title" "$issue_num")"
+  fi
+
+  # 若标题/提交仍无可用英文词素（如纯中文标题且模型未输出分支名），则从改动文件名提取语义 slug
+  if (( ${#slug} < 3 )); then
+    local files_text="" f="" base_f="" f_count=0
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      base_f="${f##*/}"
+      base_f="${base_f%.*}"
+      files_text+=" ${base_f}"
+      f_count=$((f_count + 1))
+      (( f_count >= 3 )) && break
+    done < <("$GIT_BIN" -C "$wt_dir" diff --name-only "${base_ref}..HEAD" 2>/dev/null || true)
+    if [[ -n "$files_text" ]]; then
+      slug="$(sanitize_branch_slug "$files_text" "$issue_num")"
+    fi
+  fi
+
+  local short_sha=""
+  short_sha="$("$GIT_BIN" -C "$wt_dir" rev-parse --short=6 HEAD 2>/dev/null || printf 'update')"
+  if (( ${#slug} < 3 )); then
+    slug="change-${short_sha}"
+  fi
+
+  local cand="${btype}/${slug}"
+  local cur_branch=""
+  cur_branch="$("$GIT_BIN" -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ "$cand" != "$cur_branch" ]] && {
+    "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${cand}" \
+      || "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${cand}"
+  }; then
+    local short4="${short_sha:0:4}"
+    [[ -z "$short4" ]] && short4="alt"
+    cand="${btype}/${slug:0:43}"
+    cand="${cand%-}-${short4}"
+  fi
+
+  if ! "$GIT_BIN" -C "$REPO_ROOT" check-ref-format --branch "$cand" >/dev/null 2>&1; then
+    cand="${btype}/update-${short_sha}"
+  fi
+
+  printf '%s' "$cand"
+}
+
 ensure_worktree() {
   local issue_num="$1"
-  local base_ref="$2"
-  local branch="${BRANCH_PREFIX}${issue_num}"
+  local branch="$2"
+  local base_ref="$3"
   local wt_dir="${WORKTREE_ROOT}/issue-${issue_num}"
 
   # 使用文件锁保护主仓库 fetch/worktree 操作，防止与 review/e2e/cleanup 循环并发冲突
@@ -445,12 +671,18 @@ while true; do
   labels="$("$JQ_BIN" -r '([.labels[].name] | join(", ")) // "(none)"' <<<"$next_issue_json")"
   body="$("$JQ_BIN" -r '.body // "(empty)"' <<<"$next_issue_json")"
 
-  branch="${BRANCH_PREFIX}${number}"
+  wt_dir_expected="${WORKTREE_ROOT}/issue-${number}"
   session_dir="${SESSIONS_ROOT}/issue-${number}"
   "$MKDIR_BIN" -p "$session_dir"
 
   run_ts="$("$DATE_BIN" '+%Y%m%d-%H%M%S')"
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
+  branch_name_file="${session_dir}/branch_name"
+  branch="$(resolve_existing_issue_branch "$number" "$session_dir" "$wt_dir_expected")"
+  if [[ -z "$branch" ]]; then
+    branch="_gongcao-wip/work-${run_ts}"
+  fi
+
   prompt_file="${session_dir}/prompt.md"
   run_prompt_file="${session_dir}/prompt-${run_ts}.md"
   summary_file="${session_dir}/summary.md"
@@ -460,6 +692,7 @@ while true; do
   summary_tmp="/tmp/agy-summary-${REPO_SLUG}-${number}-${run_ts}.md"
   blocked_tmp="/tmp/agy-blocked-${REPO_SLUG}-${number}-${run_ts}.md"
   commit_msg_tmp="/tmp/agy-commit-msg-${REPO_SLUG}-${number}-${run_ts}.txt"
+  branch_name_tmp="/tmp/agy-branch-name-${REPO_SLUG}-${number}-${run_ts}.txt"
   pr_body_file="${session_dir}/pr-body.md"
   events_file="${session_dir}/events.jsonl"
   run_events_file="${session_dir}/events-${run_ts}.jsonl"
@@ -474,16 +707,20 @@ while true; do
   : > "$summary_tmp"
   : > "$blocked_tmp"
   : > "$commit_msg_tmp"
+  : > "$branch_name_tmp"
 
   base_ref="$(resolve_base_ref)"
   pr_base_branch="$(strip_origin_prefix "$base_ref")"
 
-  printf '[%s] 准备 Issue #%s 的独立 worktree (base=%s)...\n' "$("$DATE_BIN" '+%F %T')" "$number" "$base_ref"
-  if ! wt_dir="$(ensure_worktree "$number" "$base_ref")"; then
+  printf '[%s] 准备 Issue #%s 的独立 worktree (base=%s, branch=%s)...\n' "$("$DATE_BIN" '+%F %T')" "$number" "$base_ref" "$branch"
+  if ! wt_dir="$(ensure_worktree "$number" "$branch" "$base_ref")"; then
     printf '[%s] 警告：为 Issue #%s 准备 worktree 失败，%ss 后重试...\n' \
       "$("$DATE_BIN" '+%F %T')" "$number" "$POLL_INTERVAL" >&2
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
+  fi
+  if ! is_placeholder_or_legacy_branch "$branch"; then
+    printf '%s\n' "$branch" > "$branch_name_file"
   fi
 
   # 同步最新基准分支到当前 worktree；若产生合并冲突，保留冲突标记并交给 agy 解决
@@ -540,6 +777,11 @@ while true; do
     fi
   fi
 
+  branch_prompt_line=""
+  if is_placeholder_or_legacy_branch "$branch"; then
+    branch_prompt_line=$'\n'"   - **务必**生成一个简短有意义的英文语义 Git 分支名（格式 \`<type>/<kebab-slug>\`，type 仅限 \`fix|feat|docs|refactor|test|chore|perf\`，例如 \`fix/pg-zero-column-compare\`、\`docs/sync-offline-user-guide\`；**严禁包含任何 Issue 或 PR 编号**，仅用小写字母、数字和 \`-\`，总长不超过 60 字符），仅写一行到 ${branch_name_tmp}。"
+  fi
+
   prompt="$("$CAT_BIN" <<EOF
 请处理以下 GitHub Issue：
 
@@ -561,7 +803,7 @@ ${body}${merge_conflict_section}${review_feedback_section}
 4. **不要执行 git add / git commit / git push，也不要修改 GitHub Issue/PR 状态**：沙箱内 .git 为只读，代码提交、推送与 PR 创建全部由外层宿主机脚本自动完成。
 5. 正常完成开发与内部验证后：
    - 将本次改动的简明中文总结（改动文件、已执行的内部验证结果、显式标注 E2E 未执行，以及潜在风险）写入 ${summary_tmp}；
-   - 可选：将一行简明的英文/中文 commit message 写入 ${commit_msg_tmp}。
+   - 可选：将一行简明的英文/中文 commit message 写入 ${commit_msg_tmp}。${branch_prompt_line}
 6. **如果工作遇到阻塞无法继续**（例如需求不明确、缺少必要凭证/依赖、内部验证无法通过且无法在当前范围内修复）：
    - 立即停止修改，不要强行凑合；
    - 将具体的阻塞原因与需要人工提供的信息写入 ${blocked_tmp}（外层脚本会据此停止推进并自动更新 Issue/PR 为 blocked 状态）。
@@ -681,7 +923,7 @@ EOF
 ### 重要续接要求
 1. 你仍在原 worktree（\`${wt_dir}\`）及分支（\`${branch}\`）中，**前面已完成的代码修改全部保留在工作区**，不要从头推倒重做。
 2. 请先运行 \`git status\` 和 \`git diff --stat\` 核对已有改动，从中断处继续完成剩余修改与必要的内部验证（不要运行 E2E，也不要执行 \`git add / git commit / git push\`）。
-3. 完成后将简明中文总结写入 ${summary_tmp}（可选：commit message 写入 ${commit_msg_tmp}）；若确有阻塞无法继续，将阻塞原因写入 ${blocked_tmp}。
+3. 完成后将简明中文总结写入 ${summary_tmp}（可选：commit message 写入 ${commit_msg_tmp}）；若确有阻塞无法继续，将阻塞原因写入 ${blocked_tmp}。${branch_prompt_line}
 EOF
 )"
       "$SLEEP_BIN" 3
@@ -823,6 +1065,38 @@ EOF
       else
         commits_ahead="$("$GIT_BIN" -C "$wt_dir" rev-list --count "${base_ref}..HEAD" 2>/dev/null || printf '0')"
         if (( commits_ahead > 0 )); then
+          proposed_branch=""
+          if [[ -s "$branch_name_tmp" ]]; then
+            while IFS= read -r _bline; do
+              _bline="${_bline#"${_bline%%[![:space:]]*}"}"
+              _bline="${_bline%"${_bline##*[![:space:]]}"}"
+              if [[ -n "$_bline" ]]; then
+                proposed_branch="$_bline"
+                break
+              fi
+            done < "$branch_name_tmp"
+          fi
+
+          # 仅在首次推送前且尚未关联远端 PR/分支时，将临时占位或遗留 agy/issue-* 分支规范命名为无编号语义分支
+          if is_placeholder_or_legacy_branch "$branch" && [[ -z "$existing_pr_num" ]] \
+            && ! "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+            semantic_branch="$(derive_semantic_branch "$proposed_branch" "$commit_msg" "$title" "$labels" "$number" "$wt_dir" "$base_ref")"
+            if [[ -n "$semantic_branch" && "$semantic_branch" != "$branch" ]]; then
+              if [[ "$DRY_RUN" == "1" ]]; then
+                printf '[DRY_RUN] %s -C %q branch -m %q %q\n' "$GIT_BIN" "$wt_dir" "$branch" "$semantic_branch" >&2
+                branch="$semantic_branch"
+              else
+                (
+                  "$FLOCK_BIN" -x 9
+                  "$GIT_BIN" -C "$wt_dir" branch -m "$branch" "$semantic_branch" >&2
+                ) 9>"$REPO_GIT_LOCK"
+                branch="$semantic_branch"
+                printf '%s\n' "$branch" > "$branch_name_file"
+                printf '[%s] Issue #%s 分支已规范命名为语义分支: %s\n' "$("$DATE_BIN" '+%F %T')" "$number" "$branch"
+              fi
+            fi
+          fi
+
           if [[ "$GH_SYNC_ENABLED" == "1" && "$AUTO_PUSH_PR" == "1" ]]; then
             push_ok=0
             if [[ "$DRY_RUN" == "1" ]]; then
