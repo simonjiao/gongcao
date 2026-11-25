@@ -61,7 +61,8 @@ MAX_TIMEOUT_RETRIES="${MAX_TIMEOUT_RETRIES:-2}" # 触发 --print-timeout 超时�
 MAX_QUOTA_RETRIES="${MAX_QUOTA_RETRIES:-6}"     # 触发 429/RESOURCE_EXHAUSTED 配额限流或可重试 API 报错时的自动等待重试次数上限
 QUOTA_RETRY_BUFFER_SEC="${QUOTA_RETRY_BUFFER_SEC:-15}" # 配额重置倒计时额外缓冲秒数
 QUOTA_DEFAULT_WAIT_SEC="${QUOTA_DEFAULT_WAIT_SEC:-120}" # 未解析出 Resets in 时的默认冷却等待秒数
-MAX_QUOTA_WAIT_SEC="${MAX_QUOTA_WAIT_SEC:-3600}"       # 单次冷却等待上限（超过则直接转 blocked 避免无限长睡）
+QUOTA_INLINE_WAIT_MAX_SEC="${QUOTA_INLINE_WAIT_MAX_SEC:-300}" # 短冷却（<=300s）原地等待续接；超过则写入全局冷却文件并退回原队列
+MAX_QUOTA_WAIT_SEC="${MAX_QUOTA_WAIT_SEC:-86400}"      # 自动冷却等待上限（默认 24 小时，仅超上限才转 blocked）
 AGY_MODE="${AGY_MODE:-accept-edits}"   # accept-edits | auto | plan（默认 accept-edits 避免账号无 auto 权限告警）
 AGY_SKIP_PERMISSIONS="${AGY_SKIP_PERMISSIONS:-1}" # 在 --sandbox 内免本地交互确认自动推进（1=启用，0=关闭）
 AGY_MODEL="${AGY_MODEL:-gemini-4-hydrogen-xhigh}" # 默认使用 Gemini 4 Hydrogen (XHigh)；也可切为 gemini-4-neon-xhigh
@@ -597,13 +598,42 @@ EOF
 
 consecutive_poll_errors=0
 idle_announced=0
+quota_wait_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
+QUOTA_COOLDOWN_FILE="${STATE_ROOT}/quota_reset_until"
 
 while true; do
   # 若启动时初始化标签失败，在网络恢复后补初始化一次
   if [[ "$GH_SYNC_ENABLED" == "1" && "$INIT_LABELS" == "1" && "$LABELS_READY" == "0" ]]; then
     if gh_state init-labels; then
       LABELS_READY=1
+    fi
+  fi
+
+  # 若处于持久化全局 429 配额冷却期内，暂停认领任何 Issue，到期后自动恢复队列续接
+  if [[ -s "$QUOTA_COOLDOWN_FILE" ]]; then
+    IFS= read -r reset_epoch < "$QUOTA_COOLDOWN_FILE" || true
+    reset_epoch="${reset_epoch#"${reset_epoch%%[![:space:]]*}"}"
+    reset_epoch="${reset_epoch%"${reset_epoch##*[![:space:]]}"}"
+    now_epoch="$("$DATE_BIN" '+%s')"
+    if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( reset_epoch > now_epoch )); then
+      remain=$(( reset_epoch - now_epoch ))
+      reset_human="$("$DATE_BIN" -d "@${reset_epoch}" '+%F %T' 2>/dev/null || printf '%s' "$reset_epoch")"
+      if (( quota_wait_announced == 0 )); then
+        printf '[%s] 空闲等待中（全局配额冷却至 %s，剩余 %ss）：到期后将自动恢复认领与续接...\n' \
+          "$("$DATE_BIN" '+%F %T')" "$reset_human" "$remain"
+        quota_wait_announced=1
+      fi
+      idle_announced=0
+      chunk=$(( remain < POLL_INTERVAL ? remain : POLL_INTERVAL ))
+      (( chunk < 1 )) && chunk=1
+      "$SLEEP_BIN" "$chunk"
+      continue
+    else
+      : > "$QUOTA_COOLDOWN_FILE"
+      printf '[%s] 全局配额冷却已到期，恢复自动认领与续接队列...\n' "$("$DATE_BIN" '+%F %T')"
+      quota_wait_announced=0
+      idle_announced=0
     fi
   fi
 
@@ -824,9 +854,12 @@ EOF
   timed_out=0
   timeout_retries=0
   quota_hit=0
+  quota_deferred=0
   quota_wait_exceeded=0
   quota_retries=0
   last_quota_wait=0
+  quota_reset_epoch=0
+  quota_reset_human=""
   attempt=0
   max_t_retries=0
   [[ "$MAX_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] && max_t_retries="$MAX_TIMEOUT_RETRIES"
@@ -939,11 +972,21 @@ EOF
       last_quota_wait="$wait_sec"
       if (( wait_sec > MAX_QUOTA_WAIT_SEC )); then
         quota_wait_exceeded=1
-        printf '[%s] 警告：Issue #%s 触发配额限流，预计冷却 %ss 超过单次等待上限 %ss，停止自动等待并转 blocked。\n' \
+        printf '[%s] 警告：Issue #%s 触发配额限流，预计冷却 %ss 超过自动等待上限 %ss，停止自动等待并转 blocked。\n' \
           "$("$DATE_BIN" '+%F %T')" "$number" "$wait_sec" "$MAX_QUOTA_WAIT_SEC" >&2
         break
-      fi
-      if (( quota_retries < max_q_retries )); then
+      elif (( wait_sec > QUOTA_INLINE_WAIT_MAX_SEC || quota_retries >= max_q_retries )); then
+        quota_deferred=1
+        now_epoch="$("$DATE_BIN" '+%s')"
+        quota_reset_epoch=$(( now_epoch + wait_sec ))
+        quota_reset_human="$("$DATE_BIN" -d "@${quota_reset_epoch}" '+%F %T' 2>/dev/null || printf '%s' "$quota_reset_epoch")"
+        if [[ "$DRY_RUN" != "1" ]]; then
+          printf '%s\n' "$quota_reset_epoch" > "$QUOTA_COOLDOWN_FILE"
+        fi
+        printf '[%s] 警告：Issue #%s 触发配额限流（预计冷却 %ss -> 至 %s），已登记全局冷却并自动退回原队列等待到期续接。\n' \
+          "$("$DATE_BIN" '+%F %T')" "$number" "$wait_sec" "$quota_reset_human" >&2
+        break
+      else
         quota_retries=$((quota_retries + 1))
         printf '[%s] 警告：Issue #%s 第 %d 次执行触发 HTTP 429 / RESOURCE_EXHAUSTED 配额限流，等待 %ss 后自动续接原会话 (%s) 重试（第 %d/%d 次配额等待）...\n' \
           "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "$wait_sec" "${current_conv_id:-new}" "$quota_retries" "$max_q_retries" >&2
@@ -1016,8 +1059,15 @@ EOF
   if (( run_ok == 0 )); then
     (( merge_in_progress == 1 )) && "$GIT_BIN" -C "$wt_dir" merge --abort >/dev/null 2>&1 || true
     final_status="blocked"
-    if (( quota_wait_exceeded == 1 )); then
-      status_detail="Agent 触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED），预计重置等待 ${last_quota_wait}s 超过单次自动冷却上限（${MAX_QUOTA_WAIT_SEC}s），已暂停并保留 worktree 与会话记录；配额恢复后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    if (( quota_deferred == 1 )); then
+      if (( picked_from_changes_requested == 1 )); then
+        final_status="changes-requested"
+      else
+        final_status="todo"
+      fi
+      status_detail="Agent 触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED），预计冷却 ${last_quota_wait}s；已登记全局冷却至 ${quota_reset_human} 并保留 worktree 与会话记录（${final_conv_id:-new}），已自动退回 \`${LABEL_PREFIX}${final_status}\` 队列，配额恢复到期后将自动续接原会话继续执行。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
+    elif (( quota_wait_exceeded == 1 )); then
+      status_detail="Agent 触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED），预计重置等待 ${last_quota_wait}s 超过自动等待上限（${MAX_QUOTA_WAIT_SEC}s），已暂停并保留 worktree 与会话记录；配额恢复后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
     elif (( quota_hit == 1 )); then
       status_detail="Agent 多次触发配额限流（HTTP 429 / RESOURCE_EXHAUSTED）并已耗尽自动冷却重试（${quota_retries}/${max_q_retries} 次），已暂停并保留 worktree 与会话记录；配额恢复后将标签改回 \`${LABEL_PREFIX}todo\` 可自动续接原会话。${blocked_reason:+$'\n\n'"### 阻塞原因"$'\n'"${blocked_reason}"}${summary_text:+$'\n\n'"### 摘要"$'\n'"${summary_text}"}"
     elif (( timed_out == 1 )); then
