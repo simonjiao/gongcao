@@ -53,10 +53,11 @@ E2E_EVIDENCE_BRANCH="${E2E_EVIDENCE_BRANCH:-qa/e2e-evidence}"
 ALLOW_SKIP_E2E="${ALLOW_SKIP_E2E:-1}"     # 1=评审确认免 E2E 或已有祖先提交 E2E 通过时直接转 agy:e2e-skipped -> final-gate；0=一律转 agy:approved
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.2-sol}" # 默认使用 GPT-6.2-Sol
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}" # 默认推理强度 xhigh
+CODEX_REREVIEW_REASONING_EFFORT="${CODEX_REREVIEW_REASONING_EFFORT:-medium}" # 第 2 轮及以上复审推理强度（避免 xhigh 过度深挖次生边界）
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"    # 单次 codex 评审超时上限，防止进程卡死
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-60000}" # 嵌入 prompt 的 diff 最大字节数（超长截断，Codex 可在 worktree 中查完整 diff）
-MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-5}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}" # 最大自动打回评审轮数，超过则切 blocked 交人工裁决
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # 评审不通过时是否同步将关联 Issue 切为 changes-requested（触发 agy 自动修复）
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -122,8 +123,8 @@ gh_state() {
 }
 
 printf '[%s] 启动 codex-review-loop\n' "$("$DATE_BIN" '+%F %T')"
-printf '  Codex 命令 : %s (model=%s, effort=%s, sandbox=%s)\n' \
-  "$CODEX_BIN" "${CODEX_MODEL:-(codex 默认)}" "${CODEX_REASONING_EFFORT:-(默认)}" "$CODEX_SANDBOX"
+printf '  Codex 命令 : %s (model=%s, effort=%s, rereview_effort=%s, sandbox=%s)\n' \
+  "$CODEX_BIN" "${CODEX_MODEL:-(codex 默认)}" "${CODEX_REASONING_EFFORT:-(默认)}" "${CODEX_REREVIEW_REASONING_EFFORT:-(同默认)}" "$CODEX_SANDBOX"
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  评审档案根 : %s\n' "$REVIEWS_ROOT"
@@ -393,6 +394,7 @@ render_review_markdown() {
   local eff_e2e_decision="$7"
   local e2e_reused_sha="$8"
   local e2e_downgrade_note="$9"
+  local eff_effort="${10:-$CODEX_REASONING_EFFORT}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
@@ -414,7 +416,7 @@ render_review_markdown() {
     --arg eff_e2e "$eff_e2e_decision" \
     --arg e2e_note "$e2e_downgrade_note" \
     --arg meta_json "$meta_json" \
-    --arg model "${CODEX_MODEL:-(codex 默认)}${CODEX_REASONING_EFFORT:+ (${CODEX_REASONING_EFFORT})}" \
+    --arg model "${CODEX_MODEL:-(codex 默认)}${eff_effort:+ (${eff_effort})}" \
     --arg now "$now_ts" \
     '
     def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
@@ -546,8 +548,12 @@ EOF
   "$TOUCH_BIN" "$sha_file"
 
   prev_rounds=0
+  prev_reviewed_sha=""
   while IFS= read -r _line; do
-    [[ -n "$_line" ]] && prev_rounds=$((prev_rounds + 1))
+    if [[ -n "$_line" ]]; then
+      prev_rounds=$((prev_rounds + 1))
+      prev_reviewed_sha="${_line%%:*}"
+    fi
   done < "$sha_file"
   current_round=$((prev_rounds + 1))
 
@@ -614,8 +620,9 @@ EOF
     pr_diff_snippet="${pr_diff_snippet}"$'\n\n'"... (diff 已截断，请在当前只读工作区使用 git diff origin/${base_branch}...HEAD 查看完整变更)"
   fi
 
-  # 若为第 2 轮及以上复审，自动带入上一轮的阻塞问题清单以约束复审收敛
+  # 若为第 2 轮及以上复审，自动带入上一轮的阻塞问题清单与本轮增量 diff 以约束复审收敛
   prev_review_section=""
+  rereview_delta_section=""
   if (( current_round >= 2 )); then
     prev_verdict_file="${review_dir}/last_verdict.json"
     if [[ ! -s "$prev_verdict_file" ]]; then
@@ -636,6 +643,21 @@ EOF
         prev_review_section=$'\n\n'"## 上一轮阻塞问题清单（本轮重点核验收敛）"$'\n'"${prev_blocking}"
       fi
     fi
+
+    if [[ -n "$prev_reviewed_sha" ]]; then
+      if [[ "$prev_reviewed_sha" == "$head_sha" ]]; then
+        rereview_delta_section=$'\n\n'"## 本轮增量变更（复审主要核对范围）"$'\n'"- 本轮未新增代码提交（仍为 \`${head_sha:0:10}\`），仅更新了 PR 描述或验证证据；请重点核验新补充的证据是否已关闭上一轮阻塞项。"
+      elif "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${prev_reviewed_sha}^{commit}" 2>/dev/null \
+        && "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+        delta_commits_text="$("$GIT_BIN" -C "$REPO_ROOT" log --oneline "${prev_reviewed_sha}..${head_sha}" 2>/dev/null || true)"
+        delta_diff_raw="$("$GIT_BIN" -C "$REPO_ROOT" diff "${prev_reviewed_sha}..${head_sha}" 2>/dev/null || true)"
+        delta_diff_snippet="${delta_diff_raw:0:MAX_DIFF_BYTES}"
+        if (( ${#delta_diff_raw} > MAX_DIFF_BYTES )); then
+          delta_diff_snippet="${delta_diff_snippet}"$'\n\n'"... (增量 diff 已截断，请在当前只读工作区使用 git diff ${prev_reviewed_sha:0:10}..HEAD 查看完整增量)"
+        fi
+        rereview_delta_section=$'\n\n'"## 本轮增量变更（\`${prev_reviewed_sha:0:10}..${head_sha:0:10}\`，复审主要核对范围）"$'\n'"\`\`\`text"$'\n'"${delta_commits_text:-"(无提交记录)"}"$'\n'"\`\`\`"$'\n'"\`\`\`diff"$'\n'"${delta_diff_snippet:-"(空增量 diff)"}"$'\n'"\`\`\`"
+      fi
+    fi
   fi
 
   "$CAT_BIN" > "$prompt_file" <<EOF
@@ -652,7 +674,7 @@ EOF
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}${prev_review_section}
+${issue_section}${prev_review_section}${rereview_delta_section}
 
 ## 既有 E2E 验收状态与免测判断依据
 - 是否存在通过的远端 QA 证据（\`${E2E_EVIDENCE_BRANCH}\`）: \`${prior_e2e_has_pass}\`
@@ -686,10 +708,19 @@ ${pr_diff_snippet:-"(空 diff)"}
    - 仅将「违反原始 Issue 明确验收标准、真实运行崩溃（如空指针 / \`TypeError\`）、或本次改动引入的真实数据正确性/安全回归、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
    - **以下情况若认为有参考价值，一律放入 \`non_blocking_notes\`（作为非阻塞项记录），不得阻塞通过**：
      - 超出原始 Issue 范围的延伸需求、次要/极端边缘的 UI 展示优化、仓库历史既有问题或轻微风格建议；
-     - 仅在人工伪造非法内部 JSON 结构（例如后端内部契约字段被篡改为非预期类型）或极罕见理论标识符构造下才触发的额外防御。
-5. **复审收敛规则（第 2 轮及以上）**：重点核验上一轮列出的阻塞问题是否已修复，以及本次修订是否引入新的真实崩溃或核心回归；不要在复审轮次不断追加与原始 Issue 无关的新要求，确保 1~2 轮内收敛进入后续 E2E 验收。
+     - 仅在人工伪造非法内部 JSON 结构（例如后端内部契约字段被篡改为非预期类型）或极罕见理论标识符构造下才触发的额外防御；
+     - 原始 Issue 未要求的次生状态机改造、非关键 UI 列表刷新优化、既有共用模块历史去重行为调整，以及仅在多重异常/并发叠加（如权限失败 + 定时扫描重叠 + 特定 SQLSTATE 细分）下才触发的极端边缘场景（可留待终审合入后沉淀为独立 Follow-up Issue）。
+5. **复审硬性收敛门禁（第 2 轮及以上，务必严格执行）**：
+   - **限定复审范围**：第 2 轮及以后复审只核验两件事：① 上一轮列出的阻塞问题是否已实质修复；② 本轮增量变更是否引入新的运行崩溃、明显逻辑错误或对原始 Issue 核心验收标准的回归。
+   - **严禁“防御套娃”与移动球门**：当上一轮阻塞项已实质关闭、且原始 Issue 核心验收标准已满足时，**禁止针对开发按上一轮意见新增的降级/错误/防御代码继续深挖二阶、三阶极端边界并追加新的 \`blocking_issues\`**。此类有价值的次生发现一律写入 \`non_blocking_notes\`（终审合入时可自动建后续追踪 Issue）并给出 \`verdict: "approve"\`，让 PR 进入真实 E2E 验收。
+   - **终轮务实放行**：若已处于最后一轮自动复审（\`current_round >= MAX_REVIEW_ROUNDS\`），只要原始 Issue 核心验收已满足且无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E，避免无意义的 \`blocked\`。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
 EOF
+
+  round_effort="$CODEX_REASONING_EFFORT"
+  if (( current_round >= 2 )) && [[ -n "$CODEX_REREVIEW_REASONING_EFFORT" ]]; then
+    round_effort="$CODEX_REREVIEW_REASONING_EFFORT"
+  fi
 
   codex_args=(
     exec
@@ -703,8 +734,8 @@ EOF
   if [[ -n "$CODEX_MODEL" ]]; then
     codex_args+=(-m "$CODEX_MODEL")
   fi
-  if [[ -n "$CODEX_REASONING_EFFORT" ]]; then
-    codex_args+=(-c "model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"")
+  if [[ -n "$round_effort" ]]; then
+    codex_args+=(-c "model_reasoning_effort=\"${round_effort}\"")
   fi
   codex_args+=(-)
 
@@ -767,7 +798,7 @@ EOF
     fi
   fi
 
-  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note")${extra_notice}"
+  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort")${extra_notice}"
   printf '%s\n' "$review_md" > "$comment_file"
 
   # 写回 PR 评审评论与状态
@@ -803,7 +834,7 @@ EOF
     --arg base_branch "$base_branch" \
     --arg head_sha "$head_sha" \
     --arg model "$CODEX_MODEL" \
-    --arg reasoning_effort "$CODEX_REASONING_EFFORT" \
+    --arg reasoning_effort "$round_effort" \
     --argjson round "$current_round" \
     --arg verdict "$verdict" \
     --arg e2e_decision "$effective_e2e_decision" \
