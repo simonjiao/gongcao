@@ -255,7 +255,7 @@ cmd_list_prs() {
     pr list
     --state "$pr_state"
     --limit "$limit"
-    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,labels
+    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,labels,updatedAt
   )
   [[ -n "$REPO" ]] && args+=(--repo "$REPO")
   [[ -n "$filter_label" ]] && args+=(--label "$filter_label")

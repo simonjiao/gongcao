@@ -34,9 +34,11 @@ SLEEP_BIN="$(resolve_bin sleep)"
 CAT_BIN="$(resolve_bin cat)"
 HEAD_BIN="$(resolve_bin head)"
 CP_BIN="$(resolve_bin cp)"
+MV_BIN="$(resolve_bin mv)"
 FIND_BIN="$(resolve_bin find)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
+SHA256SUM_BIN="$(resolve_bin sha256sum)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -50,6 +52,7 @@ AUTO_CLONE="${AUTO_CLONE:-1}"                # 未克隆时自动只读克隆到
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 E2E_TARGET_LABEL="${E2E_TARGET_LABEL:-${LABEL_PREFIX}approved}" # 默认接收代码评审通过（agy:approved）的 PR
 E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
+REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
 E2E_ENV_FILE="${E2E_ENV_FILE:-}"             # 可选：项目私有 E2E 环境说明文件（留空自动探测 ~/.gongcao/e2e/<repo_slug>.md）
 PUBLISH_EVIDENCE="${PUBLISH_EVIDENCE:-1}"    # 是否将 QA 证据归档推送到独立远端分支并在 PR/Issue 关联直链（1=是，0=否）
 E2E_EVIDENCE_BRANCH="${E2E_EVIDENCE_BRANCH:-qa/e2e-evidence}" # 独立孤立证据分支（不混入生产代码历史）
@@ -193,11 +196,13 @@ write_e2e_schema() {
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "details"],
+        "required": ["id", "name", "status", "details", "evidence_paths"],
         "properties": {
+          "id": { "type": "string" },
           "name": { "type": "string" },
           "status": { "type": "string", "enum": ["passed", "failed", "blocked", "skipped"] },
-          "details": { "type": "string" }
+          "details": { "type": "string" },
+          "evidence_paths": { "type": "array", "items": { "type": "string" } }
         }
       }
     },
@@ -240,6 +245,17 @@ extract_linked_issue() {
     [[ -n "$match" ]] && num="${match#issue-}"
   fi
   printf '%s' "$num"
+}
+
+review_e2e_checks() {
+  local pr_num="$1"
+  local head_sha="$2"
+  local comment
+  comment="$(gh_state get-comment pr "$pr_num" "$REVIEW_COMMENT_MARKER")" || return 1
+  "$JQ_BIN" -eRsc -L "$SCRIPT_DIR" --arg sha "$head_sha" '
+    include "workflow-e2e";
+    review_metadata | approved_e2e_checks($sha; "")
+  ' <<<"$comment"
 }
 
 prepare_e2e_worktree() {
@@ -295,6 +311,7 @@ publish_e2e_evidence() {
   local report_file="$8"
   local artifacts_dir="$9"
   local archived_list_file="${10}"
+  local review_checks_hash="${11}"
 
   : > "$archived_list_file"
   local rel_dir="pr-${pr_num}/${run_ts}-${head_sha:0:10}"
@@ -362,6 +379,7 @@ publish_e2e_evidence() {
     --arg tested_sha "$head_sha" \
     --arg verdict "$verdict" \
     --arg final_state "$final_state" \
+    --arg review_checks_hash "$review_checks_hash" \
     --arg model "${CODEX_MODEL}" \
     --arg reasoning_effort "${CODEX_REASONING_EFFORT}" \
     --arg archived_at "$iso_now" \
@@ -372,6 +390,7 @@ publish_e2e_evidence() {
       tested_sha: $tested_sha,
       verdict: $verdict,
       final_state: $final_state,
+      review_checks_hash: $review_checks_hash,
       model: $model,
       reasoning_effort: $reasoning_effort,
       archived_at: $archived_at,
@@ -443,7 +462,10 @@ render_e2e_markdown() {
     + "#### 端到端场景结果\n"
     + (if (.scenarios | length) > 0 then
         "| 场景 | 结果 | 详情 |\n| --- | --- | --- |\n"
-        + ([.scenarios[] | "| " + (.name | esc) + " | `" + .status + "` | " + (.details | esc) + " |"] | join("\n"))
+        + ([.scenarios[] | "| " + ((if (.id // "") != "" then .id + " " else "" end) + .name | esc)
+          + " | `" + .status + "` | " + (.details | esc)
+          + (if (.evidence_paths | length) > 0 then "（证据：" + (.evidence_paths | join("、") | esc) + "）" else "" end)
+          + " |"] | join("\n"))
       else
         "- (无场景明细)"
       end)
@@ -478,6 +500,7 @@ render_e2e_markdown() {
 consecutive_poll_errors=0
 idle_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
+declare -A review_cache_keys=() review_cache_times=() review_cache_checks=()
 
 while true; do
   if [[ "$INIT_LABELS" == "1" && "$LABELS_READY" == "0" ]]; then
@@ -498,13 +521,46 @@ while true; do
   fi
   consecutive_poll_errors=0
 
-  # 按 PR 编号升序（FIFO）找出第一条最新 head_sha 尚未做过 E2E 的 PR
+  # 按编号顺序选取尚未实测的提交与必验场景。
   next_pr_json=""
   while IFS= read -r row; do
     pnum="$("$JQ_BIN" -r '.number' <<<"$row")"
     psha="$("$JQ_BIN" -r '.headRefOid // empty' <<<"$row")"
+    if "$JQ_BIN" -e '.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY"' >/dev/null <<<"$row"; then
+      next_pr_json="$row"
+      break
+    fi
+    cache_key="$psha:$("$JQ_BIN" -r '.updatedAt // ""' <<<"$row")"
+    if [[ "${review_cache_keys[$pnum]-}" == "$cache_key" ]] \
+      && (( SECONDS - review_cache_times[$pnum] < 300 )); then
+      required_checks="${review_cache_checks[$pnum]}"
+    elif required_checks="$(review_e2e_checks "$pnum" "$psha")"; then
+      # PR 更新立即失效，定期重读以发现单独编辑过的评审评论。
+      review_cache_keys[$pnum]="$cache_key"
+      review_cache_times[$pnum]="$SECONDS"
+      review_cache_checks[$pnum]="$required_checks"
+    else
+      printf '[%s] 警告：无法读取 PR #%s（%s）的评审验收交接，将在后续轮询重试。\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pnum" "${psha:0:10}" >&2
+      continue
+    fi
+    verification_key="$psha"
+    checks_hash=""
+    if [[ "$required_checks" != "[]" ]]; then
+      checks_hash="$(printf '%s' "$required_checks" | "$SHA256SUM_BIN")"
+      checks_hash="${checks_hash%% *}"
+      verification_key+=":${checks_hash}"
+    fi
     sha_file="${E2E_ROOT}/pr-${pnum}/verified_shas.txt"
-    if [[ -n "$psha" && -f "$sha_file" ]] && "$GREP_BIN" -qx "$psha" "$sha_file"; then
+    last_verification_key=""
+    if [[ -n "$psha" && -f "$sha_file" ]]; then
+      while IFS= read -r recorded_key; do
+        if [[ "${recorded_key%%:*}" == "$psha" ]]; then
+          last_verification_key="$recorded_key"
+        fi
+      done < "$sha_file"
+    fi
+    if [[ -n "$last_verification_key" && "$verification_key" == "$last_verification_key" ]]; then
       continue
     fi
     next_pr_json="$row"
@@ -621,6 +677,14 @@ EOF
     fi
   fi
 
+  required_checks_section=""
+  if [[ "$required_checks" != "[]" ]]; then
+    required_checks_section=$'\n\n'"## 当前提交的 E2E 必验场景"$'\n'
+    required_checks_section+="$("$JQ_BIN" -r -L "$SCRIPT_DIR" '
+      include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description
+    ' <<<"$required_checks")"
+  fi
+
   printf '[%s] 开始 Codex E2E 验收 PR #%s (Issue #%s, sha=%s, 本周期第 %d/%d 轮, 累计第 %d/%d 轮)...\n' \
     "$("$DATE_BIN" '+%F %T')" "$pr_num" "${issue_num:-?}" "${head_sha:0:10}" "$cycle_round" "$MAX_E2E_ROUNDS" "$current_round" "$MAX_TOTAL_E2E_ROUNDS"
 
@@ -659,7 +723,7 @@ EOF
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}${env_file_section}
+${issue_section}${env_file_section}${required_checks_section}
 
 ## PR Diff 摘录
 \`\`\`diff
@@ -670,12 +734,13 @@ ${pr_diff_snippet:-"(空 diff)"}
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的独立检出（\`${e2e_wt}\`）。**不要预设 E2E 必须在当前本机启动服务**；先阅读目标仓库的规范与验收入口文档（如 \`AGENTS.md\`、\`qa/README.md\`、\`docs/\`、\`README.md\` 等）以及上方外部环境说明，优先直接调用仓库既有或本 PR 已最小扩展好的维护中 QA action/spec；仅在确实无维护入口时才编写外部临时驱动，一次性核齐前置 fixture（如 \`fixture_mysql\`）与核心必测场景，核心场景全部通过后若确需补测个别边界，**只运行独立轻量增量脚本，禁止把已通过的全量流程从头重跑**；向远端或隔离目录同步/解包候选源码时**保持 Git 原始文件权限（勿使用 \`umask 077\`）**，避免容器内非 root 进程无法读取挂载的初始化脚本。
 2. **严禁修改仓库业务代码或提交 commit**，也不要执行 git push 或直接操作 GitHub Issue/PR；你只负责验收与输出客观证据。
 3. 将本次验收产生的关键原始证据（日志、命令输出、报告或截图等，**注意脱敏，勿写入明文密码/Token/私钥**）保存到专用目录 \`${artifacts_dir}\`，外层脚本会自动将其归档推送到独立的远程证据分支 \`${E2E_EVIDENCE_BRANCH}\` 并在 PR/Issue 中关联链接；同时在 \`evidence_paths\` 中列出关键文件路径。验收结束后按仓库规范清理你本次创建的临时资源、测试数据或临时进程，不要在仓库工作区残留脏文件；清理本机或远端临时目录/文件（含 \`trap\` 回调）时**不要使用 \`rm -f\` 或 \`rm -rf\`**（会被 Codex 工具路由器安全策略拦截），请优先调用仓库自带清理入口或改用 Python \`shutil.rmtree\` / \`Path.unlink(missing_ok=True)\` 等安全方式。
-4. **严禁使用字节码反编译或调试器/断点注入手段**：禁止运行 \`javap\` 字节码反编译、挂载 JDWP 调试器（\`-agentlib:jdwp\`）或编写断点注入探针（如 \`ReplayProbe\` / \`jdb\`），此类操作会触发安全风控并导致远端环境泄漏。跨版本断点恢复等细粒度边界由内部单测覆盖；E2E 仅通过标准服务启停、公开接口、数据库状态与真实浏览器 UI 进行验证。
+4. **严禁使用字节码反编译或调试器/断点注入手段**：禁止运行 \`javap\` 字节码反编译、挂载 JDWP 调试器（\`-agentlib:jdwp\`）或编写断点注入探针（如 \`ReplayProbe\` / \`jdb\`），此类操作会触发安全风控并导致远端环境泄漏。使用标准服务启停、公开接口、数据库状态与真实浏览器 UI 实测评审列出的场景，包括使用已有状态的跨版本续读等。
 5. 严格区分三种结论（\`verdict\`）：
    - \`pass\`：按仓库规范在目标验收环境中完成了针对 Issue 核心场景的真实端到端验证且全部通过，证据充分。
    - \`fail\`：目标验收环境正常，但实测暴露了**代码功能缺陷、回归或未满足 Issue 验收标准**；必须在 \`failure_details\` 中给出可复现步骤、实际结果与期望结果。
    - \`blocked\`：**无法完成仓库要求的真实 E2E 验收**（例如目标远端环境/容器/数据库/浏览器/凭证不可用或环境故障），不要把环境问题误判为 \`fail\`，也不要用本机单测或替代方案冒充真实 E2E 通过。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
+   - 每个评审必验场景用一个 \`scenarios\` 条目记录，原样填写 \`id\`（如 \`E1\`），用 \`name\` 和 \`details\` 描述实测。逐项填写相对于 \`${artifacts_dir}\` 的 \`scenarios[].evidence_paths\`，并把这些路径也列在顶层 \`evidence_paths\` 中。其他场景的 \`id\` 留空。所有必验场景通过并留存证据后才输出 \`pass\`。
 EOF
 
   codex_args=(
@@ -795,6 +860,25 @@ EOF
   fi
 
   verdict="$("$JQ_BIN" -r '.verdict' "$result_file")"
+  missing_checks="[]"
+  if [[ "$verdict" == "pass" && "$required_checks" != "[]" ]]; then
+    artifact_files="$("$FIND_BIN" "$artifacts_dir" -type f -size "-$(( MAX_EVIDENCE_FILE_MB * 1024 * 1024 ))c" -printf '%P\0' \
+      | "$JQ_BIN" -Rsc 'split("\u0000") | map(select(length > 0))')"
+    missing_checks="$("$JQ_BIN" -c -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" '
+      include "workflow-e2e";
+      missing_e2e_checks($required; $files)
+    ' "$result_file")"
+    if [[ "$missing_checks" != "[]" ]]; then
+      "$CP_BIN" "$result_file" "${e2e_dir}/codex-output-${run_ts}.json"
+      "$JQ_BIN" --argjson missing "$missing_checks" '
+        .verdict = "blocked"
+        | .summary += "\n\n本轮必验场景缺少通过记录或证据，验收结论转为 blocked。"
+        | .remaining_risks = ((.remaining_risks // []) + ($missing | map(. + " 缺少唯一的通过记录、实测详情或可归档证据。")))
+      ' "$result_file" > "${result_file}.tmp"
+      "$MV_BIN" "${result_file}.tmp" "$result_file"
+      verdict="blocked"
+    fi
+  fi
   final_state=""
   extra_notice=""
 
@@ -804,7 +888,7 @@ EOF
     final_state="e2e-passed"
   elif [[ "$verdict" == "blocked" ]]; then
     final_state="blocked"
-    extra_notice=$'\n\n'"> ⚠️ E2E 验收因环境或外部依赖条件受阻，状态已切为 \`${LABEL_PREFIX}blocked\`；环境就绪后将 PR 标签改回 \`${E2E_TARGET_LABEL}\` 即可重跑 E2E。"
+    extra_notice=$'\n\n'"> ⚠️ E2E 验收受阻，排除报告中的阻塞原因后将 PR 标签改回 \`${E2E_TARGET_LABEL}\` 可重跑 E2E。"
   else
     new_consecutive_failures="$cycle_round"
     if (( cycle_round >= MAX_E2E_ROUNDS )); then
@@ -831,7 +915,7 @@ EOF
   : > "$archived_list_file"
 
   if [[ "$PUBLISH_EVIDENCE" == "1" ]]; then
-    if pub_out="$(publish_e2e_evidence "$pr_num" "$issue_num" "$head_sha" "$run_ts" "$verdict" "$final_state" "$result_file" "$comment_file" "$artifacts_dir" "$archived_list_file")"; then
+    if pub_out="$(publish_e2e_evidence "$pr_num" "$issue_num" "$head_sha" "$run_ts" "$verdict" "$final_state" "$result_file" "$comment_file" "$artifacts_dir" "$archived_list_file" "$checks_hash")"; then
       evidence_sha="${pub_out%%$'\t'*}"
       evidence_rel_dir="${pub_out#*$'\t'}"
       repo_web_base="${pr_url%/pull/*}"
@@ -869,9 +953,9 @@ EOF
     fi
   fi
 
-  # 仅在 pass 或 fail（且非 DRY_RUN）时记录已验证 SHA 与连续失败计数；blocked 环境阻塞时不锁定该 SHA，方便人工修好环境后直接重跑
+  # pass 或 fail 时记录已验证提交、场景与连续失败计数。blocked 可在排除阻塞后重跑。
   if [[ "$DRY_RUN" != "1" && "$verdict" != "blocked" ]]; then
-    printf '%s\n' "$head_sha" >> "$sha_file"
+    printf '%s\n' "$verification_key" >> "$sha_file"
     printf '%d\n' "$new_consecutive_failures" > "$consec_file"
   fi
 

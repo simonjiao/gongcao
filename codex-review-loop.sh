@@ -29,6 +29,8 @@ TOUCH_BIN="$(resolve_bin touch)"
 DATE_BIN="$(resolve_bin date)"
 SLEEP_BIN="$(resolve_bin sleep)"
 CAT_BIN="$(resolve_bin cat)"
+MV_BIN="$(resolve_bin mv)"
+RM_BIN="$(resolve_bin rm)"
 HEAD_BIN="$(resolve_bin head)"
 FIND_BIN="$(resolve_bin find)"
 SORT_BIN="$(resolve_bin sort)"
@@ -172,6 +174,8 @@ write_review_schema() {
     "summary",
     "e2e_decision",
     "e2e_decision_reason",
+    "e2e_checks",
+    "requires_human_decision",
     "requirements_coverage",
     "blocking_issues",
     "non_blocking_notes"
@@ -191,6 +195,11 @@ write_review_schema() {
     "e2e_decision_reason": {
       "type": "string"
     },
+    "e2e_checks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "requires_human_decision": { "type": "boolean" },
     "requirements_coverage": {
       "type": "array",
       "items": {
@@ -209,12 +218,14 @@ write_review_schema() {
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "location", "description", "suggestion"],
+        "required": ["id", "severity", "location", "description", "suggestion", "verification"],
         "properties": {
+          "id": { "type": "string" },
           "severity": { "type": "string", "enum": ["critical", "major"] },
           "location": { "type": "string" },
           "description": { "type": "string" },
-          "suggestion": { "type": "string" }
+          "suggestion": { "type": "string" },
+          "verification": { "type": "string" }
         }
       }
     },
@@ -401,14 +412,13 @@ render_review_markdown() {
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
   local meta_json
-  meta_json="$("$JQ_BIN" -c -n \
+  meta_json="$("$JQ_BIN" -c \
     --arg head_sha "$head_sha" \
-    --arg verdict "$("$JQ_BIN" -r '.verdict' "$verdict_file")" \
     --arg e2e_decision "$eff_e2e_decision" \
     --arg e2e_reused_sha "$e2e_reused_sha" \
-    '{head_sha: $head_sha, verdict: $verdict, e2e_decision: $e2e_decision, e2e_reused_sha: $e2e_reused_sha}')"
+    '{head_sha: $head_sha, verdict, e2e_decision: $e2e_decision, e2e_reused_sha: $e2e_reused_sha, e2e_checks: (.e2e_checks | sort)}' "$verdict_file")"
 
-  "$JQ_BIN" -r \
+  "$JQ_BIN" -r -L "$SCRIPT_DIR" \
     --arg pr "$pr_num" \
     --arg issue "${issue_num:-(未关联)}" \
     --arg sha "${head_sha:0:10}" \
@@ -423,6 +433,7 @@ render_review_markdown() {
     --arg model "${CODEX_MODEL:-(codex 默认)}${eff_effort:+ (${eff_effort})}" \
     --arg now "$now_ts" \
     '
+    include "workflow-e2e";
     def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
     "### Codex 独立评审报告\n\n"
     + "| 字段 | 值 |\n| --- | --- |\n"
@@ -447,9 +458,16 @@ render_review_markdown() {
       end)
     + "\n\n#### 阻塞问题（Blocking Issues）\n"
     + (if (.blocking_issues | length) > 0 then
-        ([.blocking_issues[] | "- **[" + .severity + "]** `" + .location + "`：" + .description + "\n  - 建议：" + .suggestion] | join("\n"))
+        ([.blocking_issues[] | "- **[" + .severity + "]** `" + .id + "` · `" + .location + "`\n  " + .description
+          + "\n  - 修复建议。" + .suggestion + "\n  - 关闭条件。" + .verification] | join("\n"))
       else
         "- 无阻塞问题"
+      end)
+    + (if .e2e_checks | length > 0 then
+        "\n\n#### E2E 必验场景\n"
+        + (.e2e_checks | sort | numbered_e2e_checks | map("- " + .id + " " + .description) | join("\n"))
+      else
+        ""
       end)
     + "\n\n#### 非阻塞建议（Non-blocking Notes）\n"
     + (if (.non_blocking_notes | length) > 0 then
@@ -457,8 +475,83 @@ render_review_markdown() {
       else
         "- 无"
       end)
-    + "\n\n<!-- codex-review-meta:" + $meta_json + " -->"
+    + "\n\n<!-- codex-review-meta:" + ($meta_json | gsub("<"; "\\u003c") | gsub(">"; "\\u003e")) + " -->"
     ' "$verdict_file"
+}
+
+publish_review() {
+  local pending_file="$1" review_dir="${1%/*}"
+  local pr_num issue_num final_state review_key round cycle_round verdict elapsed end_ts history_file history_json
+  pr_num="$("$JQ_BIN" -r '.meta.pr_number' "$pending_file")" || return 1
+  issue_num="$("$JQ_BIN" -r '.meta.issue_number' "$pending_file")" || return 1
+  final_state="$("$JQ_BIN" -r '.meta.final_state' "$pending_file")" || return 1
+  review_key="$("$JQ_BIN" -r '.review_key' "$pending_file")" || return 1
+
+  if ! "$JQ_BIN" -e '.pr_comment_written' "$pending_file" >/dev/null; then
+    "$JQ_BIN" -r '.comment' "$pending_file" | gh_state comment pr "$pr_num" - "$REVIEW_COMMENT_MARKER" || return 1
+    "$JQ_BIN" '.pr_comment_written = true' "$pending_file" > "${pending_file}.tmp" || return 1
+    "$MV_BIN" "${pending_file}.tmp" "$pending_file" || return 1
+  fi
+
+  # PR 标签切换后，下个循环就能接手。先保存本轮记录，使标签重试或进程重启不增加轮次。
+  if [[ "$DRY_RUN" != "1" ]]; then
+    if ! "$GREP_BIN" -Fqx -- "$review_key" "${review_dir}/reviewed_shas.txt"; then
+      history_file="${review_dir}/blocker-history.json"
+      history_json='{}'
+      if [[ -f "$history_file" ]]; then
+        history_json="$(<"$history_file")" || return 1
+      fi
+      "$JQ_BIN" --arg key "$review_key" --slurpfile pending "$pending_file" '
+        reduce $pending[0].review.blocking_issues[] as $blocker (.;
+          .[$blocker.id] |= {
+            description: $blocker.description,
+            location: $blocker.location,
+            verification: $blocker.verification,
+            review_keys: ((.review_keys // []) + [$key] | unique)
+          })
+      ' <<<"$history_json" > "${history_file}.tmp" || return 1
+      "$MV_BIN" "${history_file}.tmp" "$history_file" || return 1
+      "$JQ_BIN" '.review' "$pending_file" > "${review_dir}/last_verdict.json" || return 1
+      "$JQ_BIN" -r '.meta.consecutive_rejections' "$pending_file" > "${review_dir}/consecutive_rejections.txt" || return 1
+      "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
+      printf '%s\n' "$review_key" >> "${review_dir}/reviewed_shas.txt" || return 1
+    fi
+  else
+    "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
+  fi
+
+  gh_state set-state pr "$pr_num" "$final_state" || return 1
+
+  # 开发循环按 Issue 标签接手，关联 Issue 仍在 PR 交接后同步。
+  if [[ -n "$issue_num" ]] && [[ "$final_state" != "changes-requested" || "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
+    "$JQ_BIN" -r '.comment' "$pending_file" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" \
+      && gh_state set-state issue "$issue_num" "$final_state" || true
+  fi
+
+  round="$("$JQ_BIN" -r '.meta.round' "$pending_file")" || return 1
+  cycle_round="$("$JQ_BIN" -r '.meta.cycle_round' "$pending_file")" || return 1
+  verdict="$("$JQ_BIN" -r '.meta.verdict' "$pending_file")" || return 1
+  elapsed="$("$JQ_BIN" -r '.elapsed' "$pending_file")" || return 1
+  "$RM_BIN" -- "$pending_file" || return 1
+  end_ts="$("$DATE_BIN" '+%F %T')"
+  printf '\n============================================================\n'
+  printf '[%s] [DONE] PR #%s Codex 评审完成 (本周期第 %d/%d 轮, 累计第 %d/%d 轮, 耗时 %ds)\n' \
+    "$end_ts" "$pr_num" "$cycle_round" "$MAX_REVIEW_ROUNDS" "$round" "$MAX_TOTAL_REVIEW_ROUNDS" "$elapsed"
+  printf '  评审结论 : %s -> %s%s\n' "$verdict" "$LABEL_PREFIX" "$final_state"
+  printf '  评审报告 : %s\n' "${review_dir}/review-comment.md"
+  printf '============================================================\n\n'
+  printf '[%s] [codex-review] PR #%s (Issue #%s, r%d) -> %s (%s%s, %ds)\n' \
+    "$end_ts" "$pr_num" "${issue_num:-?}" "$round" "$verdict" "$LABEL_PREFIX" "$final_state" "$elapsed" >> "$ACTIVITY_LOG"
+}
+
+retry_review_handoff() {
+  if publish_review "$1"; then
+    "$SLEEP_BIN" 5
+  else
+    printf '[%s] 警告：PR #%s 评审交接失败，%ss 后重试已保存的报告。\n' \
+      "$("$DATE_BIN" '+%F %T')" "$pr_num" "$POLL_INTERVAL" >&2
+    "$SLEEP_BIN" "$POLL_INTERVAL"
+  fi
 }
 
 consecutive_poll_errors=0
@@ -493,7 +586,13 @@ while true; do
     pkey=""
     [[ -n "$psha" ]] && pkey="$(compute_review_key "$psha" "$pbody")"
     sha_file="${REVIEWS_ROOT}/pr-${pnum}/reviewed_shas.txt"
-    if [[ -n "$pkey" && -f "$sha_file" ]] && "$GREP_BIN" -qx "$pkey" "$sha_file"; then
+    pending_file="${sha_file%/*}/pending-review.json"
+    if [[ "$DRY_RUN" != "1" && -f "$pending_file" ]] \
+      && "$JQ_BIN" -e --arg key "$pkey" '.review_key == $key' "$pending_file" >/dev/null; then
+      next_pr_json="$row"
+      break
+    fi
+    if [[ -n "$pkey" && -f "$sha_file" ]] && "$GREP_BIN" -Fqx -- "$pkey" "$sha_file"; then
       continue
     fi
     next_pr_json="$row"
@@ -550,6 +649,15 @@ EOF
   "$MKDIR_BIN" -p "$review_dir"
   sha_file="${review_dir}/reviewed_shas.txt"
   "$TOUCH_BIN" "$sha_file"
+  review_key="$(compute_review_key "$head_sha" "$pr_body")"
+  pending_file="${review_dir}/pending-review.json"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    pending_file="${review_dir}/pending-review-dry-run.json"
+  elif [[ -f "$pending_file" ]] \
+    && "$JQ_BIN" -e --arg key "$review_key" '.review_key == $key' "$pending_file" >/dev/null; then
+    retry_review_handoff "$pending_file"
+    continue
+  fi
 
   prev_rounds=0
   prev_reviewed_sha=""
@@ -589,7 +697,6 @@ EOF
   events_file="${review_dir}/events-${run_ts}.jsonl"
   verdict_file="${review_dir}/verdict-${run_ts}.json"
   comment_file="${review_dir}/review-comment.md"
-  meta_file="${review_dir}/meta.json"
   write_review_schema "$schema_file"
 
   # 查找关联 Issue 原文
@@ -648,7 +755,20 @@ EOF
 
   # 若为第 2 轮及以上复审，自动带入上一轮的阻塞问题清单与本轮增量 diff 以约束复审收敛
   prev_review_section=""
+  blocker_history='{}'
+  blocker_history_section=""
   rereview_delta_section=""
+  if [[ -f "${review_dir}/blocker-history.json" ]]; then
+    blocker_history="$(<"${review_dir}/blocker-history.json")"
+    if [[ "$blocker_history" != '{}' ]]; then
+      blocker_history_section=$'\n\n'"## 本 PR 历次评审的阻塞根因"$'\n'
+      blocker_history_section+="$("$JQ_BIN" -r '
+        to_entries[] | "- " + .key + "（已出现 " + (.value.review_keys | length | tostring)
+          + " 轮） · " + .value.location + "：" + .value.description
+          + "\n  - 关闭条件。" + .value.verification
+      ' <<<"$blocker_history")"
+    fi
+  fi
   if (( current_round >= 2 )); then
     if (( cycle_round >= 2 )); then
       prev_verdict_file="${review_dir}/last_verdict.json"
@@ -661,7 +781,8 @@ EOF
       if [[ -n "$prev_verdict_file" && -s "$prev_verdict_file" ]]; then
         prev_blocking="$("$JQ_BIN" -r '
           if (.blocking_issues | length) > 0 then
-            [.blocking_issues[] | "- [" + .severity + "] `" + .location + "`：" + .description + "（原建议：" + .suggestion + "）"] | join("\n")
+            [.blocking_issues[] | "- " + (.id // "未编号") + " · [" + .severity + "] `" + .location + "`\n  " + .description
+              + "\n  - 修复建议。" + .suggestion + (if .verification then "\n  - 关闭条件。" + .verification else "" end)] | join("\n")
           else
             "- (上一轮无阻塞项)"
           end
@@ -702,7 +823,7 @@ EOF
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}${prev_review_section}${rereview_delta_section}
+${issue_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
 
 ## 既有 E2E 验收状态与免测判断依据
 - 是否存在通过的远端 QA 证据（\`${E2E_EVIDENCE_BRANCH}\`）: \`${prior_e2e_has_pass}\`
@@ -727,6 +848,8 @@ ${pr_diff_snippet:-"(空 diff)"}
 ## 评审准则（务必遵守）
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的只读检出，请按需阅读完整源文件、调用点与相关单元测试以核实证据，不要轻信 PR 描述中的自我声明。你当前运行在离线 \`read-only\` 沙箱中，网络与 \`gh\` CLI 访问已被有意禁用；所有 GitHub PR/Issue/E2E 快照已由宿主机脚本通过 \`gh-state.sh\` 注入本提示词，**禁止在沙箱内执行 \`gh\` 命令**，也不要在 \`non_blocking_notes\` 中抱怨或记录沙箱禁止 \`gh\` 访问。
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
+   - 若改动扩展了兼容行为或改变共享模块、持久化数据、状态机等现有契约，请核对 Issue 中的具体要求或已有授权。将当前 PR 引入的未授权扩展列为阻塞项，指出需要收回的改动或待确认的范围。
+   - 修复建议也须遵守相同的授权范围。发现读取或展示口径不一致时，优先建议在读取或展示层处理，并核查是否能保留现有写入、摘要和重放行为。证据无法确认根因时注明证据缺口。若满足 Issue 必须变更持久化或共享契约且缺少授权，输出 \`request_changes\`，将 \`requires_human_decision\` 设为 \`true\`，并在修复建议中写明待授权的契约和影响。其余情况该字段为 \`false\`。
 3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**。
 3.1 **E2E 路由裁定（\`e2e_decision\` 与 \`e2e_decision_reason\`）**（当 \`verdict == "request_changes"\` 时固定输出 \`run_e2e\`；当 \`verdict == "approve"\` 且开启 \`ALLOW_SKIP_E2E=1\` 时决定是否跳过 E2E 直达终审）：
    - \`run_e2e\`（默认保守选项）：涉及运行时代码/接口/数据库/前端交互/运行配置改动，且尚未针对当前运行时行为完成 E2E 验收（或上次 E2E 通过后的新改动影响了运行时行为）。
@@ -741,8 +864,10 @@ ${pr_diff_snippet:-"(空 diff)"}
 5. **复审硬性收敛门禁（第 2 轮及以上，务必严格执行）**：
    - **限定复审范围**：第 2 轮及以后复审只核验两件事：① 上一轮列出的阻塞问题是否已实质修复；② 本轮增量变更是否引入新的运行崩溃、明显逻辑错误或对原始 Issue 核心验收标准的回归。
    - **严禁“防御套娃”与移动球门**：当上一轮阻塞项已实质关闭、且原始 Issue 核心验收标准已满足时，**禁止针对开发按上一轮意见新增的降级/错误/防御代码继续深挖二阶、三阶极端边界并追加新的 \`blocking_issues\`**。此类有价值的次生发现一律写入 \`non_blocking_notes\`（终审合入时可自动建后续追踪 Issue）并给出 \`verdict: "approve"\`，让 PR 进入真实 E2E 验收。
-   - **终轮务实放行**：若已处于最后一轮自动复审（\`cycle_round >= MAX_REVIEW_ROUNDS\` 或 \`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`），只要原始 Issue 核心验收已满足且无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E，避免无意义的 \`blocked\`。
+   - **终轮务实放行**：若已处于最后一轮自动复审（\`cycle_round >= MAX_REVIEW_ROUNDS\` 或 \`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`），且 Issue 核心验收已满足、契约授权已确认、无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
+   - 按根因归并阻塞项，填写唯一且稳定的 \`id\`（小写字母、数字和连字符），并用 \`verification\` 写出覆盖该根因的可验证关闭条件。先与本 PR 历次评审的根因对照。同一根因跨评审周期沿用原 ID，新出现的类型、测试输入、调用方或文件位置作为该项的证据。
+   - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件、操作和预期结果。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时填写空数组。
 EOF
 
   round_effort="$CODEX_REASONING_EFFORT"
@@ -770,7 +895,16 @@ EOF
   codex_ok=0
   codex_rc=0
   if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
-    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e '.verdict == "approve" or .verdict == "request_changes"' "$verdict_file" >/dev/null 2>&1; then
+    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" '
+      include "workflow-e2e";
+      (.blocking_issues | type == "array")
+      and (.e2e_checks | valid_e2e_checks)
+      and (.requires_human_decision | type == "boolean")
+      and ([.blocking_issues[].id] | all(type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and length == (unique | length))
+      and (.blocking_issues | all(.verification | nonblank))
+      and ((.verdict == "approve" and (.requires_human_decision | not) and (.blocking_issues | length == 0))
+        or (.verdict == "request_changes" and (.blocking_issues | length > 0) and (.e2e_checks | length == 0)))
+    ' "$verdict_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
   else
@@ -792,18 +926,23 @@ EOF
   verdict="$("$JQ_BIN" -r '.verdict' "$verdict_file")"
   raw_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // "run_e2e"' "$verdict_file")"
   e2e_decision_reason="$("$JQ_BIN" -r '.e2e_decision_reason // ""' "$verdict_file")"
-  "$CAT_BIN" "$verdict_file" > "${review_dir}/last_verdict.json"
   final_pr_state=""
   extra_notice=""
   effective_e2e_decision="run_e2e"
   e2e_reused_sha=""
   e2e_downgrade_note=""
+  repeat_blockers="$("$JQ_BIN" -r --argjson history "$blocker_history" '
+    [.blocking_issues[].id | select(. as $id | ($history[$id].review_keys // [] | length) >= 2)] | join(", ")
+  ' "$verdict_file")"
 
   new_consecutive_rejections=0
   if [[ "$verdict" == "approve" ]]; then
     new_consecutive_rejections=0
     effective_e2e_decision="$raw_e2e_decision"
-    if [[ "$ALLOW_SKIP_E2E" != "1" ]]; then
+    if "$JQ_BIN" -e '.e2e_checks | length > 0' "$verdict_file" >/dev/null; then
+      effective_e2e_decision="run_e2e"
+      e2e_downgrade_note="（本轮评审列出必验场景）"
+    elif [[ "$ALLOW_SKIP_E2E" != "1" ]]; then
       effective_e2e_decision="run_e2e"
     elif [[ "$effective_e2e_decision" == "skip_already_passed" ]]; then
       if [[ "$prior_e2e_has_pass" == "true" && "$prior_e2e_is_ancestor" == "true" && -n "$prior_e2e_sha" ]]; then
@@ -821,7 +960,13 @@ EOF
     fi
   else
     new_consecutive_rejections="$cycle_round"
-    if (( cycle_round >= MAX_REVIEW_ROUNDS )); then
+    if "$JQ_BIN" -e '.requires_human_decision' "$verdict_file" >/dev/null; then
+      final_pr_state="blocked"
+      extra_notice=$'\n\n'"> 本轮有变更现有契约的事项待人工授权。暂停自动返工。"
+    elif [[ -n "$repeat_blockers" ]]; then
+      final_pr_state="blocked"
+      extra_notice=$'\n\n'"> 同一阻塞根因已在本 PR 的至少三轮评审中出现（${repeat_blockers}）。暂停自动返工，等待确认范围、修法或关闭条件。"
+    elif (( cycle_round >= MAX_REVIEW_ROUNDS )); then
       final_pr_state="blocked"
       extra_notice=$'\n\n'"> ⚠️ 已达到最大连续评审打回轮次（连续 ${cycle_round} / ${MAX_REVIEW_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_REVIEW_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入裁决。"
     elif (( current_round >= MAX_TOTAL_REVIEW_ROUNDS )); then
@@ -835,33 +980,12 @@ EOF
   review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort" "$cycle_round")${extra_notice}"
   printf '%s\n' "$review_md" > "$comment_file"
 
-  # 写回 PR 评审评论与状态
-  printf '%s\n' "$review_md" | gh_state comment pr "$pr_num" - "$REVIEW_COMMENT_MARKER" || true
-  gh_state set-state pr "$pr_num" "$final_pr_state" || true
-
-  # 同步关联 Issue 状态（先写评论再切标签，避免开发循环在评论写入前就拉取到 changes-requested）
-  if [[ -n "$issue_num" ]]; then
-    if [[ "$final_pr_state" == "approved" || "$final_pr_state" == "e2e-skipped" ]]; then
-      printf '%s\n' "$review_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
-      gh_state set-state issue "$issue_num" "$final_pr_state" || true
-    elif [[ "$final_pr_state" == "blocked" ]]; then
-      printf '%s\n' "$review_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
-      gh_state set-state issue "$issue_num" blocked || true
-    elif [[ "$final_pr_state" == "changes-requested" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
-      printf '%s\n' "$review_md" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || true
-      gh_state set-state issue "$issue_num" changes-requested || true
-    fi
-  fi
-
-  # 记录已评审的 (head_sha, body_hash) 与连续打回计数（DRY_RUN=0 时记录，防止同内容重复评审）
-  review_key="$(compute_review_key "$head_sha" "$pr_body")"
-  if [[ "$DRY_RUN" != "1" ]]; then
-    printf '%s\n' "$review_key" >> "$sha_file"
-    printf '%d\n' "$new_consecutive_rejections" > "$consec_file"
-  fi
-
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
   "$JQ_BIN" -n \
+    --arg review_key "$review_key" \
+    --rawfile comment "$comment_file" \
+    --slurpfile review "$verdict_file" \
+    --argjson elapsed "$((SECONDS - task_start_sec))" \
     --argjson pr_number "$pr_num" \
     --arg issue_number "$issue_num" \
     --arg pr_url "$pr_url" \
@@ -881,37 +1005,32 @@ EOF
     --arg final_state "$final_pr_state" \
     --arg updated_at "$iso_now" \
     '{
-      pr_number: $pr_number,
-      issue_number: $issue_number,
-      pr_url: $pr_url,
-      head_branch: $head_branch,
-      base_branch: $base_branch,
-      head_sha: $head_sha,
-      model: $model,
-      reasoning_effort: $reasoning_effort,
-      round: $round,
-      cycle_round: $cycle_round,
-      consecutive_rejections: $consecutive_rejections,
-      max_total_rounds: $max_total_rounds,
-      verdict: $verdict,
-      e2e_decision: $e2e_decision,
-      e2e_decision_reason: $e2e_decision_reason,
-      e2e_reused_sha: $e2e_reused_sha,
-      final_state: $final_state,
-      updated_at: $updated_at
-    }' > "$meta_file"
-
-  total_elapsed=$((SECONDS - task_start_sec))
-  end_ts="$("$DATE_BIN" '+%F %T')"
-  printf '\n============================================================\n'
-  printf '[%s] [DONE] PR #%s Codex 评审完成 (本周期第 %d/%d 轮, 累计第 %d/%d 轮, 耗时 %ds)\n' \
-    "$end_ts" "$pr_num" "$cycle_round" "$MAX_REVIEW_ROUNDS" "$current_round" "$MAX_TOTAL_REVIEW_ROUNDS" "$total_elapsed"
-  printf '  评审结论 : %s -> %s%s\n' "$verdict" "$LABEL_PREFIX" "$final_pr_state"
-  printf '  关联Issue: #%s | Commit: %s\n' "${issue_num:-?}" "${head_sha:0:10}"
-  printf '  评审报告 : %s\n' "$comment_file"
-  printf '============================================================\n\n'
-  printf '[%s] [codex-review] PR #%s (Issue #%s, r%d) -> %s (%s%s, %ds)\n' \
-    "$end_ts" "$pr_num" "${issue_num:-?}" "$current_round" "$verdict" "$LABEL_PREFIX" "$final_pr_state" "$total_elapsed" >> "$ACTIVITY_LOG"
-
-  "$SLEEP_BIN" 5
+      review_key: $review_key,
+      comment: $comment,
+      review: $review[0],
+      elapsed: $elapsed,
+      pr_comment_written: false,
+      meta: {
+        pr_number: $pr_number,
+        issue_number: $issue_number,
+        pr_url: $pr_url,
+        head_branch: $head_branch,
+        base_branch: $base_branch,
+        head_sha: $head_sha,
+        model: $model,
+        reasoning_effort: $reasoning_effort,
+        round: $round,
+        cycle_round: $cycle_round,
+        consecutive_rejections: $consecutive_rejections,
+        max_total_rounds: $max_total_rounds,
+        verdict: $verdict,
+        e2e_decision: $e2e_decision,
+        e2e_decision_reason: $e2e_decision_reason,
+        e2e_reused_sha: $e2e_reused_sha,
+        final_state: $final_state,
+        updated_at: $updated_at
+      }
+    }' > "${pending_file}.tmp"
+  "$MV_BIN" "${pending_file}.tmp" "$pending_file"
+  retry_review_handoff "$pending_file"
 done
