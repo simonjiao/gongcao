@@ -38,15 +38,17 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   ./start-gongcao.sh simonjiao/airdb stop     # 停止整个 tmux 会话
 
 可选透传环境变量:
-  GONGCAO_HOME  默认 ~/.gongcao
-  DRY_RUN       默认 0（设为 1 可全链路演练）
-  POLL_INTERVAL 默认 60
-  BASE_BRANCH   可选基准分支
-  DEV_ENGINE    开发执行器 agy 或 codex，默认 agy
+  GONGCAO_HOME       默认 ~/.gongcao
+  CODEX_REVIEW_HOME  评审/E2E/终审专用 Codex 目录，默认 ~/.gongcao/codex-review
+  DRY_RUN            默认 0（设为 1 可全链路演练）
+  POLL_INTERVAL      默认 60
+  BASE_BRANCH        可选基准分支
+  DEV_ENGINE         开发执行器 agy 或 codex，默认 agy
 
-首次启动前，请运行所选开发执行器的登录入口:
-  ./agy-issue-loop.sh login
-  ./codex-issue-loop.sh login
+首次启动前，请分别初始化开发与评审专用目录（不共用个人默认 ~/.codex）:
+  ./agy-issue-loop.sh login      # 使用 agy 开发时
+  ./codex-issue-loop.sh login    # 使用 Codex 开发时（~/.gongcao/codex）
+  ./codex-review-loop.sh login   # 评审/E2E/终审共用（~/.gongcao/codex-review）
 
 使用 Codex 处理 Issue:
   DEV_ENGINE=codex ./start-gongcao.sh simonjiao/airdb
@@ -115,12 +117,20 @@ case "$ACTION" in
       exit 1
     fi
 
+    codex_review_home="${CODEX_REVIEW_HOME:-${GONGCAO_HOME}/codex-review}"
+    if [[ ! -d "$codex_review_home" ]]; then
+      printf '错误：请先运行 %q login 初始化评审/E2E/终审专用 Codex 目录 %s（避免使用个人默认 ~/.codex）。\n' \
+        "${SCRIPT_DIR}/codex-review-loop.sh" "$codex_review_home" >&2
+      exit 1
+    fi
+
     "$MKDIR_BIN" -p "$STATE_ROOT"
     "$TOUCH_BIN" "$ACTIVITY_LOG"
 
     # 拼装共享环境前缀
     env_prefix="REPO=$(printf '%q' "$REPO_ARG") GONGCAO_HOME=$(printf '%q' "$GONGCAO_HOME") DRY_RUN=$(printf '%q' "$DRY_RUN") POLL_INTERVAL=$(printf '%q' "$POLL_INTERVAL")"
     [[ -n "$BASE_BRANCH" ]] && env_prefix+=" BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")"
+    [[ -n "${CODEX_REVIEW_HOME:-}" ]] && env_prefix+=" CODEX_REVIEW_HOME=$(printf '%q' "$CODEX_REVIEW_HOME")"
 
     # 窗口 0：dev
     dev_env_prefix="$env_prefix"

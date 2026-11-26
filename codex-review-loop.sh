@@ -43,6 +43,10 @@ GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
 REPOS_ROOT="${REPOS_ROOT:-${GONGCAO_HOME}/repos}"
 STATE_BASE="${STATE_BASE:-${GONGCAO_HOME}/state}"
 
+# shellcheck source=lib/codex-profile.sh
+source "${SCRIPT_DIR}/lib/codex-profile.sh"
+init_codex_review_profile "codex-review-loop.sh" "${1:-run}"
+
 REPO="${REPO:-}"                         # 目标 GitHub 仓库 "owner/repo"
 REPO_NAME="${REPO_NAME:-}"               # 可选：~/.gongcao/repos/<REPO_NAME>
 REPO_DIR="${REPO_DIR:-}"                 # 可选：显式本地仓库路径
@@ -128,6 +132,7 @@ gh_state() {
 printf '[%s] 启动 codex-review-loop\n' "$("$DATE_BIN" '+%F %T')"
 printf '  Codex 命令 : %s (model=%s, effort=%s, rereview_effort=%s, sandbox=%s)\n' \
   "$CODEX_BIN" "${CODEX_MODEL:-(codex 默认)}" "${CODEX_REASONING_EFFORT:-(默认)}" "${CODEX_REREVIEW_REASONING_EFFORT:-(同默认)}" "$CODEX_SANDBOX"
+printf '  Codex 配置 : %s\n' "$CODEX_PROFILE_DIR"
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  评审档案根 : %s\n' "$REVIEWS_ROOT"
@@ -922,7 +927,7 @@ EOF
 
   codex_ok=0
   codex_rc=0
-  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$CODEX_BIN" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
+  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
     if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" '
       include "workflow-e2e";
       (.blocking_issues | type == "array")

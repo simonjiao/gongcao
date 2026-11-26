@@ -930,6 +930,11 @@ while true; do
   branch="$(resolve_existing_issue_branch "$number" "$session_dir" "$wt_dir_expected")"
   if [[ -z "$branch" ]]; then
     branch="_gongcao-wip/work-${run_ts}"
+    _wip_suffix=1
+    while "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; do
+      _wip_suffix=$((_wip_suffix + 1))
+      branch="_gongcao-wip/work-${run_ts}-${_wip_suffix}"
+    done
   fi
 
   prompt_file="${session_dir}/prompt.md"

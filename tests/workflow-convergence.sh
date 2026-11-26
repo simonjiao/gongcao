@@ -4,8 +4,9 @@ set -euo pipefail
 repo_dir="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf -- "$fixture"' EXIT
-mkdir -p "$fixture/bin" "$fixture/workflow"
+mkdir -p "$fixture/bin" "$fixture/workflow/lib" "$fixture/home/codex-review"
 cp "$repo_dir"/*.sh "$fixture/workflow/"
+cp "$repo_dir"/lib/*.sh "$fixture/workflow/lib/"
 for module in "$repo_dir"/*.jq; do
   [[ -f "$module" ]] && cp "$module" "$fixture/workflow/"
 done
@@ -90,6 +91,11 @@ EOF
 cat > "$fixture/bin/codex" <<'EOF'
 #!/usr/bin/bash
 set -euo pipefail
+expected_home="$(cd -- "$GONGCAO_HOME/codex-review" && pwd -P)"
+if [[ "${CODEX_HOME:-}" != "$expected_home" ]]; then
+  printf 'Unexpected CODEX_HOME=%q (expected %q)\n' "${CODEX_HOME:-}" "$expected_home" >&2
+  exit 97
+fi
 while [[ "$1" != "-o" ]]; do shift; done
 cat > "$MOCK_DIR/last-prompt"
 case "$2" in
@@ -313,5 +319,11 @@ assert_calls 3 'set-state pr 7 ready-to-merge'
 # 再次轮询同一冲突消解提交应被跳过，不再重复调用 codex-final
 AUTO_MERGE=0 FINAL_ROOT="$fixture/final-conflict" run_loop final-gate
 assert_calls "$((before_final + 1))" codex-final
+
+# 4. 未初始化评审专用 Codex 目录时必须显式报错，绝不静默回退个人默认 ~/.codex
+if CODEX_REVIEW_HOME="$fixture/missing-codex-review" timeout 10s bash "$fixture/workflow/codex-review-loop.sh" > "$fixture/missing-home.log" 2>&1; then
+  fail '未初始化 codex-review 目录时不应静默启动'
+fi
+grep -Fq 'codex-review-loop.sh login' "$fixture/missing-home.log" || fail '缺少 codex-review 初始化提示'
 
 printf 'workflow convergence tests passed\n'
