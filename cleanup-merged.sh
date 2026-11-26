@@ -43,6 +43,8 @@ LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-agy/issue-}"
 PR_LIMIT="${PR_LIMIT:-30}"
 POLL_INTERVAL="${POLL_INTERVAL:-300}"
+AUTO_EVALUATE_ON_MERGE="${AUTO_EVALUATE_ON_MERGE:-0}" # 1=每次 PR 合入收尾后自动触发 evaluate-workflow.sh
+AUTO_EVALUATE_MODE="${AUTO_EVALUATE_MODE:-metrics}"   # metrics=仅刷新离线指标报告 | full=执行完整 Codex 评估
 DRY_RUN="${DRY_RUN:-0}"
 ONCE=0
 
@@ -251,6 +253,13 @@ run_cleanup_pass() {
       "$now_ts" "$pr_num" "${issue_num:-?}" "$LABEL_PREFIX" "${removed_items:-none}" >> "$ACTIVITY_LOG"
     cleaned_count=$((cleaned_count + 1))
   done < <("$JQ_BIN" -c '.[]' <<<"$prs_json")
+
+  if (( cleaned_count > 0 )) && [[ "$AUTO_EVALUATE_ON_MERGE" == "1" && "$DRY_RUN" != "1" && -x "${SCRIPT_DIR}/evaluate-workflow.sh" ]]; then
+    local -a eval_args=(--state-dir "$STATE_ROOT")
+    [[ "$AUTO_EVALUATE_MODE" != "full" ]] && eval_args+=(--metrics-only)
+    REPO="$REPO" GONGCAO_HOME="$GONGCAO_HOME" "${SCRIPT_DIR}/evaluate-workflow.sh" "${eval_args[@]}" >&2 || \
+      printf '[%s] 警告：合入收尾后自动评估失败（已忽略，不影响清理）\n' "$("$DATE_BIN" '+%F %T')" >&2
+  fi
 
   return 0
 }

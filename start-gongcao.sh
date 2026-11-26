@@ -131,6 +131,8 @@ case "$ACTION" in
     env_prefix="REPO=$(printf '%q' "$REPO_ARG") GONGCAO_HOME=$(printf '%q' "$GONGCAO_HOME") DRY_RUN=$(printf '%q' "$DRY_RUN") POLL_INTERVAL=$(printf '%q' "$POLL_INTERVAL")"
     [[ -n "$BASE_BRANCH" ]] && env_prefix+=" BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")"
     [[ -n "${CODEX_REVIEW_HOME:-}" ]] && env_prefix+=" CODEX_REVIEW_HOME=$(printf '%q' "$CODEX_REVIEW_HOME")"
+    [[ -n "${AUTO_EVALUATE_ON_MERGE:-}" ]] && env_prefix+=" AUTO_EVALUATE_ON_MERGE=$(printf '%q' "$AUTO_EVALUATE_ON_MERGE")"
+    [[ -n "${AUTO_EVALUATE_MODE:-}" ]] && env_prefix+=" AUTO_EVALUATE_MODE=$(printf '%q' "$AUTO_EVALUATE_MODE")"
 
     # 窗口 0：dev
     dev_env_prefix="$env_prefix"
