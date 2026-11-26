@@ -37,6 +37,7 @@ SORT_BIN="$(resolve_bin sort)"
 COMM_BIN="$(resolve_bin comm)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
+SHA256SUM_BIN="$(resolve_bin sha256sum)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -859,6 +860,13 @@ render_final_gate_markdown() {
     ' "$decision_file"
 }
 
+read_review_handoff() {
+  "$JQ_BIN" -eRsc -L "$SCRIPT_DIR" --arg sha "$1" --arg parent "${2:-}" '
+    include "workflow-e2e";
+    review_metadata | .e2e_checks = approved_e2e_checks($sha; $parent)
+  '
+}
+
 consecutive_poll_errors=0
 idle_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
@@ -902,14 +910,34 @@ while true; do
   fi
   consecutive_poll_errors=0
 
-  # 按 PR 编号升序（FIFO）找出第一条最新 head_sha 尚未终审过的 PR
+  # 按 PR 编号选取尚未针对当前提交和必验场景终审的 PR。
   next_pr_json=""
   while IFS= read -r row; do
     pnum="$("$JQ_BIN" -r '.number' <<<"$row")"
     psha="$("$JQ_BIN" -r '.headRefOid // empty' <<<"$row")"
     sha_file="${FINAL_ROOT}/pr-${pnum}/checked_shas.txt"
-    if [[ -n "$psha" && -f "$sha_file" ]] && "$GREP_BIN" -qx "$psha" "$sha_file"; then
-      continue
+    last_checked_key=""
+    review_comment_loaded=0
+    if [[ -n "$psha" && -f "$sha_file" ]]; then
+      while IFS= read -r recorded_key; do
+        if [[ "${recorded_key%%:*}" == "$psha" ]]; then
+          last_checked_key="$recorded_key"
+        fi
+      done < "$sha_file"
+    fi
+    if [[ -n "$last_checked_key" ]] && prev_review_comment="$(gh_state get-comment pr "$pnum" "$REVIEW_COMMENT_MARKER")"; then
+      review_comment_loaded=1
+      if handoff="$(read_review_handoff "$psha" <<<"$prev_review_comment" 2>/dev/null)"; then
+        checks="$("$JQ_BIN" -c '.e2e_checks' <<<"$handoff")"
+        checked_key="$psha"
+        if [[ "$checks" != "[]" ]]; then
+          digest="$(printf '%s' "$checks" | "$SHA256SUM_BIN")"
+          checked_key+=":${digest%% *}"
+        fi
+        if [[ "$checked_key" == "$last_checked_key" ]]; then
+          continue
+        fi
+      fi
     fi
     next_pr_json="$row"
     break
@@ -1109,44 +1137,38 @@ EOF
   allow_squash_merge="$("$JQ_BIN" -r '.allow_squash_merge' <<<"$repo_merge_json")"
   allow_rebase_merge="$("$JQ_BIN" -r '.allow_rebase_merge' <<<"$repo_merge_json")"
 
-  # 先拉取既有代码评审与 E2E 评论，并解析 <!-- codex-review-meta:... -->（供复用证据定位与 e2e-skipped 硬门禁校验）
-  prev_review_comment="$(gh_state get-comment pr "$pr_num" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
+  # 评审签核同时用于复用证据定位、免测校验和必验场景覆盖核对。
+  review_handoff_error=""
+  if [[ "$review_comment_loaded" == "0" ]] && ! prev_review_comment="$(gh_state get-comment pr "$pr_num" "$REVIEW_COMMENT_MARKER")"; then
+    review_handoff_error="读取评审评论失败。"
+  fi
   prev_e2e_comment="$(gh_state get-comment pr "$pr_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
   if [[ -z "$prev_e2e_comment" && -n "$issue_num" ]]; then
     prev_e2e_comment="$(gh_state get-comment issue "$issue_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
   fi
 
-  rm_head_sha=""
-  rm_verdict=""
   rm_e2e_decision=""
   rm_e2e_reused_sha=""
   review_skip_valid=0
-  _rm_line=""
-  _rm_json=""
-  while IFS= read -r _line; do
-    if [[ "$_line" == *"<!-- codex-review-meta:"* ]]; then
-      _rm_line="$_line"
-    fi
-  done <<<"$prev_review_comment"
-  if [[ -n "$_rm_line" ]]; then
-    _rm_json="${_rm_line#*<!-- codex-review-meta:}"
-    _rm_json="${_rm_json%%-->*}"
-    _rm_json="${_rm_json%"${_rm_json##*[![:space:]]}"}"
-    if "$JQ_BIN" -e 'type == "object"' >/dev/null 2>&1 <<<"$_rm_json"; then
-      rm_head_sha="$("$JQ_BIN" -r '.head_sha // ""' <<<"$_rm_json")"
-      rm_verdict="$("$JQ_BIN" -r '.verdict // ""' <<<"$_rm_json")"
-      rm_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // ""' <<<"$_rm_json")"
-      rm_e2e_reused_sha="$("$JQ_BIN" -r '.e2e_reused_sha // ""' <<<"$_rm_json")"
+  required_checks="[]"
+  review_parent_sha=""
+  if [[ -n "$resolved_from_sha" ]] \
+    && [[ "$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)" == "$resolved_from_sha" ]]; then
+    review_parent_sha="$resolved_from_sha"
+  fi
+  if [[ -z "$review_handoff_error" ]]; then
+    if review_handoff="$(read_review_handoff "$head_sha" "$review_parent_sha" <<<"$prev_review_comment" 2>&1)"; then
+      required_checks="$("$JQ_BIN" -c '.e2e_checks' <<<"$review_handoff")"
+      rm_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // ""' <<<"$review_handoff")"
+      rm_e2e_reused_sha="$("$JQ_BIN" -r '.e2e_reused_sha // ""' <<<"$review_handoff")"
+    else
+      review_handoff_error="评审签核缺失、损坏或与当前提交不匹配。"
+      printf '[%s] 警告：PR #%s 的评审交接读取失败：%s\n' "$("$DATE_BIN" '+%F %T')" "$pr_num" "$review_handoff" >&2
     fi
   fi
-
-  if [[ "$pr_is_e2e_skipped" == "1" && "$rm_verdict" == "approve" ]] \
-    && [[ "$rm_e2e_decision" == "skip_not_needed" || "$rm_e2e_decision" == "skip_already_passed" ]]; then
-    if [[ "$rm_head_sha" == "$head_sha" ]]; then
+  if [[ -z "$review_handoff_error" && "$pr_is_e2e_skipped" == "1" && "$required_checks" == "[]" ]]; then
+    if [[ "$rm_e2e_decision" == "skip_not_needed" || "$rm_e2e_decision" == "skip_already_passed" ]]; then
       review_skip_valid=1
-    elif [[ -n "$resolved_from_sha" && "$rm_head_sha" == "$resolved_from_sha" ]]; then
-      _rm_p1="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)"
-      [[ "$_rm_p1" == "$rm_head_sha" ]] && review_skip_valid=1
     fi
   fi
 
@@ -1225,6 +1247,34 @@ EOF
       fi
       ev_file_list="$("$FIND_BIN" "$ev_entry_dir" -type f | while IFS= read -r _f; do printf '%s\n' "${_f#${ev_entry_dir}/}"; done)"
       ev_sensitive_files="$(printf '%s\n' "$ev_file_list" | "$GREP_BIN" -iE '(^|/)(\.env|secrets\.json|.*\.pem|.*\.key|id_rsa)' || true)"
+    fi
+  fi
+
+  required_checks_error="$review_handoff_error"
+  required_checks_section=""
+  checks_key_suffix=""
+  if [[ "$required_checks" != "[]" ]]; then
+    required_checks_section="$("$JQ_BIN" -r -L "$SCRIPT_DIR" '
+      include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description
+    ' <<<"$required_checks")"
+    checks_hash="$(printf '%s' "$required_checks" | "$SHA256SUM_BIN")"
+    checks_key_suffix=":${checks_hash%% *}"
+    archived_checks_hash="$("$JQ_BIN" -r '.review_checks_hash // ""' <<<"$ev_manifest_json" 2>/dev/null || true)"
+    if [[ "$pr_is_e2e_skipped" == "1" ]]; then
+      required_checks_error="当前评审包含必验场景，需要实测。"
+    elif [[ "$ev_sha_matched" != "1" || "$archived_checks_hash" != "${checks_hash%% *}" ]]; then
+      required_checks_error="缺少与当前评审必验场景和提交匹配的 QA 归档。"
+    else
+      artifact_files="$("$FIND_BIN" "${ev_entry_dir}/artifacts" -type f -printf '%P\0' 2>/dev/null \
+        | "$JQ_BIN" -Rsc 'split("\u0000") | map(select(length > 0))' || printf '[]')"
+      if ! missing_checks="$("$JQ_BIN" -ec -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" '
+        include "workflow-e2e";
+        select(type == "object" and .verdict == "pass") | missing_e2e_checks($required; $files)
+      ' <<<"$ev_result_json")"; then
+        required_checks_error="QA 归档缺少有效的通过结论。"
+      elif [[ "$missing_checks" != "[]" ]]; then
+        required_checks_error="必验场景缺少通过记录、实测详情或归档证据：$("$JQ_BIN" -r 'join("、")' <<<"$missing_checks")。"
+      fi
     fi
   fi
 
@@ -1324,6 +1374,8 @@ ${issue_section}
 ${open_issues_md}
 
 ## 远端 QA 证据核对结果（分支 \`${E2E_EVIDENCE_BRANCH}\` @ \`${ev_branch_sha:0:10}\`）
+- 评审必验场景核对: ${required_checks_error:-通过}
+${required_checks_section}
 - 证据归档目录（本地只读检出）: \`${ev_entry_dir:-(未找到)}\`
 - 证据 GitHub 永久直链: ${ev_web_url:-(无)}
 - 证据 manifest.tested_sha: \`${ev_tested_sha:-(缺失)}\`（与 PR head_sha 或其第一父提交是否严格一致: \`${ev_sha_matched}\`，是否当前提交祖先: \`${ev_is_ancestor}\`）
@@ -1445,6 +1497,9 @@ EOF
   # 5. 确定性硬门禁兜底（防止 LLM 误放行）
   hard_gate_errors=""
   if [[ "$verdict" == "merge" ]]; then
+    if [[ -n "$required_checks_error" ]]; then
+      hard_gate_errors+="- 硬门禁拦截：${required_checks_error}"$'\n'
+    fi
     if [[ "$REQUIRE_EVIDENCE_SHA_MATCH" == "1" ]]; then
       if [[ "$pr_is_e2e_skipped" == "1" ]]; then
         if [[ "$review_skip_valid" != "1" ]]; then
@@ -1693,8 +1748,11 @@ EOF
     fi
   fi
 
+  if [[ "$final_state" == "blocked" && -n "$required_checks_error" ]]; then
+    record_checked_sha=0
+  fi
   if [[ "$DRY_RUN" != "1" && "$record_checked_sha" == "1" ]]; then
-    printf '%s\n' "$head_sha" >> "$sha_file"
+    printf '%s%s\n' "$head_sha" "$checks_key_suffix" >> "$sha_file"
     printf '%d\n' "$new_consecutive_rejections" > "$consec_file"
   fi
 
