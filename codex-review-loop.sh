@@ -520,12 +520,20 @@ publish_review() {
     "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
   fi
 
-  gh_state set-state pr "$pr_num" "$final_state" || return 1
+  if ! "$JQ_BIN" -e '.pr_state_written // false' "$pending_file" >/dev/null; then
+    gh_state set-state pr "$pr_num" "$final_state" || return 1
+    "$JQ_BIN" '.pr_state_written = true' "$pending_file" > "${pending_file}.tmp" || return 1
+    "$MV_BIN" "${pending_file}.tmp" "$pending_file" || return 1
+  fi
 
-  # 开发循环按 Issue 标签接手，关联 Issue 仍在 PR 交接后同步。
+  # 开发循环按 Issue 标签接手，关联 Issue 同步纳入交接重试，避免 PR 切标后 Issue 遗漏回队列。
   if [[ -n "$issue_num" ]] && [[ "$final_state" != "changes-requested" || "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
-    "$JQ_BIN" -r '.comment' "$pending_file" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" \
-      && gh_state set-state issue "$issue_num" "$final_state" || true
+    if ! "$JQ_BIN" -e '.issue_comment_written // false' "$pending_file" >/dev/null; then
+      "$JQ_BIN" -r '.comment' "$pending_file" | gh_state comment issue "$issue_num" - "$REVIEW_COMMENT_MARKER" || return 1
+      "$JQ_BIN" '.issue_comment_written = true' "$pending_file" > "${pending_file}.tmp" || return 1
+      "$MV_BIN" "${pending_file}.tmp" "$pending_file" || return 1
+    fi
+    gh_state set-state issue "$issue_num" "$final_state" || return 1
   fi
 
   round="$("$JQ_BIN" -r '.meta.round' "$pending_file")" || return 1
@@ -545,11 +553,14 @@ publish_review() {
 }
 
 retry_review_handoff() {
-  if publish_review "$1"; then
+  local pending_file="$1"
+  local pending_pr=""
+  pending_pr="$("$JQ_BIN" -r '.meta.pr_number // empty' "$pending_file" 2>/dev/null || true)"
+  if publish_review "$pending_file"; then
     "$SLEEP_BIN" 5
   else
     printf '[%s] 警告：PR #%s 评审交接失败，%ss 后重试已保存的报告。\n' \
-      "$("$DATE_BIN" '+%F %T')" "$pr_num" "$POLL_INTERVAL" >&2
+      "$("$DATE_BIN" '+%F %T')" "${pending_pr:-${pr_num:-?}}" "$POLL_INTERVAL" >&2
     "$SLEEP_BIN" "$POLL_INTERVAL"
   fi
 }
@@ -562,6 +573,23 @@ while true; do
   if [[ "$INIT_LABELS" == "1" && "$LABELS_READY" == "0" ]]; then
     if gh_state init-labels; then
       LABELS_READY=1
+    fi
+  fi
+
+  # 若某 PR 已切离评审标签但关联 Issue 交接尚未完成，先续完残余交接。
+  if [[ "$DRY_RUN" != "1" ]]; then
+    pending_issue_handoff=""
+    for _pf in "${REVIEWS_ROOT}"/pr-*/pending-review.json; do
+      [[ -f "$_pf" ]] || continue
+      if "$JQ_BIN" -e '.pr_state_written == true' "$_pf" >/dev/null 2>&1; then
+        pending_issue_handoff="$_pf"
+        break
+      fi
+    done
+    if [[ -n "$pending_issue_handoff" ]]; then
+      idle_announced=0
+      retry_review_handoff "$pending_issue_handoff"
+      continue
     fi
   fi
 
@@ -1010,6 +1038,8 @@ EOF
       review: $review[0],
       elapsed: $elapsed,
       pr_comment_written: false,
+      pr_state_written: false,
+      issue_comment_written: false,
       meta: {
         pr_number: $pr_number,
         issue_number: $issue_number,

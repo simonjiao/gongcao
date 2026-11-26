@@ -733,7 +733,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 ## E2E 执行规则（务必遵守）
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的独立检出（\`${e2e_wt}\`）。**不要预设 E2E 必须在当前本机启动服务**；先阅读目标仓库的规范与验收入口文档（如 \`AGENTS.md\`、\`qa/README.md\`、\`docs/\`、\`README.md\` 等）以及上方外部环境说明，优先直接调用仓库既有或本 PR 已最小扩展好的维护中 QA action/spec；仅在确实无维护入口时才编写外部临时驱动，一次性核齐前置 fixture（如 \`fixture_mysql\`）与核心必测场景，核心场景全部通过后若确需补测个别边界，**只运行独立轻量增量脚本，禁止把已通过的全量流程从头重跑**；向远端或隔离目录同步/解包候选源码时**保持 Git 原始文件权限（勿使用 \`umask 077\`）**，避免容器内非 root 进程无法读取挂载的初始化脚本。
 2. **严禁修改仓库业务代码或提交 commit**，也不要执行 git push 或直接操作 GitHub Issue/PR；你只负责验收与输出客观证据。
-3. 将本次验收产生的关键原始证据（日志、命令输出、报告或截图等，**注意脱敏，勿写入明文密码/Token/私钥**）保存到专用目录 \`${artifacts_dir}\`，外层脚本会自动将其归档推送到独立的远程证据分支 \`${E2E_EVIDENCE_BRANCH}\` 并在 PR/Issue 中关联链接；同时在 \`evidence_paths\` 中列出关键文件路径。验收结束后按仓库规范清理你本次创建的临时资源、测试数据或临时进程，不要在仓库工作区残留脏文件；清理本机或远端临时目录/文件（含 \`trap\` 回调）时**不要使用 \`rm -f\` 或 \`rm -rf\`**（会被 Codex 工具路由器安全策略拦截），请优先调用仓库自带清理入口或改用 Python \`shutil.rmtree\` / \`Path.unlink(missing_ok=True)\` 等安全方式。
+3. 将本次验收产生的关键原始证据（日志、命令输出、报告或截图等，**注意脱敏，勿写入明文密码/Token/私钥**）保存到专用目录 \`${artifacts_dir}\`，外层脚本会自动将其归档推送到独立的远程证据分支 \`${E2E_EVIDENCE_BRANCH}\` 并在 PR/Issue 中关联链接；同时在 \`evidence_paths\` 中列出相对于 \`${artifacts_dir}\` 的关键文件路径。验收结束后按仓库规范清理你本次创建的临时资源、测试数据或临时进程，不要在仓库工作区残留脏文件；清理本机或远端临时目录/文件（含 \`trap\` 回调）时**不要使用 \`rm -f\` 或 \`rm -rf\`**（会被 Codex 工具路由器安全策略拦截），请优先调用仓库自带清理入口或改用 Python \`shutil.rmtree\` / \`Path.unlink(missing_ok=True)\` 等安全方式。
 4. **严禁使用字节码反编译或调试器/断点注入手段**：禁止运行 \`javap\` 字节码反编译、挂载 JDWP 调试器（\`-agentlib:jdwp\`）或编写断点注入探针（如 \`ReplayProbe\` / \`jdb\`），此类操作会触发安全风控并导致远端环境泄漏。使用标准服务启停、公开接口、数据库状态与真实浏览器 UI 实测评审列出的场景，包括使用已有状态的跨版本续读等。
 5. 严格区分三种结论（\`verdict\`）：
    - \`pass\`：按仓库规范在目标验收环境中完成了针对 Issue 核心场景的真实端到端验证且全部通过，证据充分。
@@ -864,9 +864,9 @@ EOF
   if [[ "$verdict" == "pass" && "$required_checks" != "[]" ]]; then
     artifact_files="$("$FIND_BIN" "$artifacts_dir" -type f -size "-$(( MAX_EVIDENCE_FILE_MB * 1024 * 1024 ))c" -printf '%P\0' \
       | "$JQ_BIN" -Rsc 'split("\u0000") | map(select(length > 0))')"
-    missing_checks="$("$JQ_BIN" -c -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" '
+    missing_checks="$("$JQ_BIN" -c -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" --arg root "$artifacts_dir" '
       include "workflow-e2e";
-      missing_e2e_checks($required; $files)
+      missing_e2e_checks($required; $files; $root)
     ' "$result_file")"
     if [[ "$missing_checks" != "[]" ]]; then
       "$CP_BIN" "$result_file" "${e2e_dir}/codex-output-${run_ts}.json"

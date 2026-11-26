@@ -26,9 +26,24 @@ def approved_e2e_checks($sha; $previous_sha):
 def numbered_e2e_checks:
   to_entries | map({id: ("E" + ((.key + 1) | tostring)), description: .value});
 
-def missing_e2e_checks($checks; $files):
+def resolve_artifact_path($root; $files):
+  if nonblank then
+    ($root | rtrimstr("/")) as $base
+    | (if $base != "" and startswith($base + "/") then ltrimstr($base + "/")
+       elif test("/artifacts-[0-9]{8}-[0-9]{6}/") then sub("^.*/artifacts-[0-9]{8}-[0-9]{6}/"; "")
+       else . end)
+    | sub("^(\\./)+"; "")
+    | if ($files | index(.)) != null then .
+      elif startswith("artifacts/") and ($files | index(ltrimstr("artifacts/"))) != null then ltrimstr("artifacts/")
+      else null
+      end
+  else
+    null
+  end;
+
+def missing_e2e_checks($checks; $files; $root):
   (.scenarios | if type == "array" then map(objects) else [] end) as $scenarios
-  | (.evidence_paths | if type == "array" then . else [] end) as $reported
+  | (.evidence_paths | if type == "array" then map(resolve_artifact_path($root; $files) | select(. != null)) else [] end) as $reported
   | $checks | numbered_e2e_checks
   | map(.id as $id
       | [$scenarios[] | select(.id == $id)] as $matches
@@ -36,8 +51,12 @@ def missing_e2e_checks($checks; $files):
           $matches[0] | (
             .status == "passed" and (.details | nonblank)
             and (.evidence_paths | type == "array" and length > 0 and all(
-              . as $path | nonblank and ($reported | index($path)) != null and ($files | index($path)) != null
+              resolve_artifact_path($root; $files) as $norm
+              | $norm != null and ($reported | index($norm)) != null
             ))
           ) | not
         ))
       | .id);
+
+def missing_e2e_checks($checks; $files):
+  missing_e2e_checks($checks; $files; "");

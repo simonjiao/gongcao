@@ -1,7 +1,35 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-# 检查 agy-issue-loop.sh 所需的全部命令，并一律使用绝对路径调用
+# 检查开发/评审流水线所需的全部命令，并一律使用绝对路径调用
+# 用法：check-deps.sh [--engine agy|codex]（默认 agy）
+
+CHECK_ENGINE="${DEV_ENGINE:-agy}"
+while (( $# > 0 )); do
+  case "$1" in
+    --engine)
+      [[ $# -ge 2 ]] || { printf '错误：--engine 缺少参数（支持 agy 或 codex）\n' >&2; exit 2; }
+      CHECK_ENGINE="$2"
+      shift 2
+      ;;
+    --engine=*)
+      CHECK_ENGINE="${1#--engine=}"
+      shift
+      ;;
+    *)
+      printf '用法：%s [--engine agy|codex]\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$CHECK_ENGINE" in
+  agy|codex) ;;
+  *)
+    printf '错误：不支持的引擎 %q（支持 agy 或 codex）\n' "$CHECK_ENGINE" >&2
+    exit 2
+    ;;
+esac
 
 # 补充常见用户目录与 linuxbrew 目录到搜索路径
 SEARCH_PATH="${PATH}:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
@@ -11,7 +39,6 @@ REQUIRED_CMDS=(
   bash
   gh
   jq
-  agy
   git
   grep
   mkdir
@@ -28,11 +55,13 @@ REQUIRED_CMDS=(
   tail
 )
 
-# 可选命令清单（如独立 PR 评审/E2E/tmux 看板脚本使用）
-OPTIONAL_CMDS=(
-  codex
-  tmux
-)
+if [[ "$CHECK_ENGINE" == "codex" ]]; then
+  REQUIRED_CMDS+=(codex)
+  OPTIONAL_CMDS=(agy tmux)
+else
+  REQUIRED_CMDS+=(agy)
+  OPTIONAL_CMDS=(codex tmux)
+fi
 
 declare -A CMD_PATHS=()
 missing_count=0

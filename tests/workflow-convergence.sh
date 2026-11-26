@@ -42,6 +42,9 @@ case "$*" in
     ;;
   'get-comment '*|'get-pr-diff '*)
     ;;
+  'get-issue '*)
+    printf '%s\n' '{"title":"Mock Issue","body":"需求正文","labels":[],"url":"https://example.invalid/issues/42"}'
+    ;;
   'get-repo-merge-settings')
     printf '%s\n' '{"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}'
     ;;
@@ -56,6 +59,14 @@ case "$*" in
     fi
     cat > "$MOCK_DIR/review-comment"
     ;;
+  'comment issue 42 - <!-- codex-review-comment -->')
+    printf '%s\n' write-issue-review >> "$MOCK_DIR/calls"
+    if [[ -f "$MOCK_DIR/fail-issue-comment" ]]; then
+      rm "$MOCK_DIR/fail-issue-comment"
+      exit 1
+    fi
+    cat >/dev/null
+    ;;
   'comment '*)
     cat >/dev/null
     ;;
@@ -63,6 +74,13 @@ case "$*" in
     printf '%s\n' "$*" >> "$MOCK_DIR/calls"
     if [[ -f "$MOCK_DIR/fail-state" ]]; then
       rm "$MOCK_DIR/fail-state"
+      exit 1
+    fi
+    ;;
+  'set-state issue 42 '*)
+    printf '%s\n' "$*" >> "$MOCK_DIR/calls"
+    if [[ -f "$MOCK_DIR/fail-issue-state" ]]; then
+      rm "$MOCK_DIR/fail-issue-state"
       exit 1
     fi
     ;;
@@ -81,10 +99,11 @@ case "$2" in
     ;;
   */result-*)
     printf '%s\n' codex-e2e >> "$MOCK_DIR/calls"
-    cat "$MOCK_DIR/result.json" > "$2"
     artifact_dir="${2%/*}/artifacts-${2##*/result-}"
+    artifact_dir="${artifact_dir%.json}"
+    sed "s|__ARTIFACTS_DIR__|${artifact_dir}|g" "$MOCK_DIR/result.json" > "$2"
     if [[ ! -f "$MOCK_DIR/skip-artifact" ]]; then
-      printf '%s\n' '实测通过' > "${artifact_dir%.json}/upgrade.log"
+      printf '%s\n' '实测通过' > "${artifact_dir}/upgrade.log"
     fi
     ;;
   */decision-*)
@@ -247,5 +266,52 @@ set_pr_body '需要授权才能变更持久化契约'
 run_loop review
 assert_calls 5 'set-state pr 7 blocked'
 grep -Fq '变更现有契约的事项待人工授权' "$fixture/review-comment" || fail '未暂停自动返工'
+
+# 1. 验证关联 Issue 写回失败时，即使 PR 已切离 agy:in-review，下次轮询也会续完 Issue 交接而不重跑 Codex
+jq '.blocking_issues[0].id = "issue-handoff-check"' "$fixture/reject.json" > "$fixture/verdict.json"
+set_pr_body 'Closes #42 关联 Issue 交接重试测试'
+touch "$fixture/fail-issue-comment" "$fixture/fail-issue-state"
+before_reviews="$(grep -Fxc -- codex-review "$fixture/calls" || true)"
+REVIEWS_ROOT="$fixture/reviews-issue-handoff" run_loop review
+# 模拟 PR 已切离 agy:in-review（list-prs 返回空）
+cp "$fixture/pr.json" "$fixture/pr-backup.json"
+printf '[]\n' > "$fixture/pr.json"
+REVIEWS_ROOT="$fixture/reviews-issue-handoff" run_loop review
+REVIEWS_ROOT="$fixture/reviews-issue-handoff" run_loop review
+mv "$fixture/pr-backup.json" "$fixture/pr.json"
+assert_calls "$((before_reviews + 1))" codex-review
+assert_calls 2 write-issue-review
+assert_calls 2 'set-state issue 42 changes-requested'
+[[ ! -f "$fixture/reviews-issue-handoff/pr-7/pending-review.json" ]] || fail 'Issue 交接完成后仍残留 pending-review.json'
+
+# 2. 验证 E2E 证据路径归一化（绝对路径、./ 前缀、artifacts/ 前缀在 E2E 和终审均可识别）
+cp "$fixture/original-comment" "$fixture/review-comment"
+jq -n '{
+  verdict:"pass", summary:"通过", environment:"测试环境",
+  scenarios:[{id:"E1", name:"路径归一化", status:"passed", details:"实测通过", evidence_paths:["__ARTIFACTS_DIR__/upgrade.log"]}],
+  evidence_paths:["./upgrade.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$fixture/e2e-norm" PUBLISH_EVIDENCE=1 run_loop e2e 1
+assert_calls 3 'set-state pr 7 e2e-passed'
+# 终审识别归档中含绝对路径和 artifacts/ 前缀的 result.json
+git -C "$fixture/archive" pull -q origin qa/e2e-evidence
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-norm" run_loop final-gate
+assert_calls 2 'set-state pr 7 ready-to-merge'
+
+# 3. 验证终审就地消解冲突后的父提交映射（resolved-conflicts.tsv）在重跑与轮询去重中生效
+git -C "$fixture/repo" commit -qm 'merge-resolved-conflict' --allow-empty
+git -C "$fixture/repo" push -q origin main
+merged_sha="$(git -C "$fixture/repo" rev-parse HEAD)"
+mkdir -p "$fixture/final-conflict/pr-7"
+printf '%s\t%s\n' "$merged_sha" "$MOCK_SHA" > "$fixture/final-conflict/pr-7/resolved-conflicts.tsv"
+jq --arg sha "$merged_sha" '.[0].headRefOid = $sha' "$fixture/pr.json" > "$fixture/pr-merged.json"
+mv "$fixture/pr-merged.json" "$fixture/pr.json"
+before_final="$(grep -Fxc -- codex-final "$fixture/calls" || true)"
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-conflict" run_loop final-gate
+assert_calls "$((before_final + 1))" codex-final
+assert_calls 3 'set-state pr 7 ready-to-merge'
+# 再次轮询同一冲突消解提交应被跳过，不再重复调用 codex-final
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-conflict" run_loop final-gate
+assert_calls "$((before_final + 1))" codex-final
 
 printf 'workflow convergence tests passed\n'

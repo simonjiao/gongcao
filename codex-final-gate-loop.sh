@@ -867,6 +867,38 @@ read_review_handoff() {
   '
 }
 
+record_resolved_conflict_sha() {
+  local final_dir="$1"
+  local new_sha="$2"
+  local parent_sha="$3"
+  [[ "$DRY_RUN" == "1" || -z "$new_sha" || -z "$parent_sha" || "$new_sha" == "$parent_sha" ]] && return 0
+  "$MKDIR_BIN" -p "$final_dir"
+  printf '%s\t%s\n' "$new_sha" "$parent_sha" >> "${final_dir}/resolved-conflicts.tsv"
+}
+
+lookup_resolved_from_sha() {
+  local final_dir="$1"
+  local cur_sha="$2"
+  local map_file="${final_dir}/resolved-conflicts.tsv"
+  [[ -n "$cur_sha" && -f "$map_file" ]] || return 0
+  local origin_sha="" hops=0 mapped="" rec_new="" rec_parent="" actual_parent=""
+  while (( hops < 5 )); do
+    mapped=""
+    while IFS=$'\t' read -r rec_new rec_parent; do
+      if [[ "$rec_new" == "$cur_sha" && -n "$rec_parent" ]]; then
+        mapped="$rec_parent"
+      fi
+    done < "$map_file"
+    [[ -n "$mapped" ]] || break
+    actual_parent="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${cur_sha}^1" 2>/dev/null || true)"
+    [[ "$actual_parent" == "$mapped" ]] || break
+    origin_sha="$mapped"
+    cur_sha="$mapped"
+    hops=$((hops + 1))
+  done
+  printf '%s' "$origin_sha"
+}
+
 consecutive_poll_errors=0
 idle_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
@@ -927,7 +959,8 @@ while true; do
     fi
     if [[ -n "$last_checked_key" ]] && prev_review_comment="$(gh_state get-comment pr "$pnum" "$REVIEW_COMMENT_MARKER")"; then
       review_comment_loaded=1
-      if handoff="$(read_review_handoff "$psha" <<<"$prev_review_comment" 2>/dev/null)"; then
+      poll_parent_sha="$(lookup_resolved_from_sha "${FINAL_ROOT}/pr-${pnum}" "$psha")"
+      if handoff="$(read_review_handoff "$psha" "$poll_parent_sha" <<<"$prev_review_comment" 2>/dev/null)"; then
         checks="$("$JQ_BIN" -c '.e2e_checks' <<<"$handoff")"
         checked_key="$psha"
         if [[ "$checks" != "[]" ]]; then
@@ -1057,7 +1090,7 @@ while true; do
   fi
 
   # 3.1 本地确定性合并演练（git merge-tree）+ 冲突分诊（简单机械冲突就地消解，实质冲突才退回开发）
-  resolved_from_sha=""
+  resolved_from_sha="$(lookup_resolved_from_sha "$final_dir" "$head_sha")"
   resolved_conflict_note=""
   merge_sim_json="$(inspect_git_merge_state "$base_branch" "$head_sha" 0)"
   mt_status="$("$JQ_BIN" -r '.status // "unknown"' <<<"$merge_sim_json")"
@@ -1079,7 +1112,9 @@ while true; do
     t_vnote="$("$JQ_BIN" -r '.verification_note // ""' <<<"$triage_json")"
 
     if [[ "$t_outcome" == "resolved" && -n "$t_new_sha" ]]; then
-      resolved_from_sha="$head_sha"
+      prev_conflict_sha="$head_sha"
+      resolved_from_sha="${resolved_from_sha:-$prev_conflict_sha}"
+      record_resolved_conflict_sha "$final_dir" "$t_new_sha" "$prev_conflict_sha"
       head_sha="$t_new_sha"
       resolved_conflict_note="终审前置合并演练检测到简单机械冲突，已由 final-gate 就地消解并推送合并提交 \`${head_sha:0:10}\`（第一父提交保留原 E2E 验收提交 \`${resolved_from_sha:0:10}\`）。冲突文件：\`${t_cfiles//$'\n'/, }\`；说明：${t_reason}${t_vnote:+；校验：${t_vnote}}"
       final_wt="$(prepare_final_worktree "$pr_num" "$head_branch" "$head_sha")" || true
@@ -1152,9 +1187,11 @@ EOF
   review_skip_valid=0
   required_checks="[]"
   review_parent_sha=""
-  if [[ -n "$resolved_from_sha" ]] \
-    && [[ "$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)" == "$resolved_from_sha" ]]; then
-    review_parent_sha="$resolved_from_sha"
+  if [[ -n "$resolved_from_sha" ]]; then
+    if [[ "$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)" == "$resolved_from_sha" ]] \
+      || [[ "$(lookup_resolved_from_sha "$final_dir" "$head_sha")" == "$resolved_from_sha" ]]; then
+      review_parent_sha="$resolved_from_sha"
+    fi
   fi
   if [[ -z "$review_handoff_error" ]]; then
     if review_handoff="$(read_review_handoff "$head_sha" "$review_parent_sha" <<<"$prev_review_comment" 2>&1)"; then
@@ -1231,7 +1268,10 @@ EOF
           ev_sha_matched=1
         elif [[ -n "$resolved_from_sha" && "$ev_tested_sha" == "$resolved_from_sha" ]]; then
           _p1="$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)"
-          [[ "$_p1" == "$ev_tested_sha" ]] && ev_sha_matched=1
+          if [[ "$_p1" == "$ev_tested_sha" ]] \
+            || [[ "$(lookup_resolved_from_sha "$final_dir" "$head_sha")" == "$ev_tested_sha" ]]; then
+            ev_sha_matched=1
+          fi
         fi
         if [[ -n "$ev_tested_sha" ]] && "$GIT_BIN" -C "$REPO_ROOT" merge-base --is-ancestor "$ev_tested_sha" "$head_sha" 2>/dev/null; then
           ev_is_ancestor=1
@@ -1571,7 +1611,9 @@ EOF
         rt_vnote="$("$JQ_BIN" -r '.verification_note // ""' <<<"$recheck_triage")"
 
         if [[ "$rt_outcome" == "resolved" && -n "$rt_new_sha" ]]; then
-          resolved_from_sha="${resolved_from_sha:-$head_sha}"
+          prev_conflict_sha="$head_sha"
+          resolved_from_sha="${resolved_from_sha:-$prev_conflict_sha}"
+          record_resolved_conflict_sha "$final_dir" "$rt_new_sha" "$prev_conflict_sha"
           head_sha="$rt_new_sha"
           mt_merge_commits=$((mt_merge_commits + 1))
           _mm_re="$(resolve_safe_merge_method "$effective_merge_method" "$allow_merge_commit" "$allow_squash_merge" "$allow_rebase_merge" "$mt_merge_commits")"

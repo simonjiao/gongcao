@@ -38,7 +38,7 @@ case "$DEV_ENGINE" in
     DEV_BIN="$(resolve_bin codex)"
     TIMEOUT_BIN="$(resolve_bin timeout)"
     DEV_MODEL="${CODEX_MODEL:-gpt-6.2-sol}"
-    DEV_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
+    DEV_EFFORT="${CODEX_REASONING_EFFORT-xhigh}"
     DEV_TIMEOUT="${CODEX_DEV_TIMEOUT:-40m}"
     SESSION_ID_FIELD=session_id
     SESSION_ID_LABEL="Session ID"
@@ -77,13 +77,13 @@ if [[ "$DEV_ENGINE" == "agy" ]]; then
   if [[ "$DEV_ACTION" == "login" ]]; then
     exec "$DEV_BIN" acp --gemini-dir "$agy_gemini_dir" --app-data-dir antigravity-cli --login
   fi
-  "${SCRIPT_DIR}/check-deps.sh"
 else
   dev_command=("$(resolve_bin env)" "CODEX_HOME=$profile_dir" "$DEV_BIN")
   if [[ "$DEV_ACTION" == "login" ]]; then
     exec "${dev_command[@]}" login
   fi
 fi
+"${SCRIPT_DIR}/check-deps.sh" --engine "$DEV_ENGINE"
 
 JQ_BIN="$(resolve_bin jq)"
 GIT_BIN="$(resolve_bin git)"
@@ -127,6 +127,7 @@ FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-co
 POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒）
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
 MAX_TIMEOUT_RETRIES="${MAX_TIMEOUT_RETRIES:-2}" # 超时后自动续接原会话的重试次数上限
+MAX_SCHEMA_RETRIES="${MAX_SCHEMA_RETRIES:-1}"   # Codex 结构化输出不合规时续接原会话修正格式的重试次数上限
 MAX_QUOTA_RETRIES="${MAX_QUOTA_RETRIES:-6}"     # 触发 429/RESOURCE_EXHAUSTED 配额限流或可重试 API 报错时的自动等待重试次数上限
 QUOTA_RETRY_BUFFER_SEC="${QUOTA_RETRY_BUFFER_SEC:-15}" # 配额重置倒计时额外缓冲秒数
 QUOTA_DEFAULT_WAIT_SEC="${QUOTA_DEFAULT_WAIT_SEC:-120}" # 未解析出 Resets in 时的默认冷却等待秒数
@@ -610,8 +611,10 @@ run_codex_attempt() {
     --output-schema "$codex_schema_file"
     -o "$attempt_result_file"
     -m "$DEV_MODEL"
-    -c "model_reasoning_effort=\"${DEV_EFFORT}\""
   )
+  if [[ -n "$DEV_EFFORT" ]]; then
+    args+=(-c "model_reasoning_effort=\"${DEV_EFFORT}\"")
+  fi
   if [[ -n "$current_session_id" ]]; then
     args+=(resume "$current_session_id")
   fi
@@ -650,16 +653,68 @@ validate_codex_result() {
 }
 
 parse_reset_wait_seconds() {
-  local raw="" dur="" h=0 m=0 s=0
-  raw="$("$GREP_BIN" -hoiE 'resets in[[:space:]]+[0-9]+[hms]([0-9]+[ms])*' "$@" 2>/dev/null | "$GREP_BIN" -m 1 -oiE '[0-9]+[hms]([0-9]+[ms])*$' || true)"
-  [[ -n "$raw" ]] || return 1
-  dur="$raw"
-  if [[ "$dur" =~ ([0-9]+)[hH] ]]; then h=$((10#${BASH_REMATCH[1]})); fi
-  if [[ "$dur" =~ ([0-9]+)[mM] ]]; then m=$((10#${BASH_REMATCH[1]})); fi
-  if [[ "$dur" =~ ([0-9]+)[sS] ]]; then s=$((10#${BASH_REMATCH[1]})); fi
-  local total=$(( h * 3600 + m * 60 + s ))
-  (( total > 0 )) || return 1
-  printf '%s' "$total"
+  local raw="" dur="" h=0 m=0 s=0 total=0
+
+  # 1. 紧凑时长格式，如 "resets in 1h2m3s" / "try again in 15m30s" / "retry after 45s"
+  raw="$("$GREP_BIN" -hoiE '(resets in|try again in|retry in|retry after)[[:space:]]+[0-9]+[hms]([0-9]+[ms])*' "$@" 2>/dev/null \
+    | "$GREP_BIN" -m 1 -oiE '[0-9]+[hms]([0-9]+[ms])*$' || true)"
+  if [[ -n "$raw" ]]; then
+    dur="$raw"
+    if [[ "$dur" =~ ([0-9]+)[hH] ]]; then h=$((10#${BASH_REMATCH[1]})); fi
+    if [[ "$dur" =~ ([0-9]+)[mM] ]]; then m=$((10#${BASH_REMATCH[1]})); fi
+    if [[ "$dur" =~ ([0-9]+)[sS] ]]; then s=$((10#${BASH_REMATCH[1]})); fi
+    total=$(( h * 3600 + m * 60 + s ))
+    (( total > 0 )) && { printf '%s' "$total"; return 0; }
+  fi
+
+  # 2. 英文完整单位格式，如 "try again in 2 hours 15 minutes" / "try again in 5 minutes" / "try again in 1.5 seconds"
+  raw="$("$GREP_BIN" -hoiE '(resets in|try again in|retry in|retry after)[[:space:]]+([0-9]+(\.[0-9]+)?[[:space:]]*(hours?|hrs?|minutes?|mins?|seconds?|secs?)([[:space:]]*(and|,)?[[:space:]]*)?)+' "$@" 2>/dev/null \
+    | "$GREP_BIN" -m 1 -oiE '[0-9]+.*$' || true)"
+  if [[ -n "$raw" ]]; then
+    h=0; m=0; s=0
+    local num="" frac="" unit="" token=""
+    while IFS= read -r token; do
+      [[ -z "$token" ]] && continue
+      if [[ "$token" =~ ^([0-9]+)(\.([0-9]+))?[[:space:]]*([a-zA-Z]+)$ ]]; then
+        num=$((10#${BASH_REMATCH[1]}))
+        frac="${BASH_REMATCH[3]}"
+        unit="${BASH_REMATCH[4],,}"
+        case "$unit" in
+          h|hr|hrs|hour|hours) h=$((h + num)) ;;
+          m|min|mins|minute|minutes) m=$((m + num)) ;;
+          s|sec|secs|second|seconds)
+            s=$((s + num))
+            [[ -n "$frac" && "$frac" =~ [1-9] ]] && s=$((s + 1))
+            ;;
+        esac
+      fi
+    done < <("$GREP_BIN" -oiE '[0-9]+(\.[0-9]+)?[[:space:]]*(hours?|hrs?|minutes?|mins?|seconds?|secs?)' <<<"$raw" || true)
+    total=$(( h * 3600 + m * 60 + s ))
+    (( total > 0 )) && { printf '%s' "$total"; return 0; }
+  fi
+
+  # 3. 数值型 Retry-After / retry_after / retry_after_seconds（秒）
+  raw="$("$GREP_BIN" -hoiE '("?retry[_-]after(_seconds)?"?[[:space:]]*[:=][[:space:]]*[0-9]+)' "$@" 2>/dev/null \
+    | "$GREP_BIN" -m 1 -oE '[0-9]+$' || true)"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( 10#$raw > 0 )); then
+    printf '%s' "$((10#$raw))"
+    return 0
+  fi
+
+  # 4. ISO-8601 重置时间戳，如 "resets at 2026-11-26T18:00:00Z" / "reset_at": "2026-11-26T18:00:00+08:00"
+  raw="$("$GREP_BIN" -hoiE '(resets at|reset[_-]at"?[[:space:]]*[:=][[:space:]]*"?)[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:?[0-9]{2})?' "$@" 2>/dev/null \
+    | "$GREP_BIN" -m 1 -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:?[0-9]{2})?$' || true)"
+  if [[ -n "$raw" ]]; then
+    local target_epoch="" now_epoch=""
+    target_epoch="$("$DATE_BIN" -d "$raw" '+%s' 2>/dev/null || true)"
+    now_epoch="$("$DATE_BIN" '+%s')"
+    if [[ "$target_epoch" =~ ^[0-9]+$ ]] && (( target_epoch > now_epoch )); then
+      printf '%s' "$(( target_epoch - now_epoch ))"
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 format_resume_command() {
@@ -764,7 +819,7 @@ consecutive_poll_errors=0
 idle_announced=0
 quota_wait_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
-QUOTA_COOLDOWN_FILE="${STATE_ROOT}/quota_reset_until"
+QUOTA_COOLDOWN_FILE="${STATE_ROOT}/quota_reset_until.${DEV_ENGINE}"
 
 while true; do
   # 若启动时初始化标签失败，在网络恢复后补初始化一次
@@ -1049,8 +1104,11 @@ EOF
   quota_reset_epoch=0
   quota_reset_human=""
   attempt=0
+  schema_retries=0
   max_t_retries=0
   [[ "$MAX_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] && max_t_retries="$MAX_TIMEOUT_RETRIES"
+  max_s_retries=0
+  [[ "$MAX_SCHEMA_RETRIES" =~ ^[0-9]+$ ]] && max_s_retries="$MAX_SCHEMA_RETRIES"
   max_q_retries=0
   [[ "$MAX_QUOTA_RETRIES" =~ ^[0-9]+$ ]] && max_q_retries="$MAX_QUOTA_RETRIES"
   current_session_id="$existing_session_id"
@@ -1078,9 +1136,11 @@ EOF
     fi
 
     attempt_rc=0
+    is_schema_error=0
     if "$run_attempt" {dev_lock_fd}>&- 2>"$attempt_stderr_file" | "$TEE_BIN" "$attempt_events_file" >> "$events_file"; then
       if [[ "$DEV_ENGINE" == "codex" ]] && ! validate_codex_result "$attempt_result_file"; then
         printf 'Codex 返回的开发结果缺失或无效：%s\n' "$attempt_result_file" >> "$attempt_stderr_file"
+        is_schema_error=1
         attempt_rc=1
       fi
     else
@@ -1107,6 +1167,18 @@ EOF
     fi
     if [[ "$DEV_ENGINE" == "agy" && -s "$blocked_tmp" ]]; then
       break
+    fi
+
+    if (( is_schema_error == 1 && schema_retries < max_s_retries )); then
+      schema_retries=$((schema_retries + 1))
+      printf '[%s] 警告：Issue #%s 第 %d 次执行返回的结构化结果无效，3s 后续接原会话 (%s) 修正输出（第 %d/%d 次重试）...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$schema_retries" "$max_s_retries" >&2
+      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空且 blocked_reason=\"\"；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
+      if [[ -z "$current_session_id" ]]; then
+        current_prompt="${prompt}"$'\n\n'"${current_prompt}"
+      fi
+      "$SLEEP_BIN" 3
+      continue
     fi
 
     # Codex JSONL 也记录工具输出，限流判断只使用 CLI 的错误事件。
@@ -1146,7 +1218,19 @@ EOF
         post_status_comment issue "$number" "in-progress" "$branch" "$current_session_id" "" \
           "第 ${attempt} 次执行触发 ${DEV_TIMEOUT} 超时，已保留全部代码进度并自动续接原会话重试（第 ${timeout_retries}/${max_t_retries} 次重试）。"
       fi
-      current_prompt="$prompt"$'\n\n'"上次运行达到 ${DEV_TIMEOUT} 超时上限。这是第 ${timeout_retries}/${max_t_retries} 次超时重试。请先用 git status 和 git diff --stat 核对当前 worktree 中保留的改动，从中断处继续开发和内部验证，再按上面的要求返回结果。"
+      if [[ -n "$current_session_id" ]]; then
+        current_prompt="$("$CAT_BIN" <<EOF
+上一次执行因达到 ${DEV_TIMEOUT} 超时限制被中断，这是第 ${timeout_retries}/${max_t_retries} 次自动续接重试。
+
+### 续接要求
+1. 你仍在原 worktree（\`${wt_dir}\`）及分支（\`${branch}\`）中，前面已完成的代码修改全部保留在工作区，不要从头推倒重做。
+2. 请先运行 \`git status\` 和 \`git diff --stat\` 核对已有改动，从中断处继续完成剩余修改与必要的内部验证（不要运行 E2E，也不要执行 \`git add / git commit / git push\`）。
+${developer_result_section}
+EOF
+)"
+      else
+        current_prompt="$prompt"$'\n\n'"上次运行达到 ${DEV_TIMEOUT} 超时上限。这是第 ${timeout_retries}/${max_t_retries} 次超时重试。请先用 git status 和 git diff --stat 核对当前 worktree 中保留的改动，从中断处继续开发和内部验证，再按上面的要求返回结果。"
+      fi
       "$SLEEP_BIN" 3
       continue
     fi

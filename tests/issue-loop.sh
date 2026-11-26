@@ -1,0 +1,275 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+repo_dir="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)"
+fixture="$(mktemp -d)"
+trap 'rm -rf -- "$fixture"' EXIT
+mkdir -p "$fixture/bin" "$fixture/workflow/lib" "$fixture/home/codex" "$fixture/home/agy"
+cp "$repo_dir"/*.sh "$fixture/workflow/"
+cp "$repo_dir"/lib/*.sh "$fixture/workflow/lib/"
+
+fail() {
+  printf 'FAIL %s\n' "$*" >&2
+  exit 1
+}
+
+# 准备测试仓库与远端 bare origin
+git init -q -b main "$fixture/repo"
+git -C "$fixture/repo" config user.name Test
+git -C "$fixture/repo" config user.email test@example.invalid
+printf 'base\n' > "$fixture/repo/app.txt"
+git -C "$fixture/repo" add app.txt
+git -C "$fixture/repo" commit -qm initial
+git clone -q --bare "$fixture/repo" "$fixture/origin"
+git -C "$fixture/repo" remote add origin "$fixture/origin"
+git -C "$fixture/repo" fetch -q origin
+
+export MOCK_DIR="$fixture"
+export REPO_DIR="$fixture/repo"
+export REPO=example/issue-fixture
+export GONGCAO_HOME="$fixture/home"
+export INIT_LABELS=0
+export POLL_INTERVAL=1
+export PATH="$fixture/bin:$PATH"
+
+cat > "$fixture/workflow/gh-state.sh" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+case "$*" in
+  'list-issues '*'agy:changes-requested'*)
+    printf '[]\n'
+    ;;
+  'list-issues '*)
+    cat "$MOCK_DIR/issues.json"
+    ;;
+  'set-state issue '*)
+    printf '%s\n' "$*" >> "$MOCK_DIR/calls"
+    ;;
+  'comment issue '*)
+    cat >/dev/null
+    ;;
+  'find-pr '*)
+    ;;
+  'ensure-pr '*)
+    printf '%s\n' "$*" >> "$MOCK_DIR/calls"
+    printf 'https://example.invalid/pull/99\n'
+    ;;
+  *)
+    printf 'Unexpected gh-state call: %s\n' "$*" >&2
+    exit 98
+    ;;
+esac
+EOF
+
+cat > "$fixture/bin/gh" <<'EOF'
+#!/usr/bin/bash
+case "$1" in
+  --version) printf 'gh version 2.60.0-mock\n' ;;
+  auth) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+
+cat > "$fixture/bin/codex" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'codex-cli 0.172.0-mock\n'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$MOCK_DIR/codex-args.log"
+out_file=""
+while (( $# > 0 )); do
+  if [[ "$1" == "-o" ]]; then
+    out_file="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+count=0
+[[ -f "$MOCK_DIR/codex-count" ]] && count="$(<"$MOCK_DIR/codex-count")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$MOCK_DIR/codex-count"
+cat > "$MOCK_DIR/prompt-${count}.txt"
+printf '{"type":"thread.started","thread_id":"thread-abc-123"}\n'
+
+mode="$(<"$MOCK_DIR/codex-mode")"
+case "$mode" in
+  complete)
+    printf 'change-%s\n' "$count" >> app.txt
+    printf '{"status":"completed","summary":"已完成开发","blocked_reason":"","commit_message":"feat: mock change","branch_name":"feat/mock-codex"}\n' > "$out_file"
+    ;;
+  schema-retry)
+    if (( count == 1 )); then
+      printf 'schema-fix\n' >> app.txt
+      printf '{"status":"completed","summary":"","blocked_reason":"","commit_message":"","branch_name":""}\n' > "$out_file"
+    else
+      printf '{"status":"completed","summary":"修正输出后完成","blocked_reason":"","commit_message":"feat: schema retry","branch_name":"feat/schema-retry"}\n' > "$out_file"
+    fi
+    ;;
+  blocked)
+    printf '{"status":"blocked","summary":"","blocked_reason":"缺少需求澄清","commit_message":"","branch_name":""}\n' > "$out_file"
+    ;;
+  timeout-then-ok)
+    if (( count == 1 )); then
+      printf 'partial-work\n' >> app.txt
+      exit 124
+    else
+      printf '{"status":"completed","summary":"超时续接完成","blocked_reason":"","commit_message":"feat: timeout resume","branch_name":"feat/timeout-resume"}\n' > "$out_file"
+    fi
+    ;;
+  quota-worded)
+    printf 'Rate limit reached. Please try again in 10 minutes.\n' >&2
+    exit 1
+    ;;
+  *)
+    printf 'Unknown mode: %s\n' "$mode" >&2
+    exit 99
+    ;;
+esac
+EOF
+
+cat > "$fixture/bin/agy" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  printf '1.5.18-mock\n'
+  exit 0
+fi
+printf '%s\n' "agy-invoked" >> "$MOCK_DIR/calls"
+printf '{"conversation_id":"conv-agy-1"}\n'
+exit 1
+EOF
+
+cat > "$fixture/bin/sleep" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'sleep 9.4-mock\n'
+  exit 0
+fi
+count=0
+[[ -f "$MOCK_DIR/sleep-count" ]] && count="$(<"$MOCK_DIR/sleep-count")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$MOCK_DIR/sleep-count"
+if (( count >= MOCK_SLEEPS )); then exit 91; fi
+EOF
+
+chmod +x "$fixture/workflow/gh-state.sh" "$fixture/bin/"*
+
+run_dev_loop() {
+  local engine="$1" sleeps="${2:-1}" rc=0
+  shift 2 || true
+  printf '0\n' > "$fixture/sleep-count"
+  MOCK_SLEEPS="$sleeps" "$@" timeout 20s bash "$fixture/workflow/${engine}-issue-loop.sh" > "$fixture/loop.log" 2>&1 || rc=$?
+  [[ "$rc" == "91" ]] || { cat "$fixture/loop.log" >&2; fail "$engine exit $rc"; }
+}
+
+set_issue() {
+  local num="$1" title="$2" body="$3"
+  jq -n --argjson n "$num" --arg t "$title" --arg b "$body" \
+    '[{number:$n, title:$t, body:$b, url:("https://example.invalid/issues/" + ($n|tostring)), state:"OPEN", labels:[{name:"agy:todo"}]}]' \
+    > "$fixture/issues.json"
+}
+
+assert_calls() {
+  local expected="$1" call="$2" actual
+  actual="$(grep -Fxc -- "$call" "$fixture/calls" || true)"
+  [[ "$actual" == "$expected" ]] || { [[ -f "$fixture/loop.log" ]] && cat "$fixture/loop.log" >&2; fail "$call 执行 $actual 次，预期 $expected 次"; }
+}
+
+state_dir="$GONGCAO_HOME/state/example__issue-fixture"
+
+# 1. check-deps.sh --engine codex 在没有 agy 时应通过
+mkdir -p "$fixture/bin-no-agy"
+for f in "$fixture/bin/"*; do
+  [[ "$(basename "$f")" == "agy" ]] && continue
+  ln -sf "$f" "$fixture/bin-no-agy/$(basename "$f")"
+done
+PATH="$fixture/bin-no-agy:/usr/bin:/bin" bash "$fixture/workflow/check-deps.sh" --engine codex > "$fixture/deps.log" 2>&1 \
+  || { cat "$fixture/deps.log" >&2; fail 'check-deps.sh --engine codex 在缺少 agy 时失败'; }
+
+# 2. 正常 completed 流程 + CODEX_REASONING_EFFORT="" 不传非法 -c 参数
+printf 'complete' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+set_issue 10 "测试正常开发" "完整需求描述-10"
+run_dev_loop codex 1 env CODEX_REASONING_EFFORT=""
+assert_calls 1 'set-state issue 10 in-review'
+if grep -Fq 'model_reasoning_effort' "$fixture/codex-args.log"; then
+  fail 'CODEX_REASONING_EFFORT 为空时仍传入了 model_reasoning_effort'
+fi
+
+# 3. Codex JSON Schema 偶发不合规 -> 自动续接原会话修正一次并成功
+printf 'schema-retry' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-args.log"
+set_issue 11 "测试 Schema 自动重试" "完整需求描述-11"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 11 in-review'
+[[ "$(<"$fixture/codex-count")" == "2" ]] || fail 'Schema 重试次数不符合预期'
+grep -Fq 'resume thread-abc-123' "$fixture/codex-args.log" || fail 'Schema 重试未续接原会话'
+
+# 4. Codex 返回 status=blocked -> 标为 blocked 且不创建 PR
+printf 'blocked' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+set_issue 12 "测试主动阻塞" "完整需求描述-12"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 12 blocked'
+if grep -Fq 'ensure-pr 12 ' "$fixture/calls"; then
+  fail 'blocked 状态不应创建 PR'
+fi
+
+# 5. 超时重试 -> 续接原会话并使用精简提示词（不重复粘贴原 Issue 正文）
+printf 'timeout-then-ok' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+set_issue 13 "测试超时续接" "UNIQUE_ISSUE_BODY_MARKER_13"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 13 in-review'
+grep -Fq 'UNIQUE_ISSUE_BODY_MARKER_13' "$fixture/prompt-1.txt" || fail '首轮提示词缺少 Issue 正文'
+if grep -Fq 'UNIQUE_ISSUE_BODY_MARKER_13' "$fixture/prompt-2.txt"; then
+  fail '超时续接原会话时不应重复粘贴整段原始 prompt'
+fi
+
+# 6. Codex 英文时长限流（try again in 10 minutes）-> 写入 codex 独立冷却文件且不阻塞 agy
+printf 'quota-worded' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+set_issue 14 "测试按引擎隔离冷却" "完整需求描述-14"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 14 todo'
+[[ -s "$state_dir/quota_reset_until.codex" ]] || fail '未写入按引擎隔离的 quota_reset_until.codex'
+[[ ! -f "$state_dir/quota_reset_until" ]] || fail '不应继续写入共享的 quota_reset_until'
+# agy 应不受 quota_reset_until.codex 影响，能够立即认领并调用 agy
+run_dev_loop agy 1
+assert_calls 1 agy-invoked
+
+# 7. 验证 parse_reset_wait_seconds 对多种格式解析正确
+bash -euo pipefail -c '
+  GREP_BIN="$(command -v grep)"
+  DATE_BIN="$(command -v date)"
+  eval "$(sed -n "/^parse_reset_wait_seconds()/,/^}/p" "'"$fixture"'/workflow/lib/issue-loop.sh")"
+  f="'"$fixture"'/rate.log"
+  printf "resets in 1h2m3s\n" > "$f"
+  [[ "$(parse_reset_wait_seconds "$f")" == "3723" ]]
+  printf "Please try again in 2 hours 15 minutes.\n" > "$f"
+  [[ "$(parse_reset_wait_seconds "$f")" == "8100" ]]
+  printf "Please try again in 1.5 seconds.\n" > "$f"
+  [[ "$(parse_reset_wait_seconds "$f")" == "2" ]]
+  printf "{\"retry_after\": 90}\n" > "$f"
+  [[ "$(parse_reset_wait_seconds "$f")" == "90" ]]
+  future_iso="$(date -u -d "+180 seconds" "+%Y-%m-%dT%H:%M:%SZ")"
+  printf "Usage limit resets at %s\n" "$future_iso" > "$f"
+  got="$(parse_reset_wait_seconds "$f")"
+  (( got >= 170 && got <= 190 ))
+'
+
+# 8. 锁互斥：持有 issue-loop.lock 时第二个实例立即退出
+(
+  flock -x 9
+  if MOCK_SLEEPS=1 timeout 10s bash "$fixture/workflow/codex-issue-loop.sh" > "$fixture/lock.log" 2>&1; then
+    fail '持有锁时第二个开发循环不应启动成功'
+  fi
+  grep -Fq '已有开发循环运行' "$fixture/lock.log" || fail '锁互斥报错信息不符合预期'
+) 9>"$state_dir/issue-loop.lock"
+
+printf 'issue loop tests passed\n'
