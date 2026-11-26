@@ -42,6 +42,14 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   DRY_RUN       默认 0（设为 1 可全链路演练）
   POLL_INTERVAL 默认 60
   BASE_BRANCH   可选基准分支
+  DEV_ENGINE    开发执行器 agy 或 codex，默认 agy
+
+首次启动前，请运行所选开发执行器的登录入口:
+  ./agy-issue-loop.sh login
+  ./codex-issue-loop.sh login
+
+使用 Codex 处理 Issue:
+  DEV_ENGINE=codex ./start-gongcao.sh simonjiao/airdb
 EOF
   exit 2
 fi
@@ -86,10 +94,25 @@ case "$ACTION" in
     ;;
 
   start)
+    dev_engine="${DEV_ENGINE:-agy}"
+    case "$dev_engine" in
+      agy|codex) ;;
+      *)
+        printf '错误：DEV_ENGINE=%q 无效，支持 agy 和 codex。\n' "$dev_engine" >&2
+        exit 2
+        ;;
+    esac
+
     if "$TMUX_BIN" has-session -t "$SESSION_NAME" 2>/dev/null; then
       printf 'tmux 会话 %s 已在运行！使用下面命令进入查看：\n' "$SESSION_NAME"
       printf '  %s attach-session -t %s\n' "$TMUX_BIN" "$SESSION_NAME"
       exit 0
+    fi
+
+    if [[ ! -d "${GONGCAO_HOME}/${dev_engine}" ]]; then
+      printf '错误：请先运行 %q login 初始化 %s/%s。\n' \
+        "${SCRIPT_DIR}/${dev_engine}-issue-loop.sh" "$GONGCAO_HOME" "$dev_engine" >&2
+      exit 1
     fi
 
     "$MKDIR_BIN" -p "$STATE_ROOT"
@@ -99,9 +122,17 @@ case "$ACTION" in
     env_prefix="REPO=$(printf '%q' "$REPO_ARG") GONGCAO_HOME=$(printf '%q' "$GONGCAO_HOME") DRY_RUN=$(printf '%q' "$DRY_RUN") POLL_INTERVAL=$(printf '%q' "$POLL_INTERVAL")"
     [[ -n "$BASE_BRANCH" ]] && env_prefix+=" BASE_BRANCH=$(printf '%q' "$BASE_BRANCH")"
 
-    # 窗口 0：dev (agy-issue-loop.sh)
+    # 窗口 0：dev
+    dev_env_prefix="$env_prefix"
+    if [[ "$dev_engine" == "codex" ]]; then
+      for name in CODEX_MODEL CODEX_REASONING_EFFORT CODEX_DEV_TIMEOUT; do
+        if [[ -n "${!name:-}" ]]; then
+          dev_env_prefix+=" ${name}=$(printf '%q' "${!name}")"
+        fi
+      done
+    fi
     "$TMUX_BIN" new-session -d -s "$SESSION_NAME" -n "dev" \
-      "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/agy-issue-loop.sh")"
+      "${dev_env_prefix} $(printf '%q' "${SCRIPT_DIR}/${dev_engine}-issue-loop.sh")"
     # 防止任何窗口进程意外退出时窗口直接消失，保留最后报错现场
     "$TMUX_BIN" set-option -t "$SESSION_NAME" remain-on-exit on
 
