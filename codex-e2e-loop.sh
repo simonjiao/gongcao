@@ -63,6 +63,8 @@ CODEX_TIMEOUT="${CODEX_TIMEOUT:-30m}"        # 单次 E2E 验收超时上限，�
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-40000}"    # 嵌入 prompt 的 diff 最大字节数
 MAX_E2E_ROUNDS="${MAX_E2E_ROUNDS:-3}"        # 最大连续 E2E fail 打回轮数（pass 后清零，blocked 环境受阻不计入），超过则切 blocked
 MAX_TOTAL_E2E_ROUNDS="${MAX_TOTAL_E2E_ROUNDS:-6}" # 单 PR 生命周期硬性总 E2E 轮次上限，防止死循环
+MAX_E2E_CRASH_RETRIES="${MAX_E2E_CRASH_RETRIES:-2}" # 同 PR+SHA 连续异常退出/超时重试上限，超过则切 blocked 防止无限叠实例
+E2E_ON_CRASH_CLEANUP_CMD="${E2E_ON_CRASH_CLEANUP_CMD:-}" # 可选：Codex E2E 异常退出时触发的宿主机兜底清理命令
 AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}" # E2E 代码缺陷 fail 时是否将关联 Issue 切为 changes-requested
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
@@ -139,8 +141,8 @@ printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  E2E 档案根 : %s\n' "$E2E_ROOT"
 printf '  E2E 环境档 : %s\n' "${E2E_ENV_FILE:-(按仓库自身文档)}"
 printf '  证据归档   : %s (branch=%s, max=%sMB)\n' "$PUBLISH_EVIDENCE" "$E2E_EVIDENCE_BRANCH" "$MAX_EVIDENCE_FILE_MB"
-printf '  监听标签   : %s (MAX_E2E_ROUNDS=%s, MAX_TOTAL_E2E_ROUNDS=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
-  "$E2E_TARGET_LABEL" "$MAX_E2E_ROUNDS" "$MAX_TOTAL_E2E_ROUNDS" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
+printf '  监听标签   : %s (MAX_E2E_ROUNDS=%s, MAX_TOTAL_E2E_ROUNDS=%s, MAX_E2E_CRASH_RETRIES=%s, AUTO_REQUEUE_ISSUE=%s, DRY_RUN=%s)\n' \
+  "$E2E_TARGET_LABEL" "$MAX_E2E_ROUNDS" "$MAX_TOTAL_E2E_ROUNDS" "$MAX_E2E_CRASH_RETRIES" "$AUTO_REQUEUE_ISSUE" "$DRY_RUN"
 
 LABELS_READY=0
 if [[ "$INIT_LABELS" == "1" ]]; then
@@ -651,6 +653,7 @@ EOF
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 验收 Commit: \`${head_sha}\`
 - E2E 轮次: 本周期第 ${cycle_round} / ${MAX_E2E_ROUNDS} 轮（累计第 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮）
+- 建议隔离实例 ID: \`gongcao-pr-${pr_num}\`（同一 PR 固定复用此确定性 ID，启动前先销毁同名残留，禁止叠加多套带时间戳的运行实例）
 
 ### PR 描述
 ${pr_body:-"(empty)"}
@@ -667,11 +670,12 @@ ${pr_diff_snippet:-"(空 diff)"}
 1. 当前工作目录是 PR 最新提交（\`${head_sha}\`）的独立检出（\`${e2e_wt}\`）。**不要预设 E2E 必须在当前本机启动服务**；先阅读目标仓库的规范与验收入口文档（如 \`AGENTS.md\`、\`qa/README.md\`、\`docs/\`、\`README.md\` 等）以及上方外部环境说明，优先直接调用仓库既有或本 PR 已最小扩展好的维护中 QA action/spec；仅在确实无维护入口时才编写外部临时驱动，一次性核齐前置 fixture（如 \`fixture_mysql\`）与核心必测场景，核心场景全部通过后若确需补测个别边界，**只运行独立轻量增量脚本，禁止把已通过的全量流程从头重跑**；向远端或隔离目录同步/解包候选源码时**保持 Git 原始文件权限（勿使用 \`umask 077\`）**，避免容器内非 root 进程无法读取挂载的初始化脚本。
 2. **严禁修改仓库业务代码或提交 commit**，也不要执行 git push 或直接操作 GitHub Issue/PR；你只负责验收与输出客观证据。
 3. 将本次验收产生的关键原始证据（日志、命令输出、报告或截图等，**注意脱敏，勿写入明文密码/Token/私钥**）保存到专用目录 \`${artifacts_dir}\`，外层脚本会自动将其归档推送到独立的远程证据分支 \`${E2E_EVIDENCE_BRANCH}\` 并在 PR/Issue 中关联链接；同时在 \`evidence_paths\` 中列出关键文件路径。验收结束后按仓库规范清理你本次创建的临时资源、测试数据或临时进程，不要在仓库工作区残留脏文件；清理本机或远端临时目录/文件（含 \`trap\` 回调）时**不要使用 \`rm -f\` 或 \`rm -rf\`**（会被 Codex 工具路由器安全策略拦截），请优先调用仓库自带清理入口或改用 Python \`shutil.rmtree\` / \`Path.unlink(missing_ok=True)\` 等安全方式。
-4. 严格区分三种结论（\`verdict\`）：
+4. **严禁使用字节码反编译或调试器/断点注入手段**：禁止运行 \`javap\` 字节码反编译、挂载 JDWP 调试器（\`-agentlib:jdwp\`）或编写断点注入探针（如 \`ReplayProbe\` / \`jdb\`），此类操作会触发安全风控并导致远端环境泄漏。跨版本断点恢复等细粒度边界由内部单测覆盖；E2E 仅通过标准服务启停、公开接口、数据库状态与真实浏览器 UI 进行验证。
+5. 严格区分三种结论（\`verdict\`）：
    - \`pass\`：按仓库规范在目标验收环境中完成了针对 Issue 核心场景的真实端到端验证且全部通过，证据充分。
    - \`fail\`：目标验收环境正常，但实测暴露了**代码功能缺陷、回归或未满足 Issue 验收标准**；必须在 \`failure_details\` 中给出可复现步骤、实际结果与期望结果。
    - \`blocked\`：**无法完成仓库要求的真实 E2E 验收**（例如目标远端环境/容器/数据库/浏览器/凭证不可用或环境故障），不要把环境问题误判为 \`fail\`，也不要用本机单测或替代方案冒充真实 E2E 通过。
-5. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
+6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
 EOF
 
   codex_args=(
@@ -708,16 +712,86 @@ EOF
   # 清理 E2E 过程中可能在 worktree 产生的未跟踪文件，保持 worktree 干净
   cleanup_e2e_worktree "$e2e_wt"
 
+  crash_file="${e2e_dir}/crash_count.txt"
   if (( codex_ok == 0 )); then
-    if (( codex_rc == 124 )); then
-      printf '[%s] 警告：Codex E2E 验收 PR #%s 超时（上限 %s，日志：%s），%ss 后重试...\n' \
-        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$CODEX_TIMEOUT" "$events_file" "$POLL_INTERVAL" >&2
+    if [[ -n "$E2E_ON_CRASH_CLEANUP_CMD" ]]; then
+      PR_NUM="$pr_num" ISSUE_NUM="$issue_num" HEAD_SHA="$head_sha" E2E_INSTANCE_ID="gongcao-pr-${pr_num}" \
+        bash -lc "$E2E_ON_CRASH_CLEANUP_CMD" || true
+    fi
+
+    crash_fatal_reason=""
+    if [[ -s "$events_file" ]] && "$GREP_BIN" -iqE 'flagged for possible cybersecurity risk|policy violation' "$events_file" 2>/dev/null; then
+      crash_fatal_reason="Codex 会话被安全风控中断（cybersecurity risk）"
+    fi
+
+    prev_crash_sha=""
+    prev_crash_count=0
+    if [[ -f "$crash_file" ]]; then
+      _raw_crash="$(<"$crash_file")"
+      _raw_crash="${_raw_crash//$'\r'/}"
+      _raw_crash="${_raw_crash//$'\n'/}"
+      if [[ "$_raw_crash" == *:* ]]; then
+        prev_crash_sha="${_raw_crash%%:*}"
+        _cnt="${_raw_crash#*:}"
+        [[ "$_cnt" =~ ^[0-9]+$ ]] && prev_crash_count="$_cnt"
+      fi
+    fi
+
+    if [[ "$prev_crash_sha" == "$head_sha" ]]; then
+      crash_count=$((prev_crash_count + 1))
     else
-      printf '[%s] 警告：Codex E2E 验收 PR #%s 执行异常或输出不符合 Schema（exit=%d，日志：%s），%ss 后重试...\n' \
-        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$codex_rc" "$events_file" "$POLL_INTERVAL" >&2
+      crash_count=1
+    fi
+    if [[ "$DRY_RUN" != "1" ]]; then
+      printf '%s:%d\n' "$head_sha" "$crash_count" > "$crash_file"
+    fi
+
+    if [[ -n "$crash_fatal_reason" ]] || (( crash_count >= MAX_E2E_CRASH_RETRIES )); then
+      crash_reason_desc="${crash_fatal_reason:-Codex 连续异常退出或超时（exit=${codex_rc}，第 ${crash_count}/${MAX_E2E_CRASH_RETRIES} 次）}"
+      crash_notice_md="$("$CAT_BIN" <<EOF
+### Codex E2E 验收中止（\`${LABEL_PREFIX}blocked\`）
+
+- **关联 Issue**: #${issue_num:-"(未关联)"}
+- **验收 Commit**: \`${head_sha:0:10}\`
+- **中止原因**: ${crash_reason_desc}
+- **原始日志**: \`${events_file}\`
+
+> ⚠️ E2E 执行过程中发生异常中断（已拦截无休止重试，防止远端容器重复堆叠）。请先确认远端验收环境残余容器已清理，再将 PR/Issue 标签改回 \`${E2E_TARGET_LABEL}\` 重跑。
+EOF
+)"
+      printf '%s\n' "$crash_notice_md" > "$comment_file"
+      printf '%s\n' "$crash_notice_md" | gh_state comment pr "$pr_num" - "$E2E_COMMENT_MARKER" || true
+      gh_state set-state pr "$pr_num" blocked || true
+      if [[ -n "$issue_num" ]]; then
+        printf '%s\n' "$crash_notice_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
+        gh_state set-state issue "$issue_num" blocked || true
+      fi
+      if [[ "$DRY_RUN" != "1" ]]; then
+        : > "$crash_file"
+      fi
+      total_elapsed=$((SECONDS - task_start_sec))
+      end_ts="$("$DATE_BIN" '+%F %T')"
+      printf '[%s] 错误：Codex E2E 验收 PR #%s %s，已切为 %sblocked（日志：%s）\n' \
+        "$end_ts" "$pr_num" "$crash_reason_desc" "$LABEL_PREFIX" "$events_file" >&2
+      printf '[%s] [codex-e2e] PR #%s (Issue #%s, r%d) -> crash-blocked (%sblocked, %ds) %s\n' \
+        "$end_ts" "$pr_num" "${issue_num:-?}" "$current_round" "$LABEL_PREFIX" "$total_elapsed" "$events_file" >> "$ACTIVITY_LOG"
+      "$SLEEP_BIN" 5
+      continue
+    fi
+
+    if (( codex_rc == 124 )); then
+      printf '[%s] 警告：Codex E2E 验收 PR #%s 超时（上限 %s，异常重试 %d/%d，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$CODEX_TIMEOUT" "$crash_count" "$MAX_E2E_CRASH_RETRIES" "$events_file" "$POLL_INTERVAL" >&2
+    else
+      printf '[%s] 警告：Codex E2E 验收 PR #%s 执行异常或输出不符合 Schema（exit=%d，异常重试 %d/%d，日志：%s），%ss 后重试...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$pr_num" "$codex_rc" "$crash_count" "$MAX_E2E_CRASH_RETRIES" "$events_file" "$POLL_INTERVAL" >&2
     fi
     "$SLEEP_BIN" "$POLL_INTERVAL"
     continue
+  fi
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    : > "$crash_file"
   fi
 
   verdict="$("$JQ_BIN" -r '.verdict' "$result_file")"
