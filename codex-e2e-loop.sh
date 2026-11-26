@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
+source "$SCRIPT_DIR/lib/release-handoff.sh"
 
 # 解析所需命令的绝对路径（包含 linuxbrew 路径以定位 codex）
 SEARCH_PATH="${PATH}:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
@@ -242,6 +243,11 @@ extract_linked_issue() {
   local pr_body="$1"
   local head_branch="$2"
   local match="" num=""
+  num="$(release_issue_from_pr "$pr_body")"
+  if [[ -n "$num" ]]; then
+    printf '%s' "$num"
+    return
+  fi
 
   match="$("$GREP_BIN" -oiE -m 1 '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<<"$pr_body" || true)"
   [[ -n "$match" ]] && num="${match##*#}"

@@ -5,6 +5,7 @@ DEV_ENGINE="$1"
 DEV_ACTION="${2:-run}"
 SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
+source "$SCRIPT_DIR/lib/release-handoff.sh"
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
 
 # 解析所需命令的绝对路径（一律全路径调用）
@@ -1431,6 +1432,10 @@ EOF
             fi
 
             if (( push_ok == 1 )); then
+              issue_reference="Closes #${number}"
+              if is_release_issue "$body"; then
+                issue_reference="$(release_pr_reference "$number")"
+              fi
               "$CAT_BIN" > "$pr_body_file" <<EOF
 ## Summary
 
@@ -1442,7 +1447,7 @@ ${summary_text:-"Automated changes for issue #${number}."}
 - ${SESSION_ID_LABEL}: \`${final_session_id:-"(none)"}\`
 - Verification Scope: 仅完成开发实现与内部验证（未执行 E2E 验证）
 
-Closes #${number}
+${issue_reference}
 EOF
               pr_title="fix(#${number}): ${title}"
               if pr_url="$(gh_state ensure-pr "$number" "$branch" "$pr_base_branch" "$pr_title" "$pr_body_file")"; then
