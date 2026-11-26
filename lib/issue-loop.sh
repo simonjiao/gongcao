@@ -520,6 +520,73 @@ ensure_worktree() {
   printf '%s' "$wt_dir"
 }
 
+# 复用已有开发 worktree 时，核对本地 HEAD 与远端同名分支/PR 最新提交是否一致：
+# - 若工作区干净且单纯落后，安全快进（ff-only）到远端最新提交，避免在陈旧树上打补丁；
+# - 若存在未提交脏修改、分支不匹配或历史分叉，保留现场不覆盖，输出诊断原因供外层转 blocked。
+sync_worktree_with_remote() {
+  local wt_dir="$1"
+  local expected_branch="$2"
+  local diag_file="$3"
+
+  : > "$diag_file"
+  local remote_ref="refs/remotes/origin/${expected_branch}"
+  if ! "$GIT_BIN" -C "$wt_dir" show-ref --verify --quiet "$remote_ref"; then
+    return 0
+  fi
+
+  local local_sha="" remote_sha="" cur_branch="" dirty=""
+  local_sha="$("$GIT_BIN" -C "$wt_dir" rev-parse HEAD 2>/dev/null || true)"
+  remote_sha="$("$GIT_BIN" -C "$wt_dir" rev-parse "$remote_ref" 2>/dev/null || true)"
+  cur_branch="$("$GIT_BIN" -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  dirty="$("$GIT_BIN" -C "$wt_dir" status --porcelain 2>/dev/null || true)"
+
+  if [[ -z "$local_sha" || -z "$remote_sha" || "$local_sha" == "$remote_sha" ]]; then
+    return 0
+  fi
+
+  # 若本地严格领先远端（上次已有未推送提交），保持本地进度不回退
+  if "$GIT_BIN" -C "$wt_dir" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    return 0
+  fi
+
+  # 若存在未完成 merge，交由后续 prepare_base_merge 判定；仅处理明确落后/分叉场景
+  if [[ "$cur_branch" != "$expected_branch" ]]; then
+    printf '开发 worktree 当前位于分支 `%s`（预期 `%s`），且与远端 `%s`（`%s`）不一致，已保留现场暂停自动推进。' \
+      "$cur_branch" "$expected_branch" "$expected_branch" "${remote_sha:0:10}" > "$diag_file"
+    return 1
+  fi
+
+  if "$GIT_BIN" -C "$wt_dir" merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; then
+    local behind_cnt=""
+    behind_cnt="$("$GIT_BIN" -C "$wt_dir" rev-list --count "${local_sha}..${remote_sha}" 2>/dev/null || printf '?')"
+    if [[ -n "$dirty" ]]; then
+      printf '开发 worktree（`%s`）落后远端 `origin/%s` 共 %s 个提交（本地 `%s` < 远端 `%s`），但工作区存在未提交改动，拒绝覆盖现场。请人工处理后重试。' \
+        "$wt_dir" "$expected_branch" "$behind_cnt" "${local_sha:0:10}" "${remote_sha:0:10}" > "$diag_file"
+      return 1
+    fi
+    printf '[%s] 检测到开发 worktree 落后远端 origin/%s 共 %s 个提交（%s -> %s），执行安全快进...\n' \
+      "$("$DATE_BIN" '+%F %T')" "$expected_branch" "$behind_cnt" "${local_sha:0:10}" "${remote_sha:0:10}" >&2
+    if ! "$GIT_BIN" -C "$wt_dir" merge --ff-only "$remote_sha" >&2; then
+      printf '开发 worktree 快进到远端 `origin/%s`（`%s`）失败，已保留现场暂停推进。' \
+        "$expected_branch" "${remote_sha:0:10}" > "$diag_file"
+      return 1
+    fi
+    local after_sha=""
+    after_sha="$("$GIT_BIN" -C "$wt_dir" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$after_sha" != "$remote_sha" ]]; then
+      printf '开发 worktree 快进后实际 HEAD (`%s`) 与远端目标 (`%s`) 不一致，已暂停推进。' \
+        "${after_sha:0:10}" "${remote_sha:0:10}" > "$diag_file"
+      return 1
+    fi
+    return 0
+  fi
+
+  # 既非祖先也非后代：本地与远端历史分叉
+  printf '开发 worktree（`%s`）本地提交 `%s` 与远端 `origin/%s`（`%s`）历史已分叉，已保留现场拒绝覆盖。请人工对账后再恢复自动开发。' \
+    "$wt_dir" "${local_sha:0:10}" "$expected_branch" "${remote_sha:0:10}" > "$diag_file"
+  return 1
+}
+
 # 同步主干基准分支到当前 worktree；若发生冲突则保留冲突标记和文件清单。
 prepare_base_merge() {
   local wt_dir="$1"
@@ -980,6 +1047,33 @@ while true; do
   fi
   if ! is_placeholder_or_legacy_branch "$branch"; then
     printf '%s\n' "$branch" > "$branch_name_file"
+  fi
+
+  # 复用已有开发 worktree 时先与远端同名分支对账（干净且落后则 ff-only；脏树或分叉则保留现场转 blocked）
+  wt_sync_diag_file="${session_dir}/worktree-sync-diag-${run_ts}.txt"
+  if ! sync_worktree_with_remote "$wt_dir" "$branch" "$wt_sync_diag_file"; then
+    wt_sync_reason="$("$CAT_BIN" "$wt_sync_diag_file" 2>/dev/null || printf '工作树与远端提交不一致')"
+    printf '[%s] 错误：Issue #%s 工作树对账失败：%s\n' "$("$DATE_BIN" '+%F %T')" "$number" "$wt_sync_reason" >&2
+    if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
+      existing_pr_lookup="$(gh_state find-pr "$branch" 2>/dev/null || true)"
+      existing_pr_num="${existing_pr_lookup%%$'\t'*}"
+      existing_pr_url="${existing_pr_lookup#*$'\t'}"
+      post_status_comment issue "$number" "blocked" "$branch" "" "$existing_pr_url" \
+        "宿主机工作树与候选提交对账失败，已保留本地现场并暂停自动开发："$'\n\n'"- ${wt_sync_reason}"
+      gh_state set-state issue "$number" blocked || true
+      if [[ -n "$existing_pr_num" ]]; then
+        post_status_comment pr "$existing_pr_num" "blocked" "$branch" "" "$existing_pr_url" \
+          "宿主机工作树与候选提交对账失败，已保留本地现场并暂停自动开发："$'\n\n'"- ${wt_sync_reason}"
+        gh_state set-state pr "$existing_pr_num" blocked || true
+      fi
+    fi
+    finish_iso="$("$DATE_BIN" --iso-8601=seconds)"
+    write_session_meta "$meta_file" "$number" "$title" "$url" "$state" "$labels" \
+      "$branch" "$wt_dir" "" "${existing_pr_url:-}" "blocked" "$finish_iso"
+    printf '[%s] [%s-dev] Issue #%s -> %sblocked (%ds) %s\n' \
+      "$("$DATE_BIN" '+%F %T')" "$DEV_ENGINE" "$number" "$LABEL_PREFIX" "$((SECONDS - task_start_sec))" "${existing_pr_url:-$branch}" >> "$ACTIVITY_LOG"
+    "$SLEEP_BIN" 5
+    continue
   fi
 
   # 同步最新基准分支到当前 worktree，将冲突现场交给开发 Agent 处理。

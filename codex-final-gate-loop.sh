@@ -46,6 +46,8 @@ STATE_BASE="${STATE_BASE:-${GONGCAO_HOME}/state}"
 
 # shellcheck source=lib/codex-profile.sh
 source "${SCRIPT_DIR}/lib/codex-profile.sh"
+# shellcheck source=lib/git-worktree.sh
+source "${SCRIPT_DIR}/lib/git-worktree.sh"
 init_codex_review_profile "codex-final-gate-loop.sh" "${1:-run}"
 
 REPO="${REPO:-}"                             # 目标 GitHub 仓库 "owner/repo"
@@ -64,6 +66,9 @@ CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
 CODEX_SANDBOX="${CODEX_SANDBOX:-read-only}"
 CODEX_TIMEOUT="${CODEX_TIMEOUT:-15m}"
 AUTO_MERGE="${AUTO_MERGE:-1}"                # 1=终审通过后自动转 Ready 并合并；0=仅更新信息并标 agy:ready-to-merge
+HOLD_MERGE_LABEL="${HOLD_MERGE_LABEL:-${LABEL_PREFIX}hold-merge}" # PR 或关联 Issue 带此标签时宿主机硬拦截转 Ready 与合并
+REQUIRE_OWNER_MERGE_APPROVAL="${REQUIRE_OWNER_MERGE_APPROVAL:-0}" # 1=强制所有 PR 均需经身份校验的逐 SHA 评论放行（/approve-merge <sha>）
+MERGE_APPROVERS="${MERGE_APPROVERS:-}"       # 可选：逗号分隔的授权放行 GitHub 登录名白名单（留空默认信任 OWNER/MEMBER/COLLABORATOR）
 MERGE_METHOD="${MERGE_METHOD:-merge}"        # 首选默认合并方式: merge | squash | rebase（默认保留 merge commit）
 FINAL_GATE_JUDGE_MERGE_METHOD="${FINAL_GATE_JUDGE_MERGE_METHOD:-1}" # 1=由终审结合仓库策略、提交拓扑与冲突演练裁定合并方式；0=强制使用 MERGE_METHOD
 AUTO_RESOLVE_TRIVIAL_CONFLICT="${AUTO_RESOLVE_TRIVIAL_CONFLICT:-1}" # 1=终审先判断冲突性质，机械/简单冲突直接就地解决并推进合入，仅实质冲突退回开发；0=一律退回
@@ -147,8 +152,8 @@ printf '  Codex 配置 : %s\n' "$CODEX_PROFILE_DIR"
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  终审档案根 : %s\n' "$FINAL_ROOT"
-printf '  合入策略   : AUTO_MERGE=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), DRY_RUN=%s\n' \
-  "$AUTO_MERGE" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$DRY_RUN"
+printf '  合入策略   : AUTO_MERGE=%s, HOLD_LABEL=%s, REQUIRE_OWNER_APPROVAL=%s, APPROVERS=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), DRY_RUN=%s\n' \
+  "$AUTO_MERGE" "$HOLD_MERGE_LABEL" "$REQUIRE_OWNER_MERGE_APPROVAL" "${MERGE_APPROVERS:-(OWNER/MEMBER/COLLABORATOR)}" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$DRY_RUN"
 printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s, MAX_TOTAL_FINAL_ROUNDS=%s)\n' \
   "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS" "$MAX_TOTAL_FINAL_ROUNDS"
 
@@ -273,32 +278,7 @@ prepare_final_worktree() {
   local pr_num="$1"
   local head_branch="$2"
   local head_sha="$3"
-  local wt_dir="${WORKTREE_ROOT}/final-pr-${pr_num}"
-
-  (
-    "$FLOCK_BIN" -x 9
-    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
-
-    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
-        "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
-    fi
-
-    local target_commit="$head_sha"
-    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
-      target_commit="FETCH_HEAD"
-    fi
-
-    if [[ -e "${wt_dir}/.git" ]]; then
-      "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
-      "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
-    else
-      "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
-    fi
-  ) 9>"$REPO_GIT_LOCK"
-
-  printf '%s' "$wt_dir"
+  checkout_exact_pr_worktree "${WORKTREE_ROOT}/final-pr-${pr_num}" "$pr_num" "$head_branch" "$head_sha"
 }
 
 # 只读检出远端 QA 证据分支最新快照，返回 <ev_wt>\t<ev_branch_sha>
@@ -904,6 +884,104 @@ lookup_resolved_from_sha() {
   printf '%s' "$origin_sha"
 }
 
+# 宿主机逐 PR 合入授权硬门禁：
+# 在转 Ready 和执行 merge 前复读 PR 实时 head/labels、检查 HOLD 标签、识别 Issue 明示 Owner 合入保留，
+# 并核验评论者身份与绑定当前 SHA（或经证实冲突消解父 SHA）的 /approve-merge <sha> 指令。
+evaluate_merge_authorization() {
+  local pr_num="$1"
+  local expected_sha="$2"
+  local resolved_parent_sha="$3"
+  local fallback_pr_labels_json="$4"
+  local issue_labels_json="$5"
+  local issue_title="$6"
+  local issue_body="$7"
+
+  local live_pr_json="" pr_labels_json="$fallback_pr_labels_json"
+  if live_pr_json="$(gh_state get-pr "$pr_num" 2>/dev/null)" \
+    && "$JQ_BIN" -e 'type == "object"' >/dev/null 2>&1 <<<"$live_pr_json"; then
+    local live_state="" live_head=""
+    live_state="$("$JQ_BIN" -r '.state // ""' <<<"$live_pr_json")"
+    live_head="$("$JQ_BIN" -r '.headRefOid // ""' <<<"$live_pr_json")"
+    if [[ -n "$live_state" && "$live_state" != "OPEN" ]]; then
+      "$JQ_BIN" -cn --arg st "$live_state" '{allowed: false, mode: "pr_not_open", reason: ("PR 当前状态为 " + $st + "，非 OPEN，停止合入。"), approver: ""}'
+      return 0
+    fi
+    if [[ -n "$live_head" && "$live_head" != "$expected_sha" ]]; then
+      "$JQ_BIN" -cn --arg live "${live_head:0:10}" --arg exp "${expected_sha:0:10}" \
+        '{allowed: false, mode: "head_changed", reason: ("合入前复读发现 PR 最新提交已变为 " + $live + "（与终审提交 " + $exp + " 不一致），已取消合入。"), approver: ""}'
+      return 0
+    fi
+    pr_labels_json="$("$JQ_BIN" -c '[.labels[]?.name // empty]' <<<"$live_pr_json")"
+  fi
+
+  # 1. 硬性 HOLD 标签拦截（PR 或关联 Issue 任一存在均阻止转 Ready 与合入）
+  if "$JQ_BIN" -e --arg hold "$HOLD_MERGE_LABEL" --argjson ilbls "$issue_labels_json" \
+    '((. + $ilbls) | index($hold)) != null' <<<"$pr_labels_json" >/dev/null 2>&1; then
+    "$JQ_BIN" -cn --arg hold "$HOLD_MERGE_LABEL" \
+      '{allowed: false, mode: "held", reason: ("检测到暂停合入标签 `" + $hold + "`，已保持当前状态并暂停自动转 Ready 与合入。"), approver: ""}'
+    return 0
+  fi
+
+  # 2. 判断是否需要逐 PR 显式 Owner 授权
+  local needs_owner=0 need_reason=""
+  if [[ "$REQUIRE_OWNER_MERGE_APPROVAL" == "1" ]]; then
+    needs_owner=1
+    need_reason="仓库策略 REQUIRE_OWNER_MERGE_APPROVAL=1 要求逐 PR 显式合入授权"
+  elif "$GREP_BIN" -iqE '保留给[[:space:]]*Owner|由[[:space:]]*Owner[[:space:]]*(决定|审批|确认).{0,10}(合入|合并)|Owner[[:space:]]+GO.{0,12}(合入|合并)|禁止自动合(入|并)|勿自动合(入|并)|暂不自动合(入|并)|require[sd]?[[:space:]]+owner[[:space:]]+(merge|approval)|hold[[:space:]]+merge' \
+    <<<"${issue_title}"$'\n'"${issue_body}"; then
+    needs_owner=1
+    need_reason="关联 Issue 明确将合入决定保留给 Owner"
+  fi
+
+  if (( needs_owner == 0 )); then
+    "$JQ_BIN" -cn '{allowed: true, mode: "auto", reason: "", approver: ""}'
+    return 0
+  fi
+
+  # 3. 核验经身份校验的逐 SHA 放行评论（/approve-merge <sha> 或 OWNER_GO:<sha>）
+  local comments_json="[]"
+  if ! comments_json="$(gh_state get-pr-comments "$pr_num" 2>/dev/null)" \
+    || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$comments_json"; then
+    comments_json="[]"
+  fi
+
+  local approver=""
+  approver="$("$JQ_BIN" -r \
+    --arg sha "$expected_sha" \
+    --arg parent "$resolved_parent_sha" \
+    --arg allowlist "$MERGE_APPROVERS" '
+    def is_authorized($allowed_users):
+      if ($allowed_users | length) > 0 then
+        ((.author // "" | ascii_downcase) as $a | ($allowed_users | index($a)) != null)
+      else
+        ((.author_association // "" | ascii_upcase) as $assoc | (["OWNER", "ADMIN", "MAINTAIN", "MEMBER", "COLLABORATOR"] | index($assoc)) != null)
+      end;
+    def matches_sha($tok; $s; $p):
+      ($tok | ascii_downcase) as $t
+      | (($t | length) >= 7) and (($s | startswith($t)) or ($p != "" and ($p | startswith($t))));
+    ($sha | ascii_downcase) as $s
+    | ($parent | ascii_downcase) as $p
+    | ($allowlist | split(",") | map(gsub("^\\s+|\\s+$"; "") | ascii_downcase) | map(select(length > 0))) as $allowed_users
+    | [
+        .[]
+        | select(is_authorized($allowed_users))
+        | . as $c
+        | [($c.body // "") | scan("(?i)(?:^|\\s)(?:/approve-merge|OWNER_GO)[\\s:]+([0-9a-f]{7,40})(?:\\b|$)") | .[0]]
+        | select(any(matches_sha(.; $s; $p)))
+        | $c.author
+      ] | last // empty
+  ' <<<"$comments_json" 2>/dev/null || true)"
+
+  if [[ -n "$approver" ]]; then
+    "$JQ_BIN" -cn --arg approver "$approver" --arg reason "$need_reason" \
+      '{allowed: true, mode: "owner_approved", reason: ($reason + "，已核验 @" + $approver + " 对当前提交的显式放行。"), approver: $approver}'
+    return 0
+  fi
+
+  "$JQ_BIN" -cn --arg reason "$need_reason" --arg pr "$pr_num" --arg sha "$expected_sha" --arg lbl "${LABEL_PREFIX}e2e-passed" \
+    '{allowed: false, mode: "awaiting_owner_approval", reason: ($reason + "，尚未检测到经身份校验且绑定提交 `" + $sha + "` 的放行指令。请由 Owner/维护者在 PR #" + $pr + " 评论 `/approve-merge " + $sha + "` 后切回 `" + $lbl + "` 放行。"), approver: ""}'
+}
+
 consecutive_poll_errors=0
 idle_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
@@ -1122,7 +1200,12 @@ while true; do
       record_resolved_conflict_sha "$final_dir" "$t_new_sha" "$prev_conflict_sha"
       head_sha="$t_new_sha"
       resolved_conflict_note="终审前置合并演练检测到简单机械冲突，已由 final-gate 就地消解并推送合并提交 \`${head_sha:0:10}\`（第一父提交保留原 E2E 验收提交 \`${resolved_from_sha:0:10}\`）。冲突文件：\`${t_cfiles//$'\n'/, }\`；说明：${t_reason}${t_vnote:+；校验：${t_vnote}}"
-      final_wt="$(prepare_final_worktree "$pr_num" "$head_branch" "$head_sha")" || true
+      if ! final_wt="$(prepare_final_worktree "$pr_num" "$head_branch" "$head_sha")"; then
+        printf '[%s] 警告：PR #%s 冲突消解后检出新提交 %s 失败，%ss 后重试...\n' \
+          "$("$DATE_BIN" '+%F %T')" "$pr_num" "${head_sha:0:10}" "$POLL_INTERVAL" >&2
+        "$SLEEP_BIN" "$POLL_INTERVAL"
+        continue
+      fi
       merge_sim_json="$(inspect_git_merge_state "$base_branch" "$head_sha" 0)"
       mt_status="$("$JQ_BIN" -r '.status // "unknown"' <<<"$merge_sim_json")"
       mt_behind="$("$JQ_BIN" -r '.behind_count // 0' <<<"$merge_sim_json")"
@@ -1325,11 +1408,15 @@ EOF
 
   # 4. 拉取关联 Issue 以及完整 PR diff
   issue_section="（未识别到关联 Issue）"
+  issue_title=""
+  issue_body=""
+  issue_labels_json="[]"
   if [[ -n "$issue_num" ]]; then
     if issue_json="$(gh_state get-issue "$issue_num" 2>/dev/null)"; then
       issue_title="$("$JQ_BIN" -r '.title // ""' <<<"$issue_json")"
       issue_body="$("$JQ_BIN" -r '.body // "(empty)"' <<<"$issue_json")"
       issue_labels="$("$JQ_BIN" -r '([.labels[]?.name] | join(", ")) // "(none)"' <<<"$issue_json")"
+      issue_labels_json="$("$JQ_BIN" -c '[.labels[]?.name // empty]' <<<"$issue_json")"
       issue_url="$("$JQ_BIN" -r '.url // ""' <<<"$issue_json")"
       issue_section="$("$CAT_BIN" <<EOF
 - Issue: #${issue_num} (${issue_url})
@@ -1385,8 +1472,8 @@ EOF
 - 分支: \`${head_branch}\` -> \`${base_branch}\`
 - 最终 Commit SHA: \`${head_sha}\`
 - E2E 入场模式: ${e2e_entry_mode_desc}
-- Draft 状态: \`${is_draft}\`（注：自动化流水线默认先创建 Draft PR，终审放行后由外层脚本自动转为 Ready，\`isDraft=true\` 属于正常状态，不是阻塞项）
-- 自动合入授权: \`AUTO_MERGE=${AUTO_MERGE}\`（当为 \`1\` 时，仓库 Owner 已明确授权本终审在技术与证据条件满足时代表 Owner 自动解除 Draft 并执行合并）
+- Draft 状态: \`${is_draft}\`（注：自动化流水线默认先创建 Draft PR，技术审签通过后由宿主机门禁统一决定是否转为 Ready，\`isDraft=true\` 属于正常状态，不是阻塞项）
+- 宿主机合入授权门禁: \`AUTO_MERGE=${AUTO_MERGE}\`, \`HOLD_LABEL=${HOLD_MERGE_LABEL}\`, \`REQUIRE_OWNER_MERGE_APPROVAL=${REQUIRE_OWNER_MERGE_APPROVAL}\`（逐 PR 暂停标签与 Owner 合入保留由宿主机在转 Ready/merge 前确定性校验；请专注评估代码、Issue 覆盖与 QA 证据，技术就绪时直接返回 \`merge\`）
 - 可合并性: \`${mergeable:-UNKNOWN}\` / \`${merge_state:-UNKNOWN}\`
 - 终审轮次: 本周期第 ${cycle_round} / ${MAX_FINAL_ROUNDS} 轮（累计第 ${current_round} / ${MAX_TOTAL_FINAL_ROUNDS} 轮）
 
@@ -1664,28 +1751,47 @@ EOF
         gh_state update-pr "$pr_num" "$new_pr_title" "$updated_pr_body_file" || true
       fi
 
-      # 若 PR 仍为 Draft，转为 Ready for review
-      if [[ "$is_draft" == "true" ]]; then
-        gh_state mark-pr-ready "$pr_num" || true
-      fi
-
       if [[ "$AUTO_MERGE" == "1" ]]; then
-        merge_err_file="${final_dir}/merge-error-${run_ts}.log"
-        if gh_state merge-pr "$pr_num" "$effective_merge_method" "$head_sha" 2>"$merge_err_file"; then
-          merged_ok=1
-          final_state="done"
-          final_action="MERGED (${effective_merge_method}) -> ${LABEL_PREFIX}done"
-        else
-          merge_err_text="$("$CAT_BIN" "$merge_err_file" 2>/dev/null || true)"
-          if "$GREP_BIN" -iqE '(merge conflict|not mergeable|cannot be rebased|head branch was modified|HTTP 405|HTTP 409)' <<<"$merge_err_text"; then
+        pr_labels_fallback_json="$("$JQ_BIN" -c '[.labels[]?.name // empty]' <<<"$next_pr_json")"
+        merge_auth_json="$(evaluate_merge_authorization "$pr_num" "$head_sha" "$resolved_from_sha" "$pr_labels_fallback_json" "$issue_labels_json" "$issue_title" "$issue_body")"
+        merge_auth_allowed="$("$JQ_BIN" -r '.allowed' <<<"$merge_auth_json")"
+        merge_auth_mode="$("$JQ_BIN" -r '.mode // ""' <<<"$merge_auth_json")"
+        merge_auth_reason="$("$JQ_BIN" -r '.reason // ""' <<<"$merge_auth_json")"
+
+        if [[ "$merge_auth_allowed" != "true" ]]; then
+          record_checked_sha=0
+          if [[ "$merge_auth_mode" == "head_changed" ]]; then
             final_state="changes-requested"
-            final_action="${LABEL_PREFIX}changes-requested (merge-api-conflict)"
-            record_checked_sha=0
-            extra_notice+=$'\n\n'"#### ⚠️ GitHub 合并接口返回冲突/分支已变动（未合并）"$'\n''```text'$'\n'"${merge_err_text:0:2000}"$'\n''```'$'\n'"- 已退回 \`${LABEL_PREFIX}changes-requested\`，请先同步最新主干解决冲突并重新验证。"
+            final_action="${LABEL_PREFIX}changes-requested (pre-merge-head-changed)"
+            extra_notice+=$'\n\n'"#### ⚠️ 合入前实时复读拦截（未转 Ready / 未合并）"$'\n'"- ${merge_auth_reason}"
           else
-            final_state="blocked"
-            final_action="${LABEL_PREFIX}blocked (merge-failed)"
-            extra_notice+=$'\n\n'"> ⚠️ 终审已通过且 PR 信息已更新，但自动合并（\`${effective_merge_method}\`）失败（可能因分支保护、审批策略或权限限制），已切为 \`${LABEL_PREFIX}blocked\`，请人工检查合并。"$'\n''```text'$'\n'"${merge_err_text:0:2000}"$'\n''```'
+            final_state="ready-to-merge"
+            final_action="${LABEL_PREFIX}ready-to-merge (${merge_auth_mode})"
+            extra_notice+=$'\n\n'"#### ⏸️ 宿主机合入授权门禁暂停（未转 Ready / 未合并）"$'\n'"- ${merge_auth_reason}"
+          fi
+        else
+          [[ -n "$merge_auth_reason" ]] && extra_notice+=$'\n\n'"> ✅ 合入授权核验通过：${merge_auth_reason}"
+          # 仅在确认执行自动合并且通过宿主机授权校验后，才将 Draft PR 转为 Ready for review
+          if [[ "$is_draft" == "true" ]]; then
+            gh_state mark-pr-ready "$pr_num" || true
+          fi
+          merge_err_file="${final_dir}/merge-error-${run_ts}.log"
+          if gh_state merge-pr "$pr_num" "$effective_merge_method" "$head_sha" 2>"$merge_err_file"; then
+            merged_ok=1
+            final_state="done"
+            final_action="MERGED (${effective_merge_method}) -> ${LABEL_PREFIX}done"
+          else
+            merge_err_text="$("$CAT_BIN" "$merge_err_file" 2>/dev/null || true)"
+            if "$GREP_BIN" -iqE '(merge conflict|not mergeable|cannot be rebased|head branch was modified|HTTP 405|HTTP 409)' <<<"$merge_err_text"; then
+              final_state="changes-requested"
+              final_action="${LABEL_PREFIX}changes-requested (merge-api-conflict)"
+              record_checked_sha=0
+              extra_notice+=$'\n\n'"#### ⚠️ GitHub 合并接口返回冲突/分支已变动（未合并）"$'\n''```text'$'\n'"${merge_err_text:0:2000}"$'\n''```'$'\n'"- 已退回 \`${LABEL_PREFIX}changes-requested\`，请先同步最新主干解决冲突并重新验证。"
+            else
+              final_state="blocked"
+              final_action="${LABEL_PREFIX}blocked (merge-failed)"
+              extra_notice+=$'\n\n'"> ⚠️ 终审已通过且 PR 信息已更新，但自动合并（\`${effective_merge_method}\`）失败（可能因分支保护、审批策略或权限限制），已切为 \`${LABEL_PREFIX}blocked\`，请人工检查合并。"$'\n''```text'$'\n'"${merge_err_text:0:2000}"$'\n''```'
+            fi
           fi
         fi
       else

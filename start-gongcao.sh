@@ -133,6 +133,12 @@ case "$ACTION" in
     [[ -n "${CODEX_REVIEW_HOME:-}" ]] && env_prefix+=" CODEX_REVIEW_HOME=$(printf '%q' "$CODEX_REVIEW_HOME")"
     [[ -n "${AUTO_EVALUATE_ON_MERGE:-}" ]] && env_prefix+=" AUTO_EVALUATE_ON_MERGE=$(printf '%q' "$AUTO_EVALUATE_ON_MERGE")"
     [[ -n "${AUTO_EVALUATE_MODE:-}" ]] && env_prefix+=" AUTO_EVALUATE_MODE=$(printf '%q' "$AUTO_EVALUATE_MODE")"
+    final_env_prefix="$env_prefix"
+    for name in AUTO_MERGE REQUIRE_OWNER_MERGE_APPROVAL MERGE_APPROVERS HOLD_MERGE_LABEL; do
+      if [[ -n "${!name:-}" ]]; then
+        final_env_prefix+=" ${name}=$(printf '%q' "${!name}")"
+      fi
+    done
 
     # 窗口 0：dev
     dev_env_prefix="$env_prefix"
@@ -158,7 +164,7 @@ case "$ACTION" in
 
     # 窗口 3：final-gate (codex-final-gate-loop.sh: 终审对账 + 更新信息 + 自动合并)
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "final-gate" \
-      "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-final-gate-loop.sh")"
+      "${final_env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-final-gate-loop.sh")"
 
     # 窗口 4：monitor（上 pane 实时总览 activity.log，下 pane 运行 cleanup-merged.sh）
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "monitor" \

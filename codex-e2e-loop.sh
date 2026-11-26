@@ -47,6 +47,8 @@ STATE_BASE="${STATE_BASE:-${GONGCAO_HOME}/state}"
 
 # shellcheck source=lib/codex-profile.sh
 source "${SCRIPT_DIR}/lib/codex-profile.sh"
+# shellcheck source=lib/git-worktree.sh
+source "${SCRIPT_DIR}/lib/git-worktree.sh"
 init_codex_review_profile "codex-e2e-loop.sh" "${1:-run}"
 
 REPO="${REPO:-}"                             # 目标 GitHub 仓库 "owner/repo"
@@ -267,32 +269,7 @@ prepare_e2e_worktree() {
   local pr_num="$1"
   local head_branch="$2"
   local head_sha="$3"
-  local wt_dir="${WORKTREE_ROOT}/e2e-pr-${pr_num}"
-
-  (
-    "$FLOCK_BIN" -x 9
-    "$GIT_BIN" -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-    "$GIT_BIN" -C "$REPO_ROOT" fetch --prune origin >&2 || true
-
-    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-      "$GIT_BIN" -C "$REPO_ROOT" fetch origin "pull/${pr_num}/head" >&2 || \
-        "$GIT_BIN" -C "$REPO_ROOT" fetch origin "$head_branch" >&2
-    fi
-
-    local target_commit="$head_sha"
-    if ! "$GIT_BIN" -C "$REPO_ROOT" cat-file -e "${target_commit}^{commit}" 2>/dev/null; then
-      target_commit="FETCH_HEAD"
-    fi
-
-    if [[ -e "${wt_dir}/.git" ]]; then
-      "$GIT_BIN" -C "$wt_dir" checkout --detach --force "$target_commit" >&2
-      "$GIT_BIN" -C "$wt_dir" clean -fd >/dev/null 2>&1 || true
-    else
-      "$GIT_BIN" -C "$REPO_ROOT" worktree add --detach "$wt_dir" "$target_commit" >&2
-    fi
-  ) 9>"$REPO_GIT_LOCK"
-
-  printf '%s' "$wt_dir"
+  checkout_exact_pr_worktree "${WORKTREE_ROOT}/e2e-pr-${pr_num}" "$pr_num" "$head_branch" "$head_sha"
 }
 
 cleanup_e2e_worktree() {

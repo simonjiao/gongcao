@@ -58,6 +58,11 @@ STATES=(
   "done|5319e7|Completed"
 )
 
+# 非互斥控制标签（不会被 set-state 清除）
+FLAG_LABELS=(
+  "hold-merge|b60205|Hold auto-merge until cleared or explicitly authorized per SHA"
+)
+
 usage() {
   "$CAT_BIN" <<'EOF' >&2
 用法:
@@ -66,6 +71,8 @@ usage() {
   gh-state.sh list-issues [state] [label] [limit]
   gh-state.sh get-issue <number>
   gh-state.sh list-prs [state] [label] [limit]
+  gh-state.sh get-pr <number>
+  gh-state.sh get-pr-comments <number>
   gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
   gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|e2e-skipped|ready-to-merge|blocked|done>
@@ -263,6 +270,35 @@ cmd_list_prs() {
   run_gh "${args[@]}"
 }
 
+cmd_get_pr() {
+  local number="${1:-}"
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf '错误：get-pr 需要有效的 <number>\n' >&2
+    exit 2
+  fi
+  local -a extra_args=()
+  [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
+  run_gh pr view "$number" --json number,state,isDraft,headRefName,baseRefName,headRefOid,labels,updatedAt "${extra_args[@]}"
+}
+
+cmd_get_pr_comments() {
+  local number="${1:-}"
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf '错误：get-pr-comments 需要有效的 <number>\n' >&2
+    exit 2
+  fi
+  local repo_slug
+  repo_slug="$(resolve_repo_slug)"
+  local comments_json=""
+  comments_json="$(run_gh api --paginate "repos/${repo_slug}/issues/${number}/comments?per_page=100" --jq '.[]')"
+  if [[ -z "$comments_json" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  "$JQ_BIN" -s '[.[] | {author: (.user.login // ""), author_association: (.author_association // ""), body: (.body // ""), updated_at: (.updated_at // .created_at // "")}]' \
+    <<<"$comments_json"
+}
+
 cmd_get_pr_diff() {
   local number="${1:-}"
   if [[ ! "$number" =~ ^[0-9]+$ ]]; then
@@ -279,7 +315,7 @@ cmd_init_labels() {
   local -a extra_args=()
   [[ -n "$REPO" ]] && extra_args+=(--repo "$REPO")
 
-  for item in "${STATES[@]}"; do
+  for item in "${STATES[@]}" "${FLAG_LABELS[@]}"; do
     name="${item%%|*}"
     rest="${item#*|}"
     color="${rest%%|*}"
@@ -687,6 +723,8 @@ main() {
     list-issues)   cmd_list_issues "$@" ;;
     get-issue)     cmd_get_issue "$@" ;;
     list-prs)      cmd_list_prs "$@" ;;
+    get-pr)        cmd_get_pr "$@" ;;
+    get-pr-comments) cmd_get_pr_comments "$@" ;;
     get-pr-diff)   cmd_get_pr_diff "$@" ;;
     find-pr)       cmd_find_pr "$@" ;;
     set-state)     cmd_set_state "$@" ;;

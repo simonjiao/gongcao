@@ -272,4 +272,73 @@ bash -euo pipefail -c '
   grep -Fq '已有开发循环运行' "$fixture/lock.log" || fail '锁互斥报错信息不符合预期'
 ) 9>"$state_dir/issue-loop.lock"
 
+# 9. P0-1: 复用已有开发 worktree 与远端同名分支对账（干净落后快进 / 脏树保护 / 分叉保护）
+rm -f "$state_dir/quota_reset_until.codex"
+git clone -q "$fixture/origin" "$fixture/peer"
+git -C "$fixture/peer" config user.name Peer
+git -C "$fixture/peer" config user.email peer@example.invalid
+
+# 9a. 干净落后远端 2 个提交 -> 自动 ff-only 快进后继续开发
+git -C "$fixture/peer" checkout -q -b feat/sync-ff main
+printf 'r0\n' > "$fixture/peer/sync.txt"
+git -C "$fixture/peer" add sync.txt && git -C "$fixture/peer" commit -qm 'remote-0'
+git -C "$fixture/peer" push -q origin feat/sync-ff
+git -C "$fixture/repo" fetch -q origin
+git -C "$fixture/repo" worktree add -q -b feat/sync-ff "$state_dir/worktrees/issue-15" origin/feat/sync-ff
+mkdir -p "$state_dir/sessions/issue-15"
+printf 'feat/sync-ff\n' > "$state_dir/sessions/issue-15/branch_name"
+printf 'r1\n' >> "$fixture/peer/sync.txt" && git -C "$fixture/peer" commit -qam 'remote-1'
+printf 'r2\n' >> "$fixture/peer/sync.txt" && git -C "$fixture/peer" commit -qam 'remote-2'
+git -C "$fixture/peer" push -q origin feat/sync-ff
+expected_ff_parent="$(git -C "$fixture/peer" rev-parse HEAD)"
+
+printf 'complete' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+set_issue 15 "测试干净落后快进" "需求-15"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 15 in-review'
+git -C "$state_dir/worktrees/issue-15" merge-base --is-ancestor "$expected_ff_parent" HEAD \
+  || fail '干净落后的开发 worktree 未快进到远端最新提交'
+
+# 9b. 落后远端且工作区存在脏改动 -> 保留脏改动不覆盖，不调用 Codex，直接转 blocked
+git -C "$fixture/peer" checkout -q -b feat/sync-dirty main
+printf 'd0\n' > "$fixture/peer/dirty.txt"
+git -C "$fixture/peer" add dirty.txt && git -C "$fixture/peer" commit -qm 'dirty-base'
+git -C "$fixture/peer" push -q origin feat/sync-dirty
+git -C "$fixture/repo" fetch -q origin
+git -C "$fixture/repo" worktree add -q -b feat/sync-dirty "$state_dir/worktrees/issue-16" origin/feat/sync-dirty
+mkdir -p "$state_dir/sessions/issue-16"
+printf 'feat/sync-dirty\n' > "$state_dir/sessions/issue-16/branch_name"
+printf 'local-unsaved\n' >> "$state_dir/worktrees/issue-16/dirty.txt"
+printf 'd1\n' >> "$fixture/peer/dirty.txt" && git -C "$fixture/peer" commit -qam 'dirty-remote-1'
+git -C "$fixture/peer" push -q origin feat/sync-dirty
+
+printf '0\n' > "$fixture/codex-count"
+set_issue 16 "测试脏树保护" "需求-16"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 16 blocked'
+[[ "$(<"$fixture/codex-count")" == "0" ]] || fail '脏树落后场景不应启动 Codex'
+grep -Fq 'local-unsaved' "$state_dir/worktrees/issue-16/dirty.txt" || fail '脏树本地改动被破坏'
+
+# 9c. 与远端历史分叉 -> 保留现场，不调用 Codex，直接转 blocked
+git -C "$fixture/peer" checkout -q -b feat/sync-diverge main
+printf 'v0\n' > "$fixture/peer/diverge.txt"
+git -C "$fixture/peer" add diverge.txt && git -C "$fixture/peer" commit -qm 'diverge-base'
+git -C "$fixture/peer" push -q origin feat/sync-diverge
+git -C "$fixture/repo" fetch -q origin
+git -C "$fixture/repo" worktree add -q -b feat/sync-diverge "$state_dir/worktrees/issue-17" origin/feat/sync-diverge
+mkdir -p "$state_dir/sessions/issue-17"
+printf 'feat/sync-diverge\n' > "$state_dir/sessions/issue-17/branch_name"
+printf 'local-commit\n' >> "$state_dir/worktrees/issue-17/diverge.txt"
+git -C "$state_dir/worktrees/issue-17" commit -qam 'local-diverge'
+printf 'remote-commit\n' >> "$fixture/peer/diverge.txt"
+git -C "$fixture/peer" commit -qam 'remote-diverge'
+git -C "$fixture/peer" push -q origin feat/sync-diverge
+
+printf '0\n' > "$fixture/codex-count"
+set_issue 17 "测试分叉保护" "需求-17"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 17 blocked'
+[[ "$(<"$fixture/codex-count")" == "0" ]] || fail '历史分叉场景不应启动 Codex'
+
 printf 'issue loop tests passed\n'

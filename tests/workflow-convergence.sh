@@ -44,7 +44,33 @@ case "$*" in
   'get-comment '*|'get-pr-diff '*)
     ;;
   'get-issue '*)
-    printf '%s\n' '{"title":"Mock Issue","body":"需求正文","labels":[],"url":"https://example.invalid/issues/42"}'
+    if [[ -f "$MOCK_DIR/issue.json" ]]; then
+      cat "$MOCK_DIR/issue.json"
+    else
+      printf '%s\n' '{"title":"Mock Issue","body":"需求正文","labels":[],"url":"https://example.invalid/issues/42"}'
+    fi
+    ;;
+  'get-pr '*)
+    if [[ -f "$MOCK_DIR/live-pr.json" ]]; then
+      cat "$MOCK_DIR/live-pr.json"
+    else
+      jq '.[0] + {state:"OPEN"}' "$MOCK_DIR/pr.json"
+    fi
+    ;;
+  'get-pr-comments '*)
+    if [[ -f "$MOCK_DIR/pr-comments.json" ]]; then
+      cat "$MOCK_DIR/pr-comments.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  'mark-pr-ready '*)
+    printf '%s\n' "$*" >> "$MOCK_DIR/calls"
+    ;;
+  'merge-pr '*)
+    printf '%s\n' "$*" >> "$MOCK_DIR/calls"
+    ;;
+  'update-pr '*)
     ;;
   'get-repo-merge-settings')
     printf '%s\n' '{"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}'
@@ -325,5 +351,65 @@ if CODEX_REVIEW_HOME="$fixture/missing-codex-review" timeout 10s bash "$fixture/
   fail '未初始化 codex-review 目录时不应静默启动'
 fi
 grep -Fq 'codex-review-loop.sh login' "$fixture/missing-home.log" || fail '缺少 codex-review 初始化提示'
+
+# 5. P0-1: 目标 head_sha 不存在时拒绝回退 FETCH_HEAD，不启动评审模型
+before_rev_p0="$(grep -Fxc -- codex-review "$fixture/calls" || true)"
+cp "$fixture/pr.json" "$fixture/pr-p0-bak.json"
+jq '.[0].headRefOid = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"' "$fixture/pr.json" > "$fixture/pr-missing-sha.json"
+mv "$fixture/pr-missing-sha.json" "$fixture/pr.json"
+REVIEWS_ROOT="$fixture/reviews-missing-sha" run_loop review
+mv "$fixture/pr-p0-bak.json" "$fixture/pr.json"
+assert_calls "$before_rev_p0" codex-review
+grep -Fq '拒绝回退 FETCH_HEAD' "$fixture/loop.log" || fail '缺失提交时未拒绝回退 FETCH_HEAD'
+
+# 6. P0-2: 宿主机逐 PR 合入授权与 HOLD 硬门禁
+cp "$fixture/original-comment" "$fixture/review-comment"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"Fixture", body:"Closes #42", url:"https://example.invalid/pull/7",
+  state:"OPEN", isDraft:true, headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", labels:[], updatedAt:"p0"}]' > "$fixture/pr.json"
+
+# 6a. AUTO_MERGE=0 下 Draft PR 不应提前转为 Ready
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-p0-noauto" run_loop final-gate
+assert_calls 0 'mark-pr-ready 7'
+assert_calls 0 "merge-pr 7 merge ${MOCK_SHA}"
+
+# 6b. 运行中实时新增 agy:hold-merge 标签 -> 拦截转 Ready 与合入
+jq -n --arg sha "$MOCK_SHA" '{number:7, state:"OPEN", isDraft:true, headRefName:"main", baseRefName:"main", headRefOid:$sha, labels:[{name:"agy:hold-merge"}]}' \
+  > "$fixture/live-pr.json"
+AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-hold" run_loop final-gate
+assert_calls 0 'mark-pr-ready 7'
+assert_calls 0 "merge-pr 7 merge ${MOCK_SHA}"
+grep -Fq 'agy:hold-merge' "$fixture/final-p0-hold/pr-7/final-gate-comment.md" || fail 'HOLD 标签未写入终审说明'
+rm -f "$fixture/live-pr.json"
+
+# 6c. Issue 明示将合入决定保留给 Owner：未授权用户评论与旧 SHA 放行均须拒绝，仅 Owner 绑定当前 SHA 才放行
+jq -n '{title:"发布封版", body:"合入决定保留给 Owner，确认后放行。", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+jq -n --arg sha "$MOCK_SHA" '[{author:"stranger", author_association:"NONE", body:("/approve-merge " + $sha), updated_at:"2026-11-26T00:00:00Z"}]' \
+  > "$fixture/pr-comments.json"
+AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-owner" run_loop final-gate
+assert_calls 0 'mark-pr-ready 7'
+assert_calls 0 "merge-pr 7 merge ${MOCK_SHA}"
+
+jq -n '[{author:"simonjiao", author_association:"OWNER", body:"/approve-merge 1111111111111111111111111111111111111111", updated_at:"2026-11-26T00:00:00Z"}]' \
+  > "$fixture/pr-comments.json"
+AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-owner" run_loop final-gate
+assert_calls 0 'mark-pr-ready 7'
+assert_calls 0 "merge-pr 7 merge ${MOCK_SHA}"
+
+jq -n --arg sha "$MOCK_SHA" '[{author:"simonjiao", author_association:"OWNER", body:("/approve-merge " + $sha), updated_at:"2026-11-26T00:00:00Z"}]' \
+  > "$fixture/pr-comments.json"
+AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-owner" run_loop final-gate
+assert_calls 1 'mark-pr-ready 7'
+assert_calls 1 "merge-pr 7 merge ${MOCK_SHA}"
+assert_calls 1 'set-state pr 7 done'
+
+# 6d. 合入前实时复读发现 headRefOid 已变 -> 取消合入并退回 changes-requested
+jq -n '{title:"普通单", body:"正常需求", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+jq '{number:7, state:"OPEN", isDraft:true, headRefName:"main", baseRefName:"main", headRefOid:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", labels:[]}' \
+  "$fixture/pr.json" > "$fixture/live-pr.json"
+AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-headchanged" run_loop final-gate
+assert_calls 1 'mark-pr-ready 7'
+assert_calls 1 "merge-pr 7 merge ${MOCK_SHA}"
+grep -Fq '最新提交已变为 aaaaaaaaaa' "$fixture/final-p0-headchanged/pr-7/final-gate-comment.md" || fail 'head 变动未在终审评论中提示'
+rm -f "$fixture/live-pr.json" "$fixture/issue.json" "$fixture/pr-comments.json"
 
 printf 'workflow convergence tests passed\n'
