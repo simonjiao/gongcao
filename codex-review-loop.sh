@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
 source "$SCRIPT_DIR/lib/release-handoff.sh"
+source "$SCRIPT_DIR/lib/diff-metrics.sh"
 
 # 解析所需命令的绝对路径（包含 linuxbrew 路径以定位 codex）
 SEARCH_PATH="${PATH}:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
@@ -852,6 +853,10 @@ EOF
     e2e_handoff_section=$'\n\n'"## E2E 退回复审交接（请重点核对前置条件与 Issue 范围）"$'\n'"- 本轮由独立 E2E 验收退回复审（同一提交 \`${head_sha:0:10}\`）：E2E 指出上一轮某条必验项依赖候选版本尚未支持的能力。"$'\n'"- 请对照下方「最近一次 E2E 验收评论摘录」与原始 Issue 要求，做出明确裁定："$'\n'"  1. 若现有单测/组件测试已满足对应回归，且真实 E2E 只需保留候选版本支持的核心场景，请调整并收敛 \`e2e_checks\` 后直接 \`approve\`，交回 E2E 继续验收；"$'\n'"  2. 若确认必须实测该场景且仓库系统有可用准备路径，请给出明确可落地的 QA 准备方式（账号/权限/数据/预检/清理），输出 \`request_changes\` 交由 Dev 在同一 PR 补齐可复用 QA 资产；"$'\n'"  3. 若确需产品/Owner 授权或变更系统能力边界，请在 \`request_changes\` 中设 \`requires_human_decision: true\` 并写清待授权项。"
   fi
 
+  review_diff_metrics_json="$(compute_diff_metrics "$GIT_BIN" "$JQ_BIN" "$review_wt" "origin/${base_branch}" HEAD)"
+  review_test_budget="$(parse_issue_test_budget "${issue_body:-}")"
+  review_metrics_md="$(render_diff_metrics_markdown "$JQ_BIN" "$review_diff_metrics_json" "$review_test_budget")"
+
   pr_diff_raw="$(gh_state get-pr-diff "$pr_num" 2>/dev/null || true)"
   # 使用纯 Bash 切片截断，避免 set -o pipefail 下 printf | head 触发 SIGPIPE (141) 退出
   pr_diff_snippet="${pr_diff_raw:0:MAX_DIFF_BYTES}"
@@ -932,6 +937,9 @@ ${pr_body:-"(empty)"}
 ## 关联 Issue 要求
 ${issue_section}${e2e_handoff_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
 
+## 变更规模与测试/QA 复核信号（宿主机实测）
+${review_metrics_md}
+
 ## 既有 E2E 验收状态与免测判断依据
 - 是否存在通过的远端 QA 证据（\`${E2E_EVIDENCE_BRANCH}\`）: \`${prior_e2e_has_pass}\`
 - 已通过 E2E 的提交 SHA: \`${prior_e2e_sha:-(无)}\`（是否当前 PR 提交 \`${head_sha:0:10}\` 的祖先: \`${prior_e2e_is_ancestor}\`）
@@ -957,7 +965,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
    - 若改动扩展了兼容行为或改变共享模块、持久化数据、状态机等现有契约，请核对 Issue 中的具体要求或已有授权。将当前 PR 引入的未授权扩展列为阻塞项，指出需要收回的改动或待确认的范围。
    - 修复建议也须遵守相同的授权范围。发现读取或展示口径不一致时，优先建议在读取或展示层处理，并核查是否能保留现有写入、摘要和重放行为。证据无法确认根因时注明证据缺口。若满足 Issue 必须变更持久化或共享契约且缺少授权，输出 \`request_changes\`，将 \`requires_human_decision\` 设为 \`true\`，并在修复建议中写明待授权的契约和影响。其余情况该字段为 \`false\`。
-3. **关于 E2E 验证与前置条件核对**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**。
+3. **关于 E2E 验证、测试规模与前置条件核对**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**；但**功能 PR 不得顺手重构或扩建通用 QA 运行时/跨单进程回收底座**（例如大段修改 \`qa/browser-runtime*\` 等通用基础设施），同样 **Review 自身也不得在功能 PR 复审中追加跨单通用 QA 底座需求作为阻塞项**（此类基础设施缺口应记入 \`non_blocking_notes\` 供终审沉淀为独立 Follow-up Issue）。
    - **Review 必须先核对每条 E2E 必验项的前置条件（且在首轮即一次性核对完毕）**：你列出的每一条 \`e2e_checks\` 都要能明确指出账号、权限、数据与服务如何准备，并核对候选版本实际具备该能力。当 PR 改动或扩展了 \`qa/\` 入口、或涉及目标引擎默认关闭的可选开关/插件/权限/工作负载组时，**首轮即核对“默认关闭态如何临时启用/授权，以及成功与失败退出时如何恢复原值与清理资源”**，避免拖到后续复审才逐轮追加。
      - 若仓库系统允许准备（例如可通过系统支持的接口/命令创建测试账号、授权、临时启用开关并恢复、造数），但现有 QA 入口/脚本缺少准备、预检或清理步骤，应直接输出 \`request_changes\` 退回 Dev 在同一 PR 补齐可复用 QA 脚本（而非放行到 E2E 后因缺脚本落入 \`blocked\`）。
      - 若某条设想场景依赖候选版本尚未支持的能力（例如候选后端仅接受单组登录凭据却要求实测双账号登录），**禁止将不可执行的前置条件写入 \`e2e_checks\`**；应先核对 Issue 范围及已有单测/组件测试是否已满足对应回归，仅保留候选版本可真实执行的 E2E 必验项，或明确可用的 QA 准备路径后再交给 Dev 补齐资产。
@@ -967,7 +975,7 @@ ${pr_diff_snippet:-"(空 diff)"}
    - \`skip_not_needed\`：本次整个 PR 仅改动文档（\`docs/\`、\`*.md\`）、注释、纯单元测试、静态检查/格式化或构建元数据，完全不改变运行时行为，或原始 Issue 明确说明无需 E2E。
    - \`skip_already_passed\`：本 PR 或关联 Issue **已经通过过 E2E 验收**（\`has_pass=true\` 且 \`is_ancestor=true\`），且自已通过 E2E 的提交（\`${prior_e2e_sha:-(无)}\`）之后无新增改动或增量改动全部为非运行时改动（文档、单测、命名整理、注释等），不破坏既有 E2E 结论，可直接进入 \`final-gate\` 避免重复 E2E。
 4. **严格区分阻塞项与范围外建议（务实分级，禁止范围蔓延）**：
-   - 仅将「违反原始 Issue 明确验收标准、真实运行崩溃（如空指针 / \`TypeError\`）、或本次改动引入的真实数据正确性/安全回归、或缺少关键内部单测」列入 \`blocking_issues\` 并返回 \`request_changes\`。
+   - 仅将「违反原始 Issue 明确验收标准、真实运行崩溃（如空指针 / \`TypeError\`）、本次改动引入的真实数据正确性/安全回归、缺少关键内部单测、或对照上方宿主机实测变更规模与 PR 验证覆盖表存在明显的**重复/低价值测试膨胀、无正当理由超出测试/QA 规模估算，或在功能 PR 夹带通用 QA 运行时基础设施改造**」列入 \`blocking_issues\` 并返回 \`request_changes\`（指明应精简或拆出的具体测试/QA 范围）。
    - **以下情况若认为有参考价值，一律放入 \`non_blocking_notes\`（作为非阻塞项记录），不得阻塞通过**：
      - 超出原始 Issue 范围的延伸需求、次要/极端边缘的 UI 展示优化、仓库历史既有问题或轻微风格建议；
      - 仅在人工伪造非法内部 JSON 结构（例如后端内部契约字段被篡改为非预期类型）或极罕见理论标识符构造下才触发的额外防御；

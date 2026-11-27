@@ -153,6 +153,16 @@ case "$mode" in
       printf '{"status":"completed","summary":"已补齐全部阻塞证据","blocked_reason":"","commit_message":"fix: full evidence","branch_name":"feat/rework-evidence","blocker_resolutions":[{"id":"blocker-a","precondition_covered":"输入 false 态","test_or_check":"pytest test_a","result":"passed"},{"id":"blocker-b","precondition_covered":"异常退出恢复原值","test_or_check":"pytest test_b","result":"passed"}]}\n' > "$out_file"
     fi
     ;;
+  test-size-retry)
+    if (( count == 1 )); then
+      mkdir -p frontend/src qa
+      seq 1 80 | sed 's/^/test_line_/' > frontend/src/foo.test.ts
+      seq 1 10 | sed 's/^/runtime_line_/' > qa/browser-runtime.cjs
+      printf '{"status":"completed","summary":"已实现并补测","blocked_reason":"","commit_message":"feat: with tests","branch_name":"feat/test-size-gate","blocker_resolutions":[],"verification_matrix":[],"size_justification":""}\n' > "$out_file"
+    else
+      printf '{"status":"completed","summary":"已补齐四列表与规模说明","blocked_reason":"","commit_message":"feat: with tests and matrix","branch_name":"feat/test-size-gate","blocker_resolutions":[],"verification_matrix":[{"target":"验证断链状态清理","existing_entry":"frontend/src/foo.test.ts 仅有成功路径","gap":"缺少 401 竞态清理断言","action":"EXTEND","rationale":"少了会漏检会话过期后旧引用残留"}],"size_justification":"401 竞态与多分支清理需 80 行隔离单测；browser-runtime 仅补 10 行归属校验。"}\n' > "$out_file"
+    fi
+    ;;
   *)
     printf 'Unknown mode: %s\n' "$mode" >&2
     exit 99
@@ -506,6 +516,37 @@ EOM
 )"
   got_approved="$(extract_review_blockers_json "$approved_md")"
   [[ "$got_approved" == "[]" ]]
+'
+
+# 13. 提交前验证覆盖四列表与测试/QA 规模门禁（超 Issue 估算 + 触及通用 QA 运行时 -> 原会话补齐并渲染进 PR 正文）
+printf 'test-size-retry' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-args.log"
+set_issue 20 "测试规模与四列表门禁" "需求正文：生产约 110–200 行，必要测试 30–75 行，原则前端为主。"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 20 in-review'
+[[ "$(<"$fixture/codex-count")" == "2" ]] || fail '缺少 verification_matrix 或 size_justification 时应触发原会话补齐'
+grep -Fq 'resume thread-abc-123' "$fixture/codex-args.log" || fail '规模/四列表补齐未续接原会话'
+grep -Fq 'verification_matrix' "$fixture/prompt-2.txt" || fail '补齐提示词未要求填写 verification_matrix'
+grep -Fq '超出 Issue 估算上限 75 行' "$fixture/prompt-2.txt" || fail '补齐提示词未指出超出 Issue 测试估算上限 75 行'
+grep -Fq 'qa/browser-runtime.cjs' "$fixture/prompt-2.txt" || fail '补齐提示词未指出改动了通用 QA 运行时文件'
+grep -Fq '验证覆盖与复用说明' "$state_dir/sessions/issue-20/summary.md" || fail 'summary 未渲染验证覆盖与复用说明表'
+grep -Fq '测试/QA 规模与范围说明' "$state_dir/sessions/issue-20/summary.md" || fail 'summary 未渲染规模说明'
+grep -Fq '## 变更规模（宿主机实测）' "$state_dir/sessions/issue-20/pr-body.md" || fail 'PR 正文未注入宿主机实测变更规模'
+grep -Fq '内部测试（Issue 测试估算上限：75 行）' "$state_dir/sessions/issue-20/pr-body.md" || fail 'PR 正文规模表未标注 Issue 测试估算上限'
+
+# 13b. 单元测试 lib/diff-metrics.sh 分类与估算解析
+bash -euo pipefail -c '
+  source "'"$fixture"'/workflow/lib/diff-metrics.sh"
+  [[ "$(classify_diff_path "qa/README.md")" == "docs" ]]
+  [[ "$(classify_diff_path "qa/test-browser-runtime.cjs")" == "test" ]]
+  [[ "$(classify_diff_path "qa/test_environment.py")" == "test" ]]
+  [[ "$(classify_diff_path "qa/metadata-evidence-browser.cjs")" == "qa" ]]
+  [[ "$(classify_diff_path "frontend/src/views/GraphView.vue")" == "prod" ]]
+  is_qa_infra_path "qa/browser-runtime.cjs"
+  ! is_qa_infra_path "qa/metadata-evidence-browser.cjs"
+  [[ "$(parse_issue_test_budget "生产约 110–200 行，必要测试 30–75 行")" == "75" ]]
+  [[ "$(parse_issue_test_budget "无估算说明")" == "0" ]]
 '
 
 printf 'issue loop tests passed\n'

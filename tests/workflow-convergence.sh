@@ -568,4 +568,26 @@ MAX_STALLED_REVIEW_ROUNDS=1 REVIEWS_ROOT="$stall_rev" run_loop review
 assert_calls "$((before_prog_blk + 1))" 'set-state pr 7 blocked'
 grep -Fq '复审未关闭上一轮任何阻塞项' "$fixture/review-comment" || fail '停滞暂停评论缺少无进展说明'
 
+# 9. Review 提示词注入宿主机实测变更规模与测试/QA 复核信号，并包含重复测试/通用 QA 底座双向规则
+mkdir -p "$fixture/repo/frontend/src" "$fixture/repo/qa"
+seq 1 90 | sed 's/^/t_/' > "$fixture/repo/frontend/src/demo.test.ts"
+seq 1 20 | sed 's/^/r_/' > "$fixture/repo/qa/browser-runtime.cjs"
+git -C "$fixture/repo" add frontend/src/demo.test.ts qa/browser-runtime.cjs
+git -C "$fixture/repo" commit -qm 'feat: add oversized test and qa runtime'
+git -C "$fixture/repo" checkout -q -b feat/metrics-check
+git -C "$fixture/repo" push -q origin feat/metrics-check
+metrics_sha="$(git -C "$fixture/repo" rev-parse HEAD)"
+git -C "$fixture/repo" checkout -q main
+git -C "$fixture/repo" reset -q --hard HEAD~1
+jq -n --arg sha "$metrics_sha" '[{number: 7, title:"Metrics", body:"Closes #42", url:"https://example.invalid/pull/7",
+  headRefName:"feat/metrics-check", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", updatedAt:"metrics"}]' > "$fixture/pr.json"
+jq -n '{title:"测试规模", body:"生产约 110–200 行，必要测试 30–75 行", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+cp "$fixture/approve.json" "$fixture/verdict.json"
+REVIEWS_ROOT="$fixture/reviews-metrics" run_loop review
+grep -Fq '## 变更规模与测试/QA 复核信号（宿主机实测）' "$fixture/last-prompt" || fail 'Review 提示词未注入宿主机实测变更规模'
+grep -Fq '超出 Issue 估算上限 75 行' "$fixture/last-prompt" || fail 'Review 提示词未提示内部测试超估算'
+grep -Fq 'qa/browser-runtime.cjs' "$fixture/last-prompt" || fail 'Review 提示词未标出通用 QA 运行时改动'
+grep -Fq '不得在功能 PR 复审中追加跨单通用 QA 底座需求作为阻塞项' "$fixture/last-prompt" || fail 'Review 提示词缺少不追加通用 QA 底座需求的双向约束'
+grep -Fq '重复/低价值测试膨胀' "$fixture/last-prompt" || fail 'Review 提示词缺少重复测试膨胀阻塞准则'
+
 printf 'workflow convergence tests passed\n'

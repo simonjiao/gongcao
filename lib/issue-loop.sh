@@ -6,6 +6,7 @@ DEV_ACTION="${2:-run}"
 SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
 source "$SCRIPT_DIR/lib/release-handoff.sh"
+source "$SCRIPT_DIR/lib/diff-metrics.sh"
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
 
 # 解析所需命令的绝对路径（一律全路径调用）
@@ -753,9 +754,34 @@ write_codex_schema() {
         "required": ["id", "precondition_covered", "test_or_check", "result"],
         "additionalProperties": false
       }
-    }
+    },
+    "verification_matrix": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "target": {"type": "string"},
+          "existing_entry": {"type": "string"},
+          "gap": {"type": "string"},
+          "action": {"type": "string", "enum": ["REUSE", "EXTEND", "NEW"]},
+          "rationale": {"type": "string"}
+        },
+        "required": ["target", "existing_entry", "gap", "action", "rationale"],
+        "additionalProperties": false
+      }
+    },
+    "size_justification": {"type": "string"}
   },
-  "required": ["status", "summary", "blocked_reason", "commit_message", "branch_name", "blocker_resolutions"],
+  "required": [
+    "status",
+    "summary",
+    "blocked_reason",
+    "commit_message",
+    "branch_name",
+    "blocker_resolutions",
+    "verification_matrix",
+    "size_justification"
+  ],
   "additionalProperties": false
 }
 EOF
@@ -770,9 +796,19 @@ validate_codex_result() {
         all(type == "object" and ([.id, .precondition_covered, .test_or_check, .result] | all(type == "string")))
       else false
       end;
+    def valid_matrix:
+      if . == null then true
+      elif type == "array" then
+        all(type == "object"
+          and ([.target, .existing_entry, .gap, .rationale] | all(type == "string"))
+          and (.action == "REUSE" or .action == "EXTEND" or .action == "NEW"))
+      else false
+      end;
     length == 1 and (.[0] |
       ([.summary, .blocked_reason, .commit_message, .branch_name] | all(type == "string"))
+      and (.size_justification == null or (.size_justification | type == "string"))
       and (.blocker_resolutions | valid_resolutions)
+      and (.verification_matrix | valid_matrix)
       and (
         (.status == "completed" and (.summary | filled) and .blocked_reason == "")
         or (.status == "blocked" and (.blocked_reason | filled))
@@ -887,6 +923,63 @@ check_blocker_evidence() {
         ] | join("\n")
     end
   ' "$result_file" 2>/dev/null || true)"
+  if [[ -n "$missing_report" ]]; then
+    printf '%s\n' "$missing_report"
+    return 1
+  fi
+  return 0
+}
+
+# 确定性校验：改动测试或 qa/ 文件时必须提交四列验证覆盖表；触发规模/QA基建复核信号时必须提交 size_justification
+check_verification_and_size_evidence() {
+  local result_file="$1"
+  local metrics_json="$2"
+  local test_budget="${3:-0}"
+
+  if [[ -z "$metrics_json" ]]; then
+    return 0
+  fi
+
+  local triggers=""
+  triggers="$(evaluate_size_review_triggers "$JQ_BIN" "$metrics_json" "$test_budget")"
+
+  local missing_report=""
+  missing_report="$("$JQ_BIN" -r \
+    --argjson metrics "$metrics_json" \
+    --arg triggers "$triggers" '
+    def filled: type == "string" and test("\\S");
+    if .status != "completed" then ""
+    else
+      [
+        (if ($metrics.test_or_qa_changed == true) then
+          (.verification_matrix // []) as $m
+          | if ($m | length) == 0 then
+              "- 本轮修改或新增了测试/QA 文件（测试 +" + ($metrics.test.added|tostring) + " 行，QA +" + ($metrics.qa.added|tostring) + " 行），但 `verification_matrix` 为空；请逐项填写验证目标、已有入口及断言、覆盖缺口、REUSE/EXTEND/NEW 与必要性说明。"
+            else
+              ($m | to_entries | map(
+                .key as $idx | .value as $v
+                | ([
+                    (if ($v.target | filled) then empty else "target（验证目标）" end),
+                    (if ($v.existing_entry | filled) then empty else "existing_entry（已有入口及断言）" end),
+                    (if ($v.gap | filled) then empty else "gap（覆盖缺口）" end),
+                    (if ($v.rationale | filled) then empty else "rationale（必要性/漏检说明）" end)
+                  ]) as $miss
+                | if ($miss | length) > 0 then
+                    "- `verification_matrix[" + ($idx|tostring) + "]` 缺少 " + ($miss | join("、"))
+                  else empty end
+              ) | join("\n"))
+              | if length > 0 then . else empty end
+            end
+        else empty end),
+        (if ($triggers | filled) and ((.size_justification // "") | filled | not) then
+          "- 本轮改动触发了测试/QA 规模或范围复核信号，但 `size_justification` 为空：\n"
+          + ($triggers | split("\n") | map("  - " + .) | join("\n"))
+          + "\n  请先核查并精简重复/低价值测试或收回非必要的通用 QA 运行时改动；若确属必要，请在 `size_justification` 中逐项说明理由。"
+        else empty end)
+      ] | join("\n")
+    end
+  ' "$result_file" 2>/dev/null || true)"
+
   if [[ -n "$missing_report" ]]; then
     printf '%s\n' "$missing_report"
     return 1
@@ -1348,7 +1441,9 @@ while true; do
 5. 最终按 JSON Schema 返回开发结果。
    - 开发和内部验证完成后，设置 \`status\` 为 \`completed\`，在 \`summary\` 中用中文说明改动、内部验证结果、E2E 执行情况和潜在风险。将 \`blocked_reason\` 留空。
    - 若本轮为评审返工且上方列出了待关闭阻塞编号，必须在 \`blocker_resolutions\` 中逐项列出每个阻塞 \`id\` 对应的 \`precondition_covered\`（覆盖的前置状态/边界输入）、\`test_or_check\`（执行的内部测试或检查）与 \`result\`（通过结果）；非评审返工或无阻塞编号时返回空数组 \`[]\`。
-   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入（\`blocker_resolutions\` 可为空数组 \`[]\`）。
+   - **验证覆盖与复用表（\`verification_matrix\`）**：只要本轮新增或修改了任何内部测试或 \`qa/\` 文件，必须在 \`verification_matrix\` 中逐项列出 \`target\`（验证目标）、\`existing_entry\`（已有测试/QA 入口及源码断言）、\`gap\`（现有覆盖缺口）、\`action\`（\`REUSE\` / \`EXTEND\` / \`NEW\`）与 \`rationale\`（为何必要、少了会漏掉什么）；未改动测试与 \`qa/\` 时返回 \`[]\`。
+   - **测试/QA 规模与范围说明（\`size_justification\`）**：若测试增量超出 Issue 估算（或超过生产代码 1.5 倍且 > 80 行）、\`qa/\` 驱动新增超过 150 行、或触及通用 QA 运行时/基础设施文件，应先核查并精简冗余测试或收回非必要改动；确属必要时必须在 \`size_justification\` 中逐项说明理由，否则留空 \`""\`。
+   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入（\`blocker_resolutions\` 与 \`verification_matrix\` 可为空数组 \`[]\`，\`size_justification\` 可为空 \`""\`）。
    - \`commit_message\` 可填写一行简明的提交消息。按以下要求填写 \`branch_name\`，无需命名时留空。${branch_prompt_line}
 6. GitHub 的读写均由外层脚本执行，请使用上面的 Issue 和反馈信息。
 EOF
@@ -1389,8 +1484,9 @@ EOF
 ### 处理要求
 1. 你当前运行在专属 git worktree（分支 ${branch}）的沙箱中，先阅读相关代码并分析问题根因或需求范围。
 2. 仅完成开发实现和相关内部验证（如类型检查、构建检查、改动相关的单元测试或模块级测试）。
+   - **最小必要测试集**：先检索现有测试文件与断言，优先复用或在相邻用例上扩展（\`REUSE / EXTEND\`），不复制整套 fixture 起重复用例；新增测试行数明显超出 Issue 估算前先自查是否存在重复或低价值测试。
 3. **不需要执行 E2E（端到端）验证**（例如浏览器自动化 E2E、启动完整外部依赖服务或全链路集成环境测试）；不要在 E2E 环境准备上耗费时间。
-   - **可复用 E2E 入口与准备步骤沉淀**：若本次 Issue 引入**新的用户可见页面流程**、明确要求真实引擎/浏览器验收，或 Review / E2E 退回要求补齐 QA 准备步骤，且目标仓库维护了可复用的 QA/E2E 入口（如 \`qa/README.md\` 登记的 action 目录或维护中的 Playwright spec）且原始 Issue 未禁止改动 \`qa/\`，当既有入口尚未覆盖时，应按仓库 \`REUSE / EXTEND\` 规范在当前 PR 中对既有入口/驱动做**最小可复用扩展**（不另建新 QA 框架）：
+   - **可复用 E2E 入口与准备步骤沉淀**：若本次 Issue 引入**新的用户可见页面流程**、明确要求真实引擎/浏览器验收，或 Review / E2E 退回要求补齐 QA 准备步骤，且目标仓库维护了可复用的 QA/E2E 入口（如 \`qa/README.md\` 登记的 action 目录或维护中的 Playwright spec）且原始 Issue 未禁止改动 \`qa/\`，当既有入口尚未覆盖时，应按仓库 \`REUSE / EXTEND\` 规范在当前 PR 中对既有入口/驱动做**最小可复用扩展**（不另建新 QA 框架，**不在功能 PR 中顺手重构通用 QA 运行时或跨单进程回收底座**；若确需通用 QA 基础设施改造，记录缺口或标为 \`blocked\` 交由独立基础设施单处理）：
      - 优先在现有 \`qa/\` 入口中补齐系统支持的**可复用准备步骤**（如用系统支持的方式创建测试用户/身份、授予同一表对或资源的读取权限、准备隔离夹具），并提供清晰的**预检、运行和清理**命令/步骤；
      - 若 Issue 验收标准同时明确要求真实引擎/浏览器下的**反例或边界场景**（如跨对象/无权拒绝、并发或慢响应切表隔离），一并纳入该既有维护入口，避免下游 \`codex-e2e\` 临场拼装一次性脚本反复试错；
      - 开发期仅验证脚本本身（静态/语法/入口守卫/路由单测或类型检查，不启动真实引擎或浏览器实跑），独立 E2E 会用真实页面验证登录、切换与端到端行为，请在总结中写明供下游 \`codex-e2e\` 直接调用的预检、运行和清理命令；若已有入口覆盖、属纯后端/文档/小修，或 Issue 明确要求不改动 \`qa/\`，则保持不动。
@@ -1460,14 +1556,27 @@ EOF
     is_schema_error=0
     is_evidence_error=0
     missing_evidence=""
+    issue_test_budget="$(parse_issue_test_budget "$body")"
     if "$run_attempt" {dev_lock_fd}>&- 2>"$attempt_stderr_file" | "$TEE_BIN" "$attempt_events_file" >> "$events_file"; then
       if [[ "$DEV_ENGINE" == "codex" ]] && ! validate_codex_result "$attempt_result_file"; then
         printf 'Codex 返回的开发结果缺失或无效：%s\n' "$attempt_result_file" >> "$attempt_stderr_file"
         is_schema_error=1
         attempt_rc=1
-      elif [[ "$DEV_ENGINE" == "codex" && "$expected_review_blockers_json" != "[]" ]]; then
-        if ! missing_evidence="$(check_blocker_evidence "$attempt_result_file" "$expected_review_blockers_json")"; then
-          printf 'Codex 返回的阻塞项关闭证据不完整：\n%s\n' "$missing_evidence" >> "$attempt_stderr_file"
+      elif [[ "$DEV_ENGINE" == "codex" ]]; then
+        missing_blocker_part=""
+        missing_verify_part=""
+        if [[ "$expected_review_blockers_json" != "[]" ]]; then
+          if ! missing_blocker_part="$(check_blocker_evidence "$attempt_result_file" "$expected_review_blockers_json")"; then
+            :
+          fi
+        fi
+        live_metrics_json="$(compute_diff_metrics "$GIT_BIN" "$JQ_BIN" "$wt_dir" "$base_ref" WORKTREE)"
+        if ! missing_verify_part="$(check_verification_and_size_evidence "$attempt_result_file" "$live_metrics_json" "$issue_test_budget")"; then
+          :
+        fi
+        if [[ -n "$missing_blocker_part" || -n "$missing_verify_part" ]]; then
+          missing_evidence="${missing_blocker_part}${missing_blocker_part:+$'\n'}${missing_verify_part}"
+          printf 'Codex 返回的验证/规模证据不完整：\n%s\n' "$missing_evidence" >> "$attempt_stderr_file"
           last_missing_evidence="$missing_evidence"
           is_evidence_error=1
           attempt_rc=1
@@ -1503,7 +1612,7 @@ EOF
       schema_retries=$((schema_retries + 1))
       printf '[%s] 警告：Issue #%s 第 %d 次执行返回的结构化结果无效，3s 后续接原会话 (%s) 修正输出（第 %d/%d 次重试）...\n' \
         "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$schema_retries" "$max_s_retries" >&2
-      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空、blocked_reason=\"\"，并按要求填写 blocker_resolutions（无评审阻塞项时填 []）；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
+      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空、blocked_reason=\"\"，并按要求填写 blocker_resolutions、verification_matrix 与 size_justification；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
       if [[ -z "$current_session_id" ]]; then
         current_prompt="${prompt}"$'\n\n'"${current_prompt}"
       fi
@@ -1513,9 +1622,9 @@ EOF
 
     if (( is_evidence_error == 1 && evidence_retries < max_e_retries )); then
       evidence_retries=$((evidence_retries + 1))
-      printf '[%s] 警告：Issue #%s 第 %d 次执行缺少评审阻塞项逐项证据，3s 后续接原会话 (%s) 补齐（第 %d/%d 次重试）...\n' \
+      printf '[%s] 警告：Issue #%s 第 %d 次执行缺少评审阻塞或测试规模证据，3s 后续接原会话 (%s) 补齐（第 %d/%d 次重试）...\n' \
         "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$evidence_retries" "$max_e_retries" >&2
-      current_prompt="你上一次提交的结果缺少以下评审阻塞项的逐项关闭证据："$'\n'"${missing_evidence}"$'\n\n'"请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push）："$'\n'"1. 逐条对照上述阻塞项的关闭条件，如尚未覆盖要求的前置状态、边界输入或失败恢复路径，请先补齐定向内部测试并运行通过（真实 Doris 与浏览器仍由独立 E2E 执行）；"$'\n'"2. 再次按 JSON Schema 返回完整结果，在 blocker_resolutions 中为每个阻塞编号填全 precondition_covered、test_or_check 与 result。"
+      current_prompt="你上一次提交的结果缺少以下必交证据（宿主机实测工作树相对 ${base_ref} 的变更规模：$(render_diff_metrics_markdown "$JQ_BIN" "$live_metrics_json" "$issue_test_budget" | tr '\n' ' ')）："$'\n'"${missing_evidence}"$'\n\n'"请保留当前 worktree 中已完成的有效代码改动（不要执行 git commit/push）："$'\n'"1. 若缺少评审阻塞项关闭证据且尚未覆盖要求的前置状态/边界输入/失败恢复路径，请先补齐定向内部测试并运行通过（真实 Doris 与浏览器仍由独立 E2E 执行）；"$'\n'"2. 若触发了测试/QA 规模或通用 QA 运行时复核信号，请先自查并精简重复/低价值测试或收回非必要改动；确属必要则在 size_justification 中写清原因；"$'\n'"3. 在 verification_matrix 中逐项补齐每个测试/QA 改动的 target、existing_entry、gap、action（REUSE/EXTEND/NEW）与 rationale，并按 JSON Schema 返回完整结果。"
       if [[ -z "$current_session_id" ]]; then
         current_prompt="${prompt}"$'\n\n'"${current_prompt}"
       fi
@@ -1637,6 +1746,7 @@ EOF
     if (( run_ok == 1 )); then
       "$JQ_BIN" -r '
         def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
+        def filled: type == "string" and test("\\S");
         .summary
         + (if ((.blocker_resolutions // []) | length) > 0 then
             "\n\n#### 本轮阻塞项逐项验证\n| 阻塞编号 | 覆盖前置/边界 | 对应测试或检查 | 结果 |\n| --- | --- | --- | --- |\n"
@@ -1644,12 +1754,21 @@ EOF
                 | "| `" + (.id | esc) + "` | " + (.precondition_covered | esc) + " | " + (.test_or_check | esc) + " | " + (.result | esc) + " |"
               ] | join("\n"))
           else "" end)
+        + (if ((.verification_matrix // []) | length) > 0 then
+            "\n\n#### 验证覆盖与复用说明\n| 验证目标 | 已有入口及断言 | 覆盖缺口 | 方式 | 必要性说明 |\n| --- | --- | --- | --- | --- |\n"
+            + ([.verification_matrix[]
+                | "| " + (.target | esc) + " | " + (.existing_entry | esc) + " | " + (.gap | esc) + " | `" + (.action | esc) + "` | " + (.rationale | esc) + " |"
+              ] | join("\n"))
+          else "" end)
+        + (if (.size_justification | filled) then
+            "\n\n#### 测试/QA 规模与范围说明\n" + .size_justification
+          else "" end)
       ' "$attempt_result_file" > "$summary_file"
       "$JQ_BIN" -r '.blocked_reason' "$attempt_result_file" > "$blocked_file"
       "$JQ_BIN" -r '.commit_message' "$attempt_result_file" > "$commit_msg_file"
       proposed_branch="$("$JQ_BIN" -r '.branch_name | split("\n")[0] // ""' "$attempt_result_file")"
     elif [[ -n "$last_missing_evidence" ]]; then
-      printf '返工提交缺少评审阻塞项逐项关闭证据（已重试原会话 %d/%d 次仍不完整）：\n%s\n' \
+      printf '提交前证据校验未通过（已重试原会话 %d/%d 次仍不完整）：\n%s\n' \
         "$evidence_retries" "$max_e_retries" "$last_missing_evidence" > "$blocked_file"
     fi
   else
@@ -1786,10 +1905,15 @@ EOF
               if is_release_issue "$body"; then
                 issue_reference="$(release_pr_reference "$number")"
               fi
+              final_metrics_json="$(compute_diff_metrics "$GIT_BIN" "$JQ_BIN" "$wt_dir" "$base_ref" HEAD)"
+              final_metrics_md="$(render_diff_metrics_markdown "$JQ_BIN" "$final_metrics_json" "$(parse_issue_test_budget "$body")")"
               "$CAT_BIN" > "$pr_body_file" <<EOF
 ## Summary
 
 ${summary_text:-"Automated changes for issue #${number}."}
+
+## 变更规模（宿主机实测）
+${final_metrics_md}
 
 ## Metadata
 - Issue: #${number}
