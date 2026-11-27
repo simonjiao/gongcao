@@ -40,7 +40,7 @@ if [[ "$orig_dead" != "0" ]]; then
   exit 1
 fi
 
-# 判定面板当前是否处于安全可重启边界（空闲等待或刚结束本轮任务进入收尾 sleep）
+# 判定面板当前是否处于安全可重启边界（空闲等待、轮询退避等待或刚结束本轮任务进入收尾 sleep）
 is_pane_safe_to_restart() {
   local pane_pid="$1"
   local child_comms="" line=""
@@ -54,9 +54,10 @@ is_pane_safe_to_restart() {
     [[ "$line" == "sleep" ]] || return 1
   done <<<"$child_comms"
 
-  # 2. 面板尾部输出检查：避免在配额冷却或超时重试等待期间误重启
+  # 2. 面板回溯检查（200 行）：兼容长期空闲期间被 gh-state 瞬态网络重试日志顶出 25 行的场景，
+  #    同时严格避免在任务执行中、配额原地冷却、超时续接或评审交接重试期间误重启。
   local pane_text=""
-  pane_text="$("$TMUX_BIN" capture-pane -t "$TARGET" -p -S -25 2>/dev/null || true)"
+  pane_text="$("$TMUX_BIN" capture-pane -t "$TARGET" -p -S -200 2>/dev/null || true)"
 
   local -a non_empty=()
   while IFS= read -r line; do
@@ -68,30 +69,22 @@ is_pane_safe_to_restart() {
   local count="${#non_empty[@]}"
   (( count == 0 )) && return 1
 
-  local last_line="${non_empty[$((count - 1))]}"
-  if [[ "$last_line" == *"空闲等待中"* ]]; then
-    return 0
-  fi
-
-  local start_idx=$(( count > 15 ? count - 15 : 0 ))
-  local done_idx=-1
-  local i=0
-  for (( i = start_idx; i < count; i++ )); do
-    if [[ "${non_empty[$i]}" == *"[DONE]"* ]]; then
-      done_idx="$i"
-    fi
+  # 从最新一行向前扫描，忽略纯轮询阶段的瞬态 GitHub 报错，找到最近一条显著状态边界
+  local i=0 cur=""
+  for (( i = count - 1; i >= 0; i-- )); do
+    cur="${non_empty[$i]}"
+    case "$cur" in
+      *"[gh-state] 警告："*|*"Post \"https://api.github.com"*|*"Get \"https://api.github.com"*|*"警告：拉取"*"列表失败"*|*"警告：初始化状态标签失败"*|*"警告：无法读取 PR #"*"评审验收交接"*)
+        continue
+        ;;
+      *"空闲等待中"*|*"[DONE]"*|*"启动 codex-"*|*"启动 agy-"*|*"启动 cleanup-merged"*)
+        return 0
+        ;;
+      *"准备 Issue"*|*"启动 Issue"*|*"续接 Issue"*|*"开始 Codex"*|*"开始构建合入提交"*|*"配额限流"*|*"超时上限"*|*"超时限制"*|*"结构化结果无效"*|*"可重试接口异常"*|*"评审交接失败"*|*"准备"*"worktree 失败"*|*"同步主干"*"失败"*|*"已切换"*)
+        return 1
+        ;;
+    esac
   done
-
-  if (( done_idx >= 0 )); then
-    for (( i = done_idx + 1; i < count; i++ )); do
-      case "${non_empty[$i]}" in
-        *"准备 Issue"*|*"启动 Issue"*|*"续接 Issue"*|*"开始 Codex"*|*"警告："*|*"已切换"*)
-          return 1
-          ;;
-      esac
-    done
-    return 0
-  fi
 
   return 1
 }
