@@ -37,7 +37,16 @@ cat > "$fixture/workflow/gh-state.sh" <<'EOF'
 set -euo pipefail
 case "$*" in
   'list-issues '*'agy:changes-requested'*)
-    printf '[]\n'
+    if [[ -f "$MOCK_DIR/changes-issues.json" ]]; then
+      cat "$MOCK_DIR/changes-issues.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  'get-comment issue '*'codex-review-comment'*)
+    [[ -f "$MOCK_DIR/review-comment.md" ]] && cat "$MOCK_DIR/review-comment.md" || true
+    ;;
+  'get-comment issue '*)
     ;;
   'list-issues '*'ready-for-agent'*)
     if [[ -f "$MOCK_DIR/ready-issues.json" ]]; then
@@ -134,6 +143,15 @@ case "$mode" in
   quota-worded)
     printf 'Rate limit reached. Please try again in 10 minutes.\n' >&2
     exit 1
+    ;;
+  evidence-retry)
+    if (( count == 1 )); then
+      printf 'rework-part1\n' >> app.txt
+      printf '{"status":"completed","summary":"已修一项","blocked_reason":"","commit_message":"fix: partial","branch_name":"feat/rework-evidence","blocker_resolutions":[{"id":"blocker-a","precondition_covered":"输入 false 态","test_or_check":"pytest test_a","result":"passed"}]}\n' > "$out_file"
+    else
+      printf 'rework-part2\n' >> app.txt
+      printf '{"status":"completed","summary":"已补齐全部阻塞证据","blocked_reason":"","commit_message":"fix: full evidence","branch_name":"feat/rework-evidence","blocker_resolutions":[{"id":"blocker-a","precondition_covered":"输入 false 态","test_or_check":"pytest test_a","result":"passed"},{"id":"blocker-b","precondition_covered":"异常退出恢复原值","test_or_check":"pytest test_b","result":"passed"}]}\n' > "$out_file"
+    fi
     ;;
   *)
     printf 'Unknown mode: %s\n' "$mode" >&2
@@ -423,5 +441,71 @@ jq -e '
   and (.labels | index("bug")) != null
 ' "$fixture/gh-put-payload.json" >/dev/null \
   || { cat "$fixture/gh-put-payload.json" >&2; fail 'gh-state set-state 未清除 ready-for-agent 或误删了 hold-merge/bug'; }
+
+# 12. 评审返工：阻塞清单与反馈置顶 + 缺少逐项证据时续接原会话补齐 + 兼容旧版评论与 approve 评论
+printf '[]\n' > "$fixture/issues.json"
+jq -n '[{number:19, title:"测试返工逐项证据", body:"UNIQUE_ISSUE_19_BODY", url:"https://example.invalid/issues/19", state:"OPEN", labels:[{name:"agy:changes-requested"}]}]' \
+  > "$fixture/changes-issues.json"
+cat > "$fixture/review-comment.md" <<'EOF'
+### Codex 独立评审报告
+
+| 字段 | 值 |
+| --- | --- |
+| 评审结论 | `request_changes` -> `agy:changes-requested` |
+
+#### 阻塞问题（Blocking Issues）
+- **[major]** `blocker-a` · `a.py:1`
+  缺少 false 态覆盖
+  - 修复建议。从 false 起测
+  - 关闭条件。从 switch=false 起测并验证开启
+- **[major]** `blocker-b` · `b.py:2`
+  缺少异常恢复
+  - 修复建议。finally 恢复
+  - 关闭条件。探针失败退出时恢复原值
+
+<!-- codex-review-meta:{"head_sha":"abc123","verdict":"request_changes","e2e_decision":"run_e2e","e2e_reused_sha":"","e2e_checks":[],"blocking_issues":[{"id":"blocker-a","severity":"major","location":"a.py:1","verification":"从 switch=false 起测并验证开启"},{"id":"blocker-b","severity":"major","location":"b.py:2","verification":"探针失败退出时恢复原值"}]} -->
+EOF
+printf 'evidence-retry' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-args.log"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 19 in-review'
+[[ "$(<"$fixture/codex-count")" == "2" ]] || fail '缺项证据应触发 1 次原会话补齐'
+grep -Fq 'resume thread-abc-123' "$fixture/codex-args.log" || fail '缺项证据补齐未续接原会话'
+grep -Fq 'blocker-b' "$fixture/prompt-2.txt" || fail '原会话补齐提示词未指出缺失的 blocker-b'
+grep -Fq '探针失败退出时恢复原值' "$fixture/prompt-2.txt" || fail '原会话补齐提示词未附带缺失项关闭条件'
+line_checklist="$(grep -n '本轮待关闭阻塞项与关闭条件' "$fixture/prompt-1.txt" | head -n 1 | cut -d: -f1)"
+line_issue_body="$(grep -n 'UNIQUE_ISSUE_19_BODY' "$fixture/prompt-1.txt" | head -n 1 | cut -d: -f1)"
+[[ -n "$line_checklist" && -n "$line_issue_body" && "$line_checklist" -lt "$line_issue_body" ]] \
+  || fail "返工提示词未将阻塞清单置顶于 Issue 正文之前 (checklist=$line_checklist, body=$line_issue_body)"
+grep -Fq '本轮阻塞项逐项验证' "$state_dir/sessions/issue-19/summary.md" || fail '最终 summary 未渲染阻塞项逐项验证表'
+grep -Fq '异常退出恢复原值' "$state_dir/sessions/issue-19/summary.md" || fail '最终 summary 缺少 blocker-b 证据'
+rm -f "$fixture/changes-issues.json" "$fixture/review-comment.md"
+
+# 12b. 验证 extract_review_blockers_json 兼容无 blocking_issues 的旧版评审评论，并在 verdict=approve 时返回 []
+bash -euo pipefail -c '
+  JQ_BIN="$(command -v jq)"
+  eval "$(sed -n "/^extract_review_blockers_json()/,/^}/p" "'"$fixture"'/workflow/lib/issue-loop.sh")"
+  legacy_md="$(cat <<'\''EOM'\''
+### Codex 独立评审报告
+| 评审结论 | `request_changes` -> `agy:changes-requested` |
+#### 阻塞问题（Blocking Issues）
+- **[major]** `quality-qa-doris-preflight` · `qa/metadata-evidence.py:150`
+  READY 契约允许关闭
+  - 修复建议。先启用再恢复
+  - 关闭条件。定向覆盖 enable_audit_plugin=false 时启用并恢复原值。
+<!-- codex-review-meta:{"head_sha":"abc","verdict":"request_changes","e2e_decision":"run_e2e","e2e_reused_sha":"","e2e_checks":[]} -->
+EOM
+)"
+  got_legacy="$(extract_review_blockers_json "$legacy_md")"
+  jq -e '\''length == 1 and .[0].id == "quality-qa-doris-preflight" and (.[0].verification | contains("enable_audit_plugin=false"))'\'' <<<"$got_legacy" >/dev/null
+
+  approved_md="$(cat <<'\''EOM'\''
+<!-- codex-review-meta:{"head_sha":"abc","verdict":"approve","e2e_decision":"run_e2e","e2e_reused_sha":"","e2e_checks":["E1"],"blocking_issues":[]} -->
+EOM
+)"
+  got_approved="$(extract_review_blockers_json "$approved_md")"
+  [[ "$got_approved" == "[]" ]]
+'
 
 printf 'issue loop tests passed\n'

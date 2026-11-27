@@ -505,4 +505,67 @@ E2E_ROOT="$handoff_e2e_rev" run_loop e2e
 assert_calls "$((before_e2e_pass + 1))" 'set-state pr 7 e2e-passed'
 grep -Fq 'E1 单账号整页重载后保留原提交编号' "$fixture/last-prompt" || fail 'E2E 未按复审更新后的必验场景重跑'
 
+# 8. 按修复进展判停（#474 场景）：每轮关闭上一轮阻塞项时，第 3 轮仍继续交回 Dev，且 meta 内嵌阻塞关闭条件；连续无进展时暂停
+progress_rev="$fixture/reviews-progress"
+before_prog_cr="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+before_prog_blk="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+
+# R1: 3 项阻塞
+jq -n '{
+  verdict:"request_changes", summary:"首轮 3 项阻塞", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], requires_human_decision:false, requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[
+    {id:"obs-binding", severity:"major", location:"a.ts:1", description:"观察未绑定", suggestion:"绑定", verification:"确认后变更目录观察 -> 派发前拦截 -> 旧请求不执行"},
+    {id:"unknown-unlock", severity:"major", location:"b.java:2", description:"断链解锁", suggestion:"保持锁定", verification:"断链无可信凭证时锁定不重提；取得唯一凭证后解锁并展示来源明确的时间"},
+    {id:"contract-scope", severity:"major", location:"c.java:3", description:"普通查询契约", suggestion:"收回", verification:"普通查询传 expectedSourceRevision 不被拒绝"}
+  ]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 进展判停 R1'
+REVIEWS_ROOT="$progress_rev" run_loop review
+assert_calls "$((before_prog_cr + 1))" 'set-state pr 7 changes-requested'
+grep -Fq '前置状态/边界输入 → 操作/触发条件 → 可观测预期结果' "$fixture/last-prompt" || fail 'Review 提示词缺少前置状态->操作->预期结果关闭条件要求'
+grep -F 'codex-review-meta:' "$fixture/review-comment" | grep -Fq '"unknown-unlock"' || fail 'codex-review-meta 未内嵌阻塞项 ID'
+
+# R2: 关闭 obs-binding 与 contract-scope，保留 unknown-unlock，新增 qa-preflight
+jq -n '{
+  verdict:"request_changes", summary:"次轮关闭两项，余两项", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], requires_human_decision:false, requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[
+    {id:"unknown-unlock", severity:"major", location:"b.java:20", description:"终态缺少时间", suggestion:"补核对时间", verification:"取得唯一凭证后解锁并展示来源明确的时间"},
+    {id:"qa-preflight", severity:"major", location:"qa/m.py:10", description:"缺少审计预检", suggestion:"补预检", verification:"从 enable_audit_plugin=false 起测 -> 临时启用并读到唯一凭证 -> 成功与失败退出均恢复原值"}
+  ]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 进展判停 R2'
+REVIEWS_ROOT="$progress_rev" run_loop review
+assert_calls "$((before_prog_cr + 2))" 'set-state pr 7 changes-requested'
+
+# R3: 关闭 unknown-unlock，仅剩 qa-preflight（第 2 次出现）-> 有实质进展，应继续 changes-requested 而非硬停 blocked
+jq -n '{
+  verdict:"request_changes", summary:"第三轮关闭终态时间，仅剩审计预检", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], requires_human_decision:false, requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[
+    {id:"qa-preflight", severity:"major", location:"qa/m.py:15", description:"未覆盖关闭态启用", suggestion:"支持 false 态启用并恢复", verification:"从 enable_audit_plugin=false 起测 -> 临时启用并读到唯一凭证 -> 成功与失败退出均恢复原值"}
+  ]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 进展判停 R3'
+REVIEWS_ROOT="$progress_rev" run_loop review
+assert_calls "$((before_prog_cr + 3))" 'set-state pr 7 changes-requested'
+assert_calls "$before_prog_blk" 'set-state pr 7 blocked'
+[[ "$(<"$progress_rev/pr-7/stalled_rounds.txt")" == "0" ]] || fail '每轮有关闭阻塞项时 stalled_rounds 应保持 0'
+
+# 8b. 复审未关闭上一轮任何阻塞项达到 MAX_STALLED_REVIEW_ROUNDS 时触发停滞暂停
+stall_rev="$fixture/reviews-stall"
+jq -n '{
+  verdict:"request_changes", summary:"首轮单阻塞", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], requires_human_decision:false, requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[{id:"stall-item", severity:"major", location:"x.ts:1", description:"未修", suggestion:"修", verification:"输入 A -> 返回 B"}]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 停滞测试 R1'
+MAX_STALLED_REVIEW_ROUNDS=1 REVIEWS_ROOT="$stall_rev" run_loop review
+assert_calls "$((before_prog_cr + 4))" 'set-state pr 7 changes-requested'
+set_pr_body 'Closes #42 停滞测试 R2（未关闭 stall-item）'
+MAX_STALLED_REVIEW_ROUNDS=1 REVIEWS_ROOT="$stall_rev" run_loop review
+assert_calls "$((before_prog_blk + 1))" 'set-state pr 7 blocked'
+grep -Fq '复审未关闭上一轮任何阻塞项' "$fixture/review-comment" || fail '停滞暂停评论缺少无进展说明'
+
 printf 'workflow convergence tests passed\n'

@@ -134,6 +134,7 @@ POLL_INTERVAL="${POLL_INTERVAL:-60}"   # 无新 issue 时的轮询间隔（秒�
 MAX_BACKOFF="${MAX_BACKOFF:-900}"      # 连续拉取失败时的最大退避上限（秒，默认 15 分钟）
 MAX_TIMEOUT_RETRIES="${MAX_TIMEOUT_RETRIES:-2}" # 超时后自动续接原会话的重试次数上限
 MAX_SCHEMA_RETRIES="${MAX_SCHEMA_RETRIES:-1}"   # Codex 结构化输出不合规时续接原会话修正格式的重试次数上限
+MAX_EVIDENCE_RETRIES="${MAX_EVIDENCE_RETRIES:-1}" # 返工缺少逐项阻塞关闭证据时续接原会话补齐的重试次数上限
 MAX_QUOTA_RETRIES="${MAX_QUOTA_RETRIES:-6}"     # 触发 429/RESOURCE_EXHAUSTED 配额限流或可重试 API 报错时的自动等待重试次数上限
 QUOTA_RETRY_BUFFER_SEC="${QUOTA_RETRY_BUFFER_SEC:-15}" # 配额重置倒计时额外缓冲秒数
 QUOTA_DEFAULT_WAIT_SEC="${QUOTA_DEFAULT_WAIT_SEC:-120}" # 未解析出 Resets in 时的默认冷却等待秒数
@@ -738,9 +739,23 @@ write_codex_schema() {
     "summary": {"type": "string"},
     "blocked_reason": {"type": "string"},
     "commit_message": {"type": "string"},
-    "branch_name": {"type": "string"}
+    "branch_name": {"type": "string"},
+    "blocker_resolutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "precondition_covered": {"type": "string"},
+          "test_or_check": {"type": "string"},
+          "result": {"type": "string"}
+        },
+        "required": ["id", "precondition_covered", "test_or_check", "result"],
+        "additionalProperties": false
+      }
+    }
   },
-  "required": ["status", "summary", "blocked_reason", "commit_message", "branch_name"],
+  "required": ["status", "summary", "blocked_reason", "commit_message", "branch_name", "blocker_resolutions"],
   "additionalProperties": false
 }
 EOF
@@ -749,14 +764,134 @@ EOF
 validate_codex_result() {
   [[ -s "$1" ]] && "$JQ_BIN" -e -s '
     def filled: test("\\S");
+    def valid_resolutions:
+      if . == null then true
+      elif type == "array" then
+        all(type == "object" and ([.id, .precondition_covered, .test_or_check, .result] | all(type == "string")))
+      else false
+      end;
     length == 1 and (.[0] |
       ([.summary, .blocked_reason, .commit_message, .branch_name] | all(type == "string"))
+      and (.blocker_resolutions | valid_resolutions)
       and (
         (.status == "completed" and (.summary | filled) and .blocked_reason == "")
         or (.status == "blocked" and (.blocked_reason | filled))
       )
     )
   ' "$1" >/dev/null
+}
+
+# 从最新评审评论提取仍未关闭的阻塞项（优先读 codex-review-meta，缺失时兼容解析 Markdown 阻塞列表）
+extract_review_blockers_json() {
+  local review_comment="${1:-}"
+  if [[ -z "$review_comment" ]]; then
+    printf '[]'
+    return 0
+  fi
+
+  local from_meta=""
+  from_meta="$("$JQ_BIN" -Rsc '
+    "<!-- codex-review-meta:" as $prefix
+    | split("\n")
+    | map(rtrimstr("\r") | select(startswith($prefix) and endswith(" -->")))
+    | last
+    | if . == null then ""
+      else (ltrimstr($prefix) | rtrimstr(" -->") | (try fromjson catch null))
+      end
+    | if type != "object" then "__NO_META__"
+      elif .verdict != "request_changes" then "[]"
+      elif (.blocking_issues | type) == "array" and (.blocking_issues | length) > 0 then
+        ([.blocking_issues[]
+          | select((.id | type == "string") and (.id | test("\\S")))
+          | {id: .id, verification: (.verification // "")}] | tojson)
+      else "__LEGACY_META__"
+      end
+  ' <<<"$review_comment" 2>/dev/null || printf '__NO_META__')"
+  # 去除 jq -c 外层 JSON 字符串引号
+  from_meta="$("$JQ_BIN" -r '.' <<<"$from_meta" 2>/dev/null || printf '__NO_META__')"
+
+  if [[ "$from_meta" != "__NO_META__" && "$from_meta" != "__LEGACY_META__" ]]; then
+    printf '%s' "$from_meta"
+    return 0
+  fi
+
+  # 兼容旧版未在 meta 中内嵌 blocking_issues 的 request_changes 评审评论
+  if [[ "$from_meta" == "__NO_META__" && "$review_comment" != *'`request_changes`'* ]]; then
+    printf '[]'
+    return 0
+  fi
+
+  local in_blockers=0 cur_id="" cur_ver="" line="" clean_line="" items_jsonl=""
+  local re_blocker='^-[[:space:]]+\*\*\[(critical|major)\]\*\*[[:space:]]+`([a-z0-9][a-z0-9-]*)`'
+  local re_verif='^[[:space:]]*-[[:space:]]*关闭条件[。：:][[:space:]]*(.*)$'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    clean_line="${line%$'\r'}"
+    if [[ "$clean_line" == "#### 阻塞问题"* ]]; then
+      in_blockers=1
+      continue
+    fi
+    if (( in_blockers == 1 )); then
+      if [[ "$clean_line" == "#### "* || "$clean_line" == "<details>"* || "$clean_line" == "<!-- codex-review-meta:"* ]]; then
+        break
+      fi
+      if [[ "$clean_line" =~ $re_blocker ]]; then
+        if [[ -n "$cur_id" ]]; then
+          items_jsonl+="$("$JQ_BIN" -nc --arg id "$cur_id" --arg v "$cur_ver" '{id:$id, verification:$v}')"$'\n'
+        fi
+        cur_id="${BASH_REMATCH[2]}"
+        cur_ver=""
+      elif [[ -n "$cur_id" && "$clean_line" =~ $re_verif ]]; then
+        cur_ver="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done <<<"$review_comment"
+  if [[ -n "$cur_id" ]]; then
+    items_jsonl+="$("$JQ_BIN" -nc --arg id "$cur_id" --arg v "$cur_ver" '{id:$id, verification:$v}')"$'\n'
+  fi
+
+  if [[ -z "$items_jsonl" ]]; then
+    printf '[]'
+  else
+    "$JQ_BIN" -sc 'unique_by(.id)' <<<"$items_jsonl" 2>/dev/null || printf '[]'
+  fi
+}
+
+# 确定性校验：返工完成时，每条预期阻塞 ID 都须提供非空的前置覆盖、对应测试与结果
+check_blocker_evidence() {
+  local result_file="$1"
+  local expected_json="$2"
+  if [[ -z "$expected_json" || "$expected_json" == "[]" ]]; then
+    return 0
+  fi
+  local missing_report=""
+  missing_report="$("$JQ_BIN" -r --argjson expected "$expected_json" '
+    def filled: type == "string" and test("\\S");
+    if .status != "completed" then ""
+    else
+      (.blocker_resolutions // []) as $res
+      | [$expected[] | . as $e
+          | ([$res[] | select((.id // "") == $e.id)] | first) as $m
+          | if $m == null then
+              "- `" + $e.id + "`：缺少 blocker_resolutions 对应条目" + (if ($e.verification | filled) then "（关闭条件：" + $e.verification + "）" else "" end)
+            else
+              ([
+                (if ($m.precondition_covered | filled) then empty else "precondition_covered（覆盖的前置状态/边界输入）" end),
+                (if ($m.test_or_check | filled) then empty else "test_or_check（对应内部测试或检查）" end),
+                (if ($m.result | filled) then empty else "result（执行结果）" end)
+              ]) as $miss
+              | if ($miss | length) > 0 then
+                  "- `" + $e.id + "`：缺少 " + ($miss | join("、")) + (if ($e.verification | filled) then "（关闭条件：" + $e.verification + "）" else "" end)
+                else empty
+                end
+            end
+        ] | join("\n")
+    end
+  ' "$result_file" 2>/dev/null || true)"
+  if [[ -n "$missing_report" ]]; then
+    printf '%s\n' "$missing_report"
+    return 1
+  fi
+  return 0
 }
 
 parse_reset_wait_seconds() {
@@ -1175,13 +1310,24 @@ while true; do
       "Agent 已认领该 Issue，正在独立 worktree 中分析与开发。"
   fi
 
-  # 若本轮是评审、E2E 或终审打回（changes-requested），拉取最新反馈注入 prompt
+  # 若本轮是评审、E2E 或终审打回（changes-requested），拉取最新反馈并提取结构化阻塞清单
   review_feedback_section=""
+  rework_checklist_section=""
+  expected_review_blockers_json="[]"
   if (( picked_from_changes_requested == 1 )) && [[ "$GH_SYNC_ENABLED" == "1" ]]; then
     review_feedback="$(gh_state get-comment issue "$number" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
     e2e_feedback="$(gh_state get-comment issue "$number" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
     final_gate_feedback="$(gh_state get-comment issue "$number" "$FINAL_GATE_COMMENT_MARKER" 2>/dev/null || true)"
     if [[ -n "$review_feedback" ]]; then
+      expected_review_blockers_json="$(extract_review_blockers_json "$review_feedback")"
+      if [[ "$expected_review_blockers_json" != "[]" ]]; then
+        rework_checklist_md="$("$JQ_BIN" -r '
+          [.[] | "- `" + .id + "`" + (if ((.verification // "") | test("\\S")) then "\n  - 关闭条件：" + .verification else "" end)] | join("\n")
+        ' <<<"$expected_review_blockers_json" 2>/dev/null || true)"
+        if [[ -n "$rework_checklist_md" ]]; then
+          rework_checklist_section=$'\n\n'"### 本轮待关闭阻塞项与关闭条件（请逐项核验并提交对应证据）"$'\n'"${rework_checklist_md}"$'\n'"- 提交前请逐条核对上述每项关闭条件中的**前置状态/边界输入、操作与预期结果**（包括关闭态/异常退出恢复路径；若关闭条件要求从某个关闭态起测，仅测开启态不算关闭），并在返回结果的 \`blocker_resolutions\` 中按阻塞编号逐项填写 \`precondition_covered\`、\`test_or_check\` 与 \`result\`。真实 Doris 与浏览器 E2E 仍交由独立 E2E 执行。"
+        fi
+      fi
       review_feedback_section+=$'\n\n'"### 独立代码评审反馈（请优先逐项修复以下阻塞问题）"$'\n'"${review_feedback}"
     fi
     if [[ -n "$e2e_feedback" ]]; then
@@ -1201,7 +1347,8 @@ while true; do
     developer_result_section="$("$CAT_BIN" <<EOF
 5. 最终按 JSON Schema 返回开发结果。
    - 开发和内部验证完成后，设置 \`status\` 为 \`completed\`，在 \`summary\` 中用中文说明改动、内部验证结果、E2E 执行情况和潜在风险。将 \`blocked_reason\` 留空。
-   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入。
+   - 若本轮为评审返工且上方列出了待关闭阻塞编号，必须在 \`blocker_resolutions\` 中逐项列出每个阻塞 \`id\` 对应的 \`precondition_covered\`（覆盖的前置状态/边界输入）、\`test_or_check\`（执行的内部测试或检查）与 \`result\`（通过结果）；非评审返工或无阻塞编号时返回空数组 \`[]\`。
+   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入（\`blocker_resolutions\` 可为空数组 \`[]\`）。
    - \`commit_message\` 可填写一行简明的提交消息。按以下要求填写 \`branch_name\`，无需命名时留空。${branch_prompt_line}
 6. GitHub 的读写均由外层脚本执行，请使用上面的 Issue 和反馈信息。
 EOF
@@ -1212,7 +1359,7 @@ EOF
     fi
     developer_result_section="$("$CAT_BIN" <<EOF
 5. 正常完成开发与内部验证后：
-   - 将本次改动的简明中文总结（改动文件、已执行的内部验证结果、显式标注 E2E 未执行，以及潜在风险）写入 ${summary_tmp}；
+   - 将本次改动的简明中文总结（改动文件、逐项阻塞关闭证据与已执行的内部验证结果、显式标注 E2E 未执行，以及潜在风险）写入 ${summary_tmp}；
    - 可选：将一行简明的英文/中文 commit message 写入 ${commit_msg_tmp}。${branch_prompt_line}
 6. **如果工作遇到阻塞无法继续**（例如需求不明确、缺少必要凭证/依赖、内部验证无法通过且无法在当前范围内修复）：
    - 立即停止修改，不要强行凑合；
@@ -1220,6 +1367,12 @@ EOF
 7. 不要把 /tmp 下的总结或状态文件复制到仓库目录中。
 EOF
 )"
+  fi
+
+  if (( picked_from_changes_requested == 1 )) && [[ -n "${merge_conflict_section}${rework_checklist_section}${review_feedback_section}" ]]; then
+    issue_and_feedback_block="${merge_conflict_section}${rework_checklist_section}${review_feedback_section}"$'\n\n'"### 关联 Issue 原始要求"$'\n'"${body}"
+  else
+    issue_and_feedback_block=$'\n\n'"### Issue 内容"$'\n'"${body}${merge_conflict_section}${review_feedback_section}"
   fi
 
   prompt="$("$CAT_BIN" <<EOF
@@ -1231,10 +1384,7 @@ EOF
 - 标签: ${labels}
 - 标题: ${title}
 - 工作分支: ${branch}
-- Worktree 目录: ${wt_dir}
-
-### Issue 内容
-${body}${merge_conflict_section}${review_feedback_section}
+- Worktree 目录: ${wt_dir}${issue_and_feedback_block}
 
 ### 处理要求
 1. 你当前运行在专属 git worktree（分支 ${branch}）的沙箱中，先阅读相关代码并分析问题根因或需求范围。
@@ -1269,10 +1419,14 @@ EOF
   quota_reset_human=""
   attempt=0
   schema_retries=0
+  evidence_retries=0
+  last_missing_evidence=""
   max_t_retries=0
   [[ "$MAX_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] && max_t_retries="$MAX_TIMEOUT_RETRIES"
   max_s_retries=0
   [[ "$MAX_SCHEMA_RETRIES" =~ ^[0-9]+$ ]] && max_s_retries="$MAX_SCHEMA_RETRIES"
+  max_e_retries=0
+  [[ "$MAX_EVIDENCE_RETRIES" =~ ^[0-9]+$ ]] && max_e_retries="$MAX_EVIDENCE_RETRIES"
   max_q_retries=0
   [[ "$MAX_QUOTA_RETRIES" =~ ^[0-9]+$ ]] && max_q_retries="$MAX_QUOTA_RETRIES"
   current_session_id="$existing_session_id"
@@ -1304,11 +1458,20 @@ EOF
 
     attempt_rc=0
     is_schema_error=0
+    is_evidence_error=0
+    missing_evidence=""
     if "$run_attempt" {dev_lock_fd}>&- 2>"$attempt_stderr_file" | "$TEE_BIN" "$attempt_events_file" >> "$events_file"; then
       if [[ "$DEV_ENGINE" == "codex" ]] && ! validate_codex_result "$attempt_result_file"; then
         printf 'Codex 返回的开发结果缺失或无效：%s\n' "$attempt_result_file" >> "$attempt_stderr_file"
         is_schema_error=1
         attempt_rc=1
+      elif [[ "$DEV_ENGINE" == "codex" && "$expected_review_blockers_json" != "[]" ]]; then
+        if ! missing_evidence="$(check_blocker_evidence "$attempt_result_file" "$expected_review_blockers_json")"; then
+          printf 'Codex 返回的阻塞项关闭证据不完整：\n%s\n' "$missing_evidence" >> "$attempt_stderr_file"
+          last_missing_evidence="$missing_evidence"
+          is_evidence_error=1
+          attempt_rc=1
+        fi
       fi
     else
       attempt_rc=${PIPESTATUS[0]}
@@ -1340,7 +1503,19 @@ EOF
       schema_retries=$((schema_retries + 1))
       printf '[%s] 警告：Issue #%s 第 %d 次执行返回的结构化结果无效，3s 后续接原会话 (%s) 修正输出（第 %d/%d 次重试）...\n' \
         "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$schema_retries" "$max_s_retries" >&2
-      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空且 blocked_reason=\"\"；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
+      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空、blocked_reason=\"\"，并按要求填写 blocker_resolutions（无评审阻塞项时填 []）；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
+      if [[ -z "$current_session_id" ]]; then
+        current_prompt="${prompt}"$'\n\n'"${current_prompt}"
+      fi
+      "$SLEEP_BIN" 3
+      continue
+    fi
+
+    if (( is_evidence_error == 1 && evidence_retries < max_e_retries )); then
+      evidence_retries=$((evidence_retries + 1))
+      printf '[%s] 警告：Issue #%s 第 %d 次执行缺少评审阻塞项逐项证据，3s 后续接原会话 (%s) 补齐（第 %d/%d 次重试）...\n' \
+        "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$evidence_retries" "$max_e_retries" >&2
+      current_prompt="你上一次提交的结果缺少以下评审阻塞项的逐项关闭证据："$'\n'"${missing_evidence}"$'\n\n'"请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push）："$'\n'"1. 逐条对照上述阻塞项的关闭条件，如尚未覆盖要求的前置状态、边界输入或失败恢复路径，请先补齐定向内部测试并运行通过（真实 Doris 与浏览器仍由独立 E2E 执行）；"$'\n'"2. 再次按 JSON Schema 返回完整结果，在 blocker_resolutions 中为每个阻塞编号填全 precondition_covered、test_or_check 与 result。"
       if [[ -z "$current_session_id" ]]; then
         current_prompt="${prompt}"$'\n\n'"${current_prompt}"
       fi
@@ -1460,10 +1635,22 @@ EOF
   proposed_branch=""
   if [[ "$DEV_ENGINE" == "codex" ]]; then
     if (( run_ok == 1 )); then
-      "$JQ_BIN" -r '.summary' "$attempt_result_file" > "$summary_file"
+      "$JQ_BIN" -r '
+        def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
+        .summary
+        + (if ((.blocker_resolutions // []) | length) > 0 then
+            "\n\n#### 本轮阻塞项逐项验证\n| 阻塞编号 | 覆盖前置/边界 | 对应测试或检查 | 结果 |\n| --- | --- | --- | --- |\n"
+            + ([.blocker_resolutions[]
+                | "| `" + (.id | esc) + "` | " + (.precondition_covered | esc) + " | " + (.test_or_check | esc) + " | " + (.result | esc) + " |"
+              ] | join("\n"))
+          else "" end)
+      ' "$attempt_result_file" > "$summary_file"
       "$JQ_BIN" -r '.blocked_reason' "$attempt_result_file" > "$blocked_file"
       "$JQ_BIN" -r '.commit_message' "$attempt_result_file" > "$commit_msg_file"
       proposed_branch="$("$JQ_BIN" -r '.branch_name | split("\n")[0] // ""' "$attempt_result_file")"
+    elif [[ -n "$last_missing_evidence" ]]; then
+      printf '返工提交缺少评审阻塞项逐项关闭证据（已重试原会话 %d/%d 次仍不完整）：\n%s\n' \
+        "$evidence_retries" "$max_e_retries" "$last_missing_evidence" > "$blocked_file"
     fi
   else
     "$CAT_BIN" "$summary_tmp" > "$summary_file"
