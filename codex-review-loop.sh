@@ -173,6 +173,23 @@ compute_review_key() {
   printf '%s:%s' "$sha" "${body_hash:0:16}"
 }
 
+# 检测是否存在 E2E 针对当前 head_sha 退回复审的显式交接标记（<!-- codex-e2e-handoff:<sha>:<token> -->）
+extract_e2e_handoff_token() {
+  local pr_num="$1"
+  local head_sha="$2"
+  local e2e_comment="" marker="" line=""
+  e2e_comment="$(gh_state get-comment pr "$pr_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
+  [[ -n "$e2e_comment" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && marker="$line"
+  done < <("$GREP_BIN" -oE "<!-- codex-e2e-handoff:${head_sha}:[A-Za-z0-9._-]+ -->" <<<"$e2e_comment" || true)
+  if [[ -n "$marker" ]]; then
+    marker="${marker#<!-- codex-e2e-handoff:${head_sha}:}"
+    marker="${marker% -->}"
+    printf '%s' "$marker"
+  fi
+}
+
 write_review_schema() {
   local schema_file="$1"
   "$CAT_BIN" > "$schema_file" <<'EOF'
@@ -635,6 +652,12 @@ while true; do
     [[ -n "$psha" ]] && pkey="$(compute_review_key "$psha" "$pbody")"
     sha_file="${REVIEWS_ROOT}/pr-${pnum}/reviewed_shas.txt"
     pending_file="${sha_file%/*}/pending-review.json"
+    if [[ -n "$pkey" && -f "$sha_file" ]] && "$GREP_BIN" -Fqx -- "$pkey" "$sha_file"; then
+      _handoff_tok="$(extract_e2e_handoff_token "$pnum" "$psha")"
+      if [[ -n "$_handoff_tok" ]]; then
+        pkey="${pkey}:e2e-${_handoff_tok}"
+      fi
+    fi
     if [[ "$DRY_RUN" != "1" && -f "$pending_file" ]] \
       && "$JQ_BIN" -e --arg key "$pkey" '.review_key == $key' "$pending_file" >/dev/null; then
       next_pr_json="$row"
@@ -698,6 +721,13 @@ EOF
   sha_file="${review_dir}/reviewed_shas.txt"
   "$TOUCH_BIN" "$sha_file"
   review_key="$(compute_review_key "$head_sha" "$pr_body")"
+  active_e2e_handoff_token=""
+  if [[ -n "$review_key" && -f "$sha_file" ]] && "$GREP_BIN" -Fqx -- "$review_key" "$sha_file"; then
+    active_e2e_handoff_token="$(extract_e2e_handoff_token "$pr_num" "$head_sha")"
+    if [[ -n "$active_e2e_handoff_token" ]]; then
+      review_key="${review_key}:e2e-${active_e2e_handoff_token}"
+    fi
+  fi
   pending_file="${review_dir}/pending-review.json"
   if [[ "$DRY_RUN" == "1" ]]; then
     pending_file="${review_dir}/pending-review-dry-run.json"
@@ -793,6 +823,10 @@ EOF
     prev_e2e_comment="$(gh_state get-comment issue "$issue_num" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
   fi
   prev_e2e_snippet="${prev_e2e_comment:0:8000}"
+  e2e_handoff_section=""
+  if [[ -n "$active_e2e_handoff_token" ]] || [[ "$prev_e2e_comment" == *"<!-- codex-e2e-handoff:${head_sha}:"* ]]; then
+    e2e_handoff_section=$'\n\n'"## E2E 退回复审交接（请重点核对前置条件与 Issue 范围）"$'\n'"- 本轮由独立 E2E 验收退回复审（同一提交 \`${head_sha:0:10}\`）：E2E 指出上一轮某条必验项依赖候选版本尚未支持的能力。"$'\n'"- 请对照下方「最近一次 E2E 验收评论摘录」与原始 Issue 要求，做出明确裁定："$'\n'"  1. 若现有单测/组件测试已满足对应回归，且真实 E2E 只需保留候选版本支持的核心场景，请调整并收敛 \`e2e_checks\` 后直接 \`approve\`，交回 E2E 继续验收；"$'\n'"  2. 若确认必须实测该场景且仓库系统有可用准备路径，请给出明确可落地的 QA 准备方式（账号/权限/数据/预检/清理），输出 \`request_changes\` 交由 Dev 在同一 PR 补齐可复用 QA 资产；"$'\n'"  3. 若确需产品/Owner 授权或变更系统能力边界，请在 \`request_changes\` 中设 \`requires_human_decision: true\` 并写清待授权项。"
+  fi
 
   pr_diff_raw="$(gh_state get-pr-diff "$pr_num" 2>/dev/null || true)"
   # 使用纯 Bash 切片截断，避免 set -o pipefail 下 printf | head 触发 SIGPIPE (141) 退出
@@ -871,7 +905,7 @@ EOF
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
+${issue_section}${e2e_handoff_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
 
 ## 既有 E2E 验收状态与免测判断依据
 - 是否存在通过的远端 QA 证据（\`${E2E_EVIDENCE_BRANCH}\`）: \`${prior_e2e_has_pass}\`
@@ -898,7 +932,11 @@ ${pr_diff_snippet:-"(空 diff)"}
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
    - 若改动扩展了兼容行为或改变共享模块、持久化数据、状态机等现有契约，请核对 Issue 中的具体要求或已有授权。将当前 PR 引入的未授权扩展列为阻塞项，指出需要收回的改动或待确认的范围。
    - 修复建议也须遵守相同的授权范围。发现读取或展示口径不一致时，优先建议在读取或展示层处理，并核查是否能保留现有写入、摘要和重放行为。证据无法确认根因时注明证据缺口。若满足 Issue 必须变更持久化或共享契约且缺少授权，输出 \`request_changes\`，将 \`requires_human_decision\` 设为 \`true\`，并在修复建议中写明待授权的契约和影响。其余情况该字段为 \`false\`。
-3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**；若 PR 已扩展维护入口而原始 Issue 同时明确要求真实引擎/浏览器下的反例或边界场景（如跨对象/无权拒绝、并发或慢响应切表），请检查这些反例是否也已纳入维护入口，未纳入时在 \`non_blocking_notes\` 与 \`e2e_checks\` 中明确指出。
+3. **关于 E2E 验证与前置条件核对**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**。
+   - **Review 必须先核对每条 E2E 必验项的前置条件**：你列出的每一条 \`e2e_checks\` 都要能明确指出账号、权限、数据与服务如何准备，并核对候选版本实际具备该能力。
+     - 若仓库系统允许准备（例如可通过系统支持的接口/命令创建测试账号、授权、造数），但现有 QA 入口/脚本缺少准备、预检或清理步骤，应直接输出 \`request_changes\` 退回 Dev 在同一 PR 补齐可复用 QA 脚本（而非放行到 E2E 后因缺脚本落入 \`blocked\`）。
+     - 若某条设想场景依赖候选版本尚未支持的能力（例如候选后端仅接受单组登录凭据却要求实测双账号登录），**禁止将不可执行的前置条件写入 \`e2e_checks\`**；应先核对 Issue 范围及已有单测/组件测试是否已满足对应回归，仅保留候选版本可真实执行的 E2E 必验项，或明确可用的 QA 准备路径后再交给 Dev 补齐资产。
+   - 若 PR 已扩展维护入口而原始 Issue 同时明确要求真实引擎/浏览器下的反例或边界场景（如跨对象/无权拒绝、并发或慢响应切表），请检查这些反例是否也已纳入维护入口，未纳入时在 \`non_blocking_notes\` 与 \`e2e_checks\` 中明确指出（若缺口会导致 E2E 无法按维护入口执行，可退回 Dev 补齐）。
 3.1 **E2E 路由裁定（\`e2e_decision\` 与 \`e2e_decision_reason\`）**（当 \`verdict == "request_changes"\` 时固定输出 \`run_e2e\`；当 \`verdict == "approve"\` 且开启 \`ALLOW_SKIP_E2E=1\` 时决定是否跳过 E2E 直达终审）：
    - \`run_e2e\`（默认保守选项）：涉及运行时代码/接口/数据库/前端交互/运行配置改动，且尚未针对当前运行时行为完成 E2E 验收（或上次 E2E 通过后的新改动影响了运行时行为）。
    - \`skip_not_needed\`：本次整个 PR 仅改动文档（\`docs/\`、\`*.md\`）、注释、纯单元测试、静态检查/格式化或构建元数据，完全不改变运行时行为，或原始 Issue 明确说明无需 E2E。
@@ -915,7 +953,7 @@ ${pr_diff_snippet:-"(空 diff)"}
    - **终轮务实放行**：若已处于最后一轮自动复审（\`cycle_round >= MAX_REVIEW_ROUNDS\` 或 \`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`），且 Issue 核心验收已满足、契约授权已确认、无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
    - 按根因归并阻塞项，填写唯一且稳定的 \`id\`（小写字母、数字和连字符），并用 \`verification\` 写出覆盖该根因的可验证关闭条件。先与本 PR 历次评审的根因对照。同一根因跨评审周期沿用原 ID，新出现的类型、测试输入、调用方或文件位置作为该项的证据。
-   - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件、操作和预期结果。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时填写空数组。
+   - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件（含账号、权限、数据与服务如何准备，且确认候选版本支持）、操作和预期结果。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时填写空数组。
 EOF
 
   round_effort="$CODEX_REASONING_EFFORT"

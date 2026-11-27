@@ -135,7 +135,7 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
               review_conflict_requeues: ([$rev_ev[] | select(.outcome == "conflict-requeued")] | length),
               e2e_runs: ($e2e_ev | length),
               e2e_passes: ([$e2e_ev[] | select(.outcome == "pass")] | length),
-              e2e_fails: ([$e2e_ev[] | select(.outcome == "fail")] | length),
+              e2e_fails: ([$e2e_ev[] | select(.outcome == "fail" or .outcome == "return_to_dev" or .outcome == "return_to_review")] | length),
               e2e_blocked: ([$e2e_ev[] | select(.outcome == "blocked")] | length),
               e2e_crashes: ($e2e.empty_results // 0),
               e2e_skipped: (if any($rev_ev[]; .target_state == "agy:e2e-skipped") then 1 else 0 end),
@@ -169,7 +169,7 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
               | {file: $file, id: (.id // ""), severity: (.severity // ""), location: (.location // ""), description: ((.description // "")[0:220])}
             ],
             e2e_failures: [
-              $e2e_results[] | select(.verdict == "fail" or .verdict == "blocked")
+              $e2e_results[] | select(.verdict == "fail" or .verdict == "return_to_dev" or .verdict == "return_to_review" or .verdict == "blocked")
               | {
                   file: .file,
                   verdict: .verdict,

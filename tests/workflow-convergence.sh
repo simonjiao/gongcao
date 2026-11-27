@@ -41,6 +41,9 @@ case "$*" in
     [[ ! -f "$MOCK_DIR/fail-read" ]] || exit 1
     cat "$MOCK_DIR/review-comment"
     ;;
+  'get-comment pr 7 <!-- codex-e2e-comment -->')
+    [[ -f "$MOCK_DIR/e2e-comment" ]] && cat "$MOCK_DIR/e2e-comment"
+    ;;
   'get-comment '*|'get-pr-diff '*)
     ;;
   'get-issue '*)
@@ -92,6 +95,14 @@ case "$*" in
       rm "$MOCK_DIR/fail-issue-comment"
       exit 1
     fi
+    cat >/dev/null
+    ;;
+  'comment pr 7 - <!-- codex-e2e-comment -->')
+    printf '%s\n' write-e2e >> "$MOCK_DIR/calls"
+    cat > "$MOCK_DIR/e2e-comment"
+    ;;
+  'comment issue 42 - <!-- codex-e2e-comment -->')
+    printf '%s\n' write-issue-e2e >> "$MOCK_DIR/calls"
     cat >/dev/null
     ;;
   'comment '*)
@@ -424,5 +435,74 @@ assert_calls 1 'mark-pr-ready 7'
 assert_calls 1 "merge-pr 7 merge ${MOCK_SHA}"
 grep -Fq '最新提交已变为 aaaaaaaaaa' "$fixture/final-p0-headchanged/pr-7/final-gate-comment.md" || fail 'head 变动未在终审评论中提示'
 rm -f "$fixture/live-pr.json" "$fixture/issue.json" "$fixture/pr-comments.json"
+
+# 7. E2E 按原因接续：return_to_dev 退回 Dev（changes-requested），return_to_review 退回 Review（同 SHA 自动触发复审并交回 E2E）
+handoff_rev="$fixture/reviews-e2e-handoff"
+handoff_e2e="$fixture/e2e-handoff"
+rm -f "$fixture/e2e-comment"
+set_pr_body 'Closes #42 验证 E2E 交接流转'
+
+# 7a. Review 首轮批准并给出需双账号的 E1
+jq -n '{
+  verdict:"approve", summary:"通过", e2e_decision:"run_e2e", e2e_decision_reason:"实测",
+  e2e_checks:["双账号登录并验证整页重载保留原提交编号"], requires_human_decision:false,
+  requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$handoff_rev" run_loop review
+grep -Fq 'Review 必须先核对每条 E2E 必验项的前置条件' "$fixture/last-prompt" || fail 'Review 提示词缺少前置条件核对要求'
+
+# 7b. E2E 发现维护 QA 脚本缺失准备步骤 -> return_to_dev -> PR 和 Issue 均切为 changes-requested（不落入 blocked）
+before_pr_cr="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+before_issue_cr="$(grep -Fxc -- 'set-state issue 42 changes-requested' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"return_to_dev", summary:"现有 QA 入口缺少测试用户准备和清理步骤", environment:"测试环境",
+  scenarios:[{id:"E1", name:"双账号准备", status:"blocked", details:"QA 脚本缺少创建测试账号与授权步骤", evidence_paths:[]}],
+  evidence_paths:[],
+  failure_details:[{title:"QA 入口缺少可复用准备步骤", reproduction:"运行 qa 入口", observed:"未创建测试账号", expected:"补齐预检、创建、运行与清理命令"}],
+  remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$handoff_e2e" run_loop e2e
+assert_calls "$((before_pr_cr + 1))" 'set-state pr 7 changes-requested'
+assert_calls "$((before_issue_cr + 1))" 'set-state issue 42 changes-requested'
+grep -Fq '仓库 QA 脚本或可复用准备步骤缺口' "$handoff_e2e/pr-7/e2e-comment.md" || fail 'return_to_dev 缺少交回 Dev 说明'
+
+# 7c. E2E 发现必验项依赖候选版本尚未支持的能力 -> return_to_review -> 同 SHA 自动唤醒 Review 复审并收缩 e2e_checks -> E2E 重跑通过
+handoff_e2e_rev="$fixture/e2e-handoff-review"
+before_rev_handoff="$(grep -Fxc -- codex-review "$fixture/calls" || true)"
+jq -n '{
+  verdict:"return_to_review", summary:"候选后端仅接受单组登录凭据，无法实测双账号切换", environment:"测试环境",
+  scenarios:[{id:"E1", name:"双账号登录隔离", status:"blocked", details:"候选后端仅配置单组凭据，已有双身份组件单测", evidence_paths:[]}],
+  evidence_paths:[],
+  failure_details:[{title:"E1 依赖候选版本尚未支持的多账号能力", reproduction:"检查候选后端登录配置", observed:"仅支持单组凭据", expected:"评审核对已有组件测试是否满足账号隔离回归并保留整页重载 E2E"}],
+  remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$handoff_e2e_rev" run_loop e2e
+assert_calls 1 'set-state pr 7 in-review'
+assert_calls 1 'set-state issue 42 in-review'
+grep -Fq "<!-- codex-e2e-handoff:${MOCK_SHA}:" "$fixture/e2e-comment" || fail 'return_to_review 未写入 E2E 交接标记'
+
+# Review 在同 SHA + 同 PR body 下应识别 E2E 交接标记并重新评审，调整 e2e_checks 后 approve
+jq -n '{
+  verdict:"approve", summary:"核对已有双身份组件测试满足隔离回归，保留整页重载真实 E2E", e2e_decision:"run_e2e", e2e_decision_reason:"实测整页重载",
+  e2e_checks:["单账号整页重载后保留原提交编号"], requires_human_decision:false,
+  requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$handoff_rev" run_loop review
+assert_calls "$((before_rev_handoff + 1))" codex-review
+grep -Fq 'E2E 退回复审交接' "$fixture/last-prompt" || fail 'Review 复审提示词未注入 E2E 退回复审交接说明'
+# 同一交接标记再次轮询不应重复触发评审（防止死循环）
+REVIEWS_ROOT="$handoff_rev" run_loop review
+assert_calls "$((before_rev_handoff + 1))" codex-review
+
+# E2E 在同一 SHA 下因评审必验场景已更新而自动重跑并通过
+before_e2e_pass="$(grep -Fxc -- 'set-state pr 7 e2e-passed' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"pass", summary:"整页重载真实 E2E 通过", environment:"测试环境",
+  scenarios:[{id:"E1", name:"单账号整页重载后保留原提交编号", status:"passed", details:"实测通过", evidence_paths:["upgrade.log"]}],
+  evidence_paths:["upgrade.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$handoff_e2e_rev" run_loop e2e
+assert_calls "$((before_e2e_pass + 1))" 'set-state pr 7 e2e-passed'
+grep -Fq 'E1 单账号整页重载后保留原提交编号' "$fixture/last-prompt" || fail 'E2E 未按复审更新后的必验场景重跑'
 
 printf 'workflow convergence tests passed\n'

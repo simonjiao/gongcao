@@ -4,9 +4,11 @@ set -euo pipefail
 # 独立 Codex E2E 端到端验收循环（默认使用 gpt-6.2-sol + xhigh，不调用 agy，不直接调用 gh）
 # 监听带 agy:approved（代码评审已通过）标签的 PR，在独立 worktree 中结合原始 Issue 要求
 # 执行真实端到端验收，并通过 gh-state.sh 写回 E2E 验收报告与状态流转：
-#   - pass    -> agy:e2e-passed（等待人工最终合并）
-#   - fail    -> agy:changes-requested（未超最大轮次时触发 agy 自动修复；超限切 agy:blocked）
-#   - blocked -> agy:blocked（环境/外部依赖不可用时直接交人工处理，不盲目打回改代码）
+#   - pass             -> agy:e2e-passed（进入终审合入门禁）
+#   - fail             -> agy:changes-requested（代码缺陷，未超轮次时触发 Dev 自动修复；超限切 agy:blocked）
+#   - return_to_dev    -> agy:changes-requested（仓库 QA 脚本/准备步骤缺失，交回 Dev 在同一 PR 补齐；超限切 agy:blocked）
+#   - return_to_review -> agy:in-review（必验项依赖候选版本尚未支持的能力，交回 Review 核对范围与前置条件）
+#   - blocked          -> agy:blocked（外部权限、产品授权或外部环境故障时写清需要谁做什么并暂停）
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
@@ -191,7 +193,7 @@ write_e2e_schema() {
   "properties": {
     "verdict": {
       "type": "string",
-      "enum": ["pass", "fail", "blocked"]
+      "enum": ["pass", "fail", "return_to_dev", "return_to_review", "blocked"]
     },
     "summary": {
       "type": "string"
@@ -413,12 +415,18 @@ render_e2e_markdown() {
   local evidence_sha="${10:-}"
   local evidence_files_md="${11:-}"
   local cycle_round="${12:-$round}"
+  local handoff_token="${13:-}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
 
   local evidence_cell="\`${artifacts_dir}\` (仅本地)"
   if [[ -n "$evidence_url" ]]; then
     evidence_cell="[查看归档目录](${evidence_url}) (\`${evidence_branch}\` @ \`${evidence_sha:0:10}\`)"
+  fi
+
+  local handoff_marker=""
+  if [[ -n "$handoff_token" ]]; then
+    handoff_marker="<!-- codex-e2e-handoff:${head_sha}:${handoff_token} -->"
   fi
 
   "$JQ_BIN" -r \
@@ -433,6 +441,7 @@ render_e2e_markdown() {
     --arg model "${CODEX_MODEL:-(codex 默认)}${CODEX_REASONING_EFFORT:+ (${CODEX_REASONING_EFFORT})}" \
     --arg evidence_cell "$evidence_cell" \
     --arg evidence_files_md "$evidence_files_md" \
+    --arg handoff_marker "$handoff_marker" \
     --arg now "$now_ts" \
     '
     def esc: tostring | gsub("\n"; " ") | gsub("\\|"; "\\|");
@@ -482,6 +491,7 @@ render_e2e_markdown() {
       else
         "- 风险: 无"
       end)
+    + (if ($handoff_marker | length) > 0 then "\n\n" + $handoff_marker else "" end)
     ' "$result_file"
 }
 
@@ -723,10 +733,13 @@ ${pr_diff_snippet:-"(空 diff)"}
 2. **严禁修改仓库业务代码或提交 commit**，也不要执行 git push 或直接操作 GitHub Issue/PR；你只负责验收与输出客观证据。
 3. 将本次验收产生的关键原始证据（日志、命令输出、报告或截图等，**注意脱敏，勿写入明文密码/Token/私钥**）保存到专用目录 \`${artifacts_dir}\`，外层脚本会自动将其归档推送到独立的远程证据分支 \`${E2E_EVIDENCE_BRANCH}\` 并在 PR/Issue 中关联链接；同时在 \`evidence_paths\` 中列出相对于 \`${artifacts_dir}\` 的关键文件路径。验收结束后按仓库规范清理你本次创建的临时资源、测试数据或临时进程，不要在仓库工作区残留脏文件；清理本机或远端临时目录/文件（含 \`trap\` 回调）时**不要使用 \`rm -f\` 或 \`rm -rf\`**（会被 Codex 工具路由器安全策略拦截），请优先调用仓库自带清理入口或改用 Python \`shutil.rmtree\` / \`Path.unlink(missing_ok=True)\` 等安全方式。
 4. **严禁使用字节码反编译或调试器/断点注入手段**：禁止运行 \`javap\` 字节码反编译、挂载 JDWP 调试器（\`-agentlib:jdwp\`）或编写断点注入探针（如 \`ReplayProbe\` / \`jdb\`），此类操作会触发安全风控并导致远端环境泄漏。使用标准服务启停、公开接口、数据库状态与真实浏览器 UI 实测评审列出的场景，包括使用已有状态的跨版本续读等。
-5. 严格区分三种结论（\`verdict\`）：
-   - \`pass\`：按仓库规范在目标验收环境中完成了针对 Issue 核心场景的真实端到端验证且全部通过，证据充分。
-   - \`fail\`：目标验收环境正常，但实测暴露了**代码功能缺陷、回归或未满足 Issue 验收标准**；必须在 \`failure_details\` 中给出可复现步骤、实际结果与期望结果。
-   - \`blocked\`：**无法完成仓库要求的真实 E2E 验收**（例如目标远端环境/容器/数据库/浏览器/凭证不可用或环境故障），不要把环境问题误判为 \`fail\`，也不要用本机单测或替代方案冒充真实 E2E 通过。
+5. 严格按原因接续，区分五种结论（\`verdict\`）：
+   - **能就地补齐的隔离环境依赖先补齐**：若缺失的是当前隔离环境可自行准备的临时依赖/数据，补齐后**只重测缺项**，不重跑已通过的全量流程。
+   - \`pass\`：按仓库规范在目标验收环境中完成了针对 Issue 核心场景及所有必验项的真实端到端验证且全部通过，证据充分。
+   - \`fail\`：目标验收环境正常，但实测暴露了**代码功能缺陷、回归或未满足 Issue 验收标准**；必须在 \`failure_details\` 中给出可复现步骤、实际结果与期望结果，外层脚本会自动退回 Dev 修复（\`agy:changes-requested\`）。
+   - \`return_to_dev\`：仓库系统允许准备账号/权限/数据，但**需要修改仓库维护的 QA 脚本或补齐可复用准备/预检/清理步骤**（E2E 不修改仓库代码）；必须在 \`failure_details\` 中写清复现步骤、缺失的 QA 脚本/准备步骤以及明确的关闭条件，外层脚本会自动退回 Dev 在同一个 PR 补齐脚本（\`agy:changes-requested\`），避免误落入 \`blocked\`。
+   - \`return_to_review\`：**某条评审必验项依赖候选版本尚未支持的能力**（例如候选后端仅接受单组登录凭据，而必验项要求实测双账号登录切换）；必须在 \`failure_details\` 中写清涉及的必验项编号、候选版本实际能力限制以及已有单测/组件测试的覆盖事实，外层脚本会自动退回 Review 核对 Issue 范围（重新裁定必验项，或明确可用的 QA 身份/数据准备路径后再交 Dev）。
+   - \`blocked\`：**仅当确实缺少外部权限、产品/Owner 授权或外部验收环境故障无法自行恢复时**才使用 \`blocked\`；必须在 \`failure_details\` 或 \`remaining_risks\` 中写清**需要谁做什么**才能解除阻塞，不要把 QA 脚本缺失或必验项前提不成立笼统判为 \`blocked\`，也不要用本机单测冒充真实 E2E 通过。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
    - 每个评审必验场景用一个 \`scenarios\` 条目记录，原样填写 \`id\`（如 \`E1\`），用 \`name\` 和 \`details\` 描述实测。逐项填写相对于 \`${artifacts_dir}\` 的 \`scenarios[].evidence_paths\`，并把这些路径也列在顶层 \`evidence_paths\` 中。其他场景的 \`id\` 留空。所有必验场景通过并留存证据后才输出 \`pass\`。
 EOF
@@ -755,7 +768,10 @@ EOF
   codex_ok=0
   codex_rc=0
   if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
-    if [[ -s "$result_file" ]] && "$JQ_BIN" -e '.verdict == "pass" or .verdict == "fail" or .verdict == "blocked"' "$result_file" >/dev/null 2>&1; then
+    if [[ -s "$result_file" ]] && "$JQ_BIN" -e '
+      (.verdict == "pass" or .verdict == "fail" or .verdict == "return_to_dev" or .verdict == "return_to_review" or .verdict == "blocked")
+      and ((.verdict != "return_to_dev" and .verdict != "return_to_review") or ((.failure_details | type == "array") and (.failure_details | length > 0)))
+    ' "$result_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
   else
@@ -869,6 +885,7 @@ EOF
   fi
   final_state=""
   extra_notice=""
+  handoff_token=""
 
   new_consecutive_failures="$prev_consecutive_failures"
   if [[ "$verdict" == "pass" ]]; then
@@ -876,22 +893,34 @@ EOF
     final_state="e2e-passed"
   elif [[ "$verdict" == "blocked" ]]; then
     final_state="blocked"
-    extra_notice=$'\n\n'"> ⚠️ E2E 验收受阻，排除报告中的阻塞原因后将 PR 标签改回 \`${E2E_TARGET_LABEL}\` 可重跑 E2E。"
+    extra_notice=$'\n\n'"> ⚠️ E2E 验收受阻（外部权限、产品授权或环境故障），按报告中明确的操作项解除阻塞后，将 PR 标签改回 \`${E2E_TARGET_LABEL}\` 可重跑 E2E。"
+  elif [[ "$verdict" == "return_to_review" ]]; then
+    if (( current_round >= MAX_TOTAL_E2E_ROUNDS )); then
+      final_state="blocked"
+      extra_notice=$'\n\n'"> ⚠️ 已达到单 PR 最大总 E2E 轮次上限（累计 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），无法继续退回复审，状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
+    else
+      final_state="in-review"
+      handoff_token="$run_ts"
+      extra_notice=$'\n\n'"> ↩️ E2E 发现必验项依赖候选版本尚未支持的能力，已自动退回 \`${LABEL_PREFIX}in-review\` 交由独立评审核对 Issue 范围、前置条件与已有回归覆盖（评审调整必验项或给出可用 QA 准备路径后自动接续）。"
+    fi
   else
     new_consecutive_failures="$cycle_round"
     if (( cycle_round >= MAX_E2E_ROUNDS )); then
       final_state="blocked"
-      extra_notice=$'\n\n'"> ⚠️ 已达到最大连续 E2E 失败打回轮次（连续 ${cycle_round} / ${MAX_E2E_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
+      extra_notice=$'\n\n'"> ⚠️ 已达到最大连续 E2E 失败/退回轮次（连续 ${cycle_round} / ${MAX_E2E_ROUNDS} 轮，累计第 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
     elif (( current_round >= MAX_TOTAL_E2E_ROUNDS )); then
       final_state="blocked"
       extra_notice=$'\n\n'"> ⚠️ 已达到单 PR 最大总 E2E 轮次上限（累计 ${current_round} / ${MAX_TOTAL_E2E_ROUNDS} 轮），状态已切为 \`${LABEL_PREFIX}blocked\`，请人工介入排查。"
     else
       final_state="changes-requested"
+      if [[ "$verdict" == "return_to_dev" ]]; then
+        extra_notice=$'\n\n'"> ↩️ 检测到仓库 QA 脚本或可复用准备步骤缺口，已自动退回 \`${LABEL_PREFIX}changes-requested\` 交由 Dev 在同一 PR 补齐维护入口（含预检、运行与清理）后重新流转。"
+      fi
     fi
   fi
 
   # 先渲染基础验收报告，供归档分支留存
-  base_e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "" "" "" "" "$cycle_round")${extra_notice}"
+  base_e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "" "" "" "" "$cycle_round" "$handoff_token")${extra_notice}"
   printf '%s\n' "$base_e2e_md" > "$comment_file"
 
   # 将 QA 证据归档推送到独立远程分支（不污染生产分支），生成可点击的 GitHub 直链
@@ -923,16 +952,16 @@ EOF
   fi
 
   # 带上远端证据直链重新渲染最终评论报告
-  e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "$evidence_url" "$E2E_EVIDENCE_BRANCH" "$evidence_sha" "$evidence_files_md" "$cycle_round")${extra_notice}"
+  e2e_md="$(render_e2e_markdown "$result_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_state" "$artifacts_dir" "$evidence_url" "$E2E_EVIDENCE_BRANCH" "$evidence_sha" "$evidence_files_md" "$cycle_round" "$handoff_token")${extra_notice}"
   printf '%s\n' "$e2e_md" > "$comment_file"
 
   # 写回 PR E2E 验收报告与状态
   printf '%s\n' "$e2e_md" | gh_state comment pr "$pr_num" - "$E2E_COMMENT_MARKER" || true
   gh_state set-state pr "$pr_num" "$final_state" || true
 
-  # 同步关联 Issue 状态（先写评论再切标签，避免开发循环在评论写入前就拉取到 changes-requested）
+  # 同步关联 Issue 状态（先写评论再切标签，避免开发/评审循环在评论写入前就拉取到变更后的状态）
   if [[ -n "$issue_num" ]]; then
-    if [[ "$final_state" == "e2e-passed" || "$final_state" == "blocked" ]]; then
+    if [[ "$final_state" == "e2e-passed" || "$final_state" == "blocked" || "$final_state" == "in-review" ]]; then
       printf '%s\n' "$e2e_md" | gh_state comment issue "$issue_num" - "$E2E_COMMENT_MARKER" || true
       gh_state set-state issue "$issue_num" "$final_state" || true
     elif [[ "$final_state" == "changes-requested" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
@@ -941,7 +970,12 @@ EOF
     fi
   fi
 
-  # pass 或 fail 时记录已验证提交、场景与连续失败计数。blocked 可在排除阻塞后重跑。
+  # 退回复审/开发或阻塞时清理本 PR 的评审交接缓存，确保下次轮询立即读取最新评审必验场景
+  if [[ "$verdict" != "pass" ]]; then
+    unset "review_cache_keys[$pr_num]" "review_cache_times[$pr_num]" "review_cache_checks[$pr_num]" 2>/dev/null || true
+  fi
+
+  # 非 blocked 时记录已验证提交、场景与连续失败计数；blocked 可在排除阻塞后重跑。
   if [[ "$DRY_RUN" != "1" && "$verdict" != "blocked" ]]; then
     printf '%s\n' "$verification_key" >> "$sha_file"
     printf '%d\n' "$new_consecutive_failures" > "$consec_file"
