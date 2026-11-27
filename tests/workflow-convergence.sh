@@ -127,6 +127,8 @@ cat > "$MOCK_DIR/last-prompt"
 case "$2" in
   */verdict-*)
     printf '%s\n' codex-review >> "$MOCK_DIR/calls"
+    printf '%s\n' "${TMPDIR:-}" >> "$MOCK_DIR/review-tmpdir.log"
+    [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]] || { printf 'Missing review TMPDIR\n' >&2; exit 96; }
     cat "$MOCK_DIR/verdict.json" > "$2"
     ;;
   */result-*)
@@ -284,6 +286,13 @@ cp "$fixture/approve.json" "$fixture/verdict.json"
 set_pr_body '通过评审进入 E2E'
 run_loop review
 assert_calls 3 'set-state pr 7 approved'
+grep -Fq '<details>' "$fixture/review-comment" || fail '复审评论未保留历次评审记录折叠区'
+grep -Fq '历次评审记录' "$fixture/review-comment" || fail '复审评论缺少历次评审记录标题'
+grep -Fq '`capture-normalization`' "$fixture/review-comment" || fail '复审评论未保留前轮打回的阻塞根因 ID'
+grep -Fq '反例或边界场景' "$fixture/last-prompt" || fail '评审提示词缺少 QA 反例覆盖指引'
+review_tmp_used="$(head -n 1 "$fixture/review-tmpdir.log")"
+[[ "$review_tmp_used" == "$state_dir/tmp/review-pr-7-"* ]] || fail "codex-review 未使用独立 TMPDIR: $review_tmp_used"
+[[ ! -e "$review_tmp_used" ]] || fail "codex-review 结束后未清理临时目录: $review_tmp_used"
 jq '.blocking_issues[0].description = "发现 BIT 口径不一致" | .blocking_issues[0].location = "ddl.sh:50"' \
   "$fixture/reject.json" > "$fixture/verdict.json"
 set_pr_body 'E2E 后修复并进入新周期'
@@ -401,6 +410,10 @@ AUTO_MERGE=1 FINAL_ROOT="$fixture/final-p0-owner" run_loop final-gate
 assert_calls 1 'mark-pr-ready 7'
 assert_calls 1 "merge-pr 7 merge ${MOCK_SHA}"
 assert_calls 1 'set-state pr 7 done'
+compgen -G "$fixture/final-p0-owner/pr-7/merge-output-*.log" >/dev/null || fail '合并成功未生成 merge-output-*.log'
+if compgen -G "$fixture/final-p0-owner/pr-7/merge-error-*.log" >/dev/null; then
+  fail '合并成功不应生成 merge-error-*.log'
+fi
 
 # 6d. 合入前实时复读发现 headRefOid 已变 -> 取消合入并退回 changes-requested
 jq -n '{title:"普通单", body:"正常需求", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"

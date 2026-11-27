@@ -38,6 +38,7 @@ SORT_BIN="$(resolve_bin sort)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
 SHA256SUM_BIN="$(resolve_bin sha256sum)"
+ENV_BIN="$(resolve_bin env)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -117,9 +118,10 @@ REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 REVIEWS_ROOT="${REVIEWS_ROOT:-${STATE_ROOT}/reviews}"
+TMP_ROOT="${TMP_ROOT:-${STATE_ROOT}/tmp}"
 REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
 
-"$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$REVIEWS_ROOT"
+"$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$REVIEWS_ROOT" "$TMP_ROOT"
 "$TOUCH_BIN" "$REPO_GIT_LOCK"
 
 gh_state() {
@@ -395,8 +397,14 @@ render_review_markdown() {
   local e2e_downgrade_note="$9"
   local eff_effort="${10:-$CODEX_REASONING_EFFORT}"
   local cycle_round="${11:-$round}"
+  local round_history_file="${12:-}"
   local now_ts
   now_ts="$("$DATE_BIN" --iso-8601=seconds)"
+
+  local prior_rounds_json="[]"
+  if [[ -n "$round_history_file" && -s "$round_history_file" ]]; then
+    prior_rounds_json="$("$JQ_BIN" -s 'map(select(type == "object"))' "$round_history_file" 2>/dev/null || printf '[]')"
+  fi
 
   local meta_json
   meta_json="$("$JQ_BIN" -c \
@@ -417,6 +425,7 @@ render_review_markdown() {
     --arg eff_e2e "$eff_e2e_decision" \
     --arg e2e_note "$e2e_downgrade_note" \
     --arg meta_json "$meta_json" \
+    --argjson prior_rounds "$prior_rounds_json" \
     --arg model "${CODEX_MODEL:-(codex 默认)}${eff_effort:+ (${eff_effort})}" \
     --arg now "$now_ts" \
     '
@@ -462,6 +471,20 @@ render_review_markdown() {
       else
         "- 无"
       end)
+    + (if ($prior_rounds | length) > 0 then
+        "\n\n<details>\n<summary>历次评审记录（共 " + ($prior_rounds | length | tostring) + " 轮历史）</summary>\n\n"
+        + "| 轮次 | Commit | 结论 | 阻塞项 | 摘要 |\n| --- | --- | --- | --- | --- |\n"
+        + ([$prior_rounds[] |
+            "| r" + ((.round // "?") | tostring)
+            + " | `" + ((.head_sha // "")[0:10]) + "`"
+            + " | `" + (.verdict // "") + "` -> `" + (.final_state // "") + "`"
+            + " | " + (if ((.blockers // []) | length) > 0 then ([.blockers[] | "`" + (.id // "") + "`"] | join(", ")) else "无" end)
+            + " | " + ((.summary // "") | esc) + " |"
+          ] | join("\n"))
+        + "\n\n</details>"
+      else
+        ""
+      end)
     + "\n\n<!-- codex-review-meta:" + ($meta_json | gsub("<"; "\\u003c") | gsub(">"; "\\u003e")) + " -->"
     ' "$verdict_file"
 }
@@ -499,6 +522,16 @@ publish_review() {
       ' <<<"$history_json" > "${history_file}.tmp" || return 1
       "$MV_BIN" "${history_file}.tmp" "$history_file" || return 1
       "$JQ_BIN" '.review' "$pending_file" > "${review_dir}/last_verdict.json" || return 1
+      "$JQ_BIN" -c --arg label_prefix "$LABEL_PREFIX" '{
+        round: .meta.round,
+        cycle_round: .meta.cycle_round,
+        head_sha: .meta.head_sha,
+        verdict: .meta.verdict,
+        final_state: ($label_prefix + (.meta.final_state // "")),
+        summary: (.review.summary // ""),
+        blockers: [(.review.blocking_issues // [])[] | {id: (.id // ""), severity: (.severity // ""), location: (.location // "")}],
+        updated_at: (.meta.updated_at // "")
+      }' "$pending_file" >> "${review_dir}/round-history.jsonl" || return 1
       "$JQ_BIN" -r '.meta.consecutive_rejections' "$pending_file" > "${review_dir}/consecutive_rejections.txt" || return 1
       "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
       printf '%s\n' "$review_key" >> "${review_dir}/reviewed_shas.txt" || return 1
@@ -865,7 +898,7 @@ ${pr_diff_snippet:-"(空 diff)"}
 2. 逐项核对原始 Issue 需求是否完整实现，重点检查：正确性、边界条件、方言/兼容性、安全与并发隐患、回归风险、以及是否补充了合理的内部单元测试。
    - 若改动扩展了兼容行为或改变共享模块、持久化数据、状态机等现有契约，请核对 Issue 中的具体要求或已有授权。将当前 PR 引入的未授权扩展列为阻塞项，指出需要收回的改动或待确认的范围。
    - 修复建议也须遵守相同的授权范围。发现读取或展示口径不一致时，优先建议在读取或展示层处理，并核查是否能保留现有写入、摘要和重放行为。证据无法确认根因时注明证据缺口。若满足 Issue 必须变更持久化或共享契约且缺少授权，输出 \`request_changes\`，将 \`requires_human_decision\` 设为 \`true\`，并在修复建议中写明待授权的契约和影响。其余情况该字段为 \`false\`。
-3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**。
+3. **关于 E2E 验证**：本工作流明确约定开发阶段仅做内部验证（构建/类型检查/单元测试），**不要因为“未执行 E2E 测试”而给出 request_changes**；若需提示人工验收点，可写在 \`non_blocking_notes\` 中。若目标仓库维护了可复用 QA/E2E 入口，且本 PR 为新增页面流程按仓库 \`REUSE / EXTEND\` 规范对既有入口/驱动做了最小扩展（并通过静态/路由/入口守卫检查），视为合理的测试资产沉淀，**不要将其误判为范围蔓延或要求开发期实跑真实 E2E**；若 PR 已扩展维护入口而原始 Issue 同时明确要求真实引擎/浏览器下的反例或边界场景（如跨对象/无权拒绝、并发或慢响应切表），请检查这些反例是否也已纳入维护入口，未纳入时在 \`non_blocking_notes\` 与 \`e2e_checks\` 中明确指出。
 3.1 **E2E 路由裁定（\`e2e_decision\` 与 \`e2e_decision_reason\`）**（当 \`verdict == "request_changes"\` 时固定输出 \`run_e2e\`；当 \`verdict == "approve"\` 且开启 \`ALLOW_SKIP_E2E=1\` 时决定是否跳过 E2E 直达终审）：
    - \`run_e2e\`（默认保守选项）：涉及运行时代码/接口/数据库/前端交互/运行配置改动，且尚未针对当前运行时行为完成 E2E 验收（或上次 E2E 通过后的新改动影响了运行时行为）。
    - \`skip_not_needed\`：本次整个 PR 仅改动文档（\`docs/\`、\`*.md\`）、注释、纯单元测试、静态检查/格式化或构建元数据，完全不改变运行时行为，或原始 Issue 明确说明无需 E2E。
@@ -890,6 +923,9 @@ EOF
     round_effort="$CODEX_REREVIEW_REASONING_EFFORT"
   fi
 
+  review_tmpdir="${TMP_ROOT}/review-pr-${pr_num}-${run_ts}"
+  "$MKDIR_BIN" -p "$review_tmpdir"
+
   codex_args=(
     exec
     -s "$CODEX_SANDBOX"
@@ -899,6 +935,9 @@ EOF
     --json
     --color never
   )
+  if [[ "$CODEX_SANDBOX" != "read-only" ]]; then
+    codex_args+=(--add-dir "$review_tmpdir")
+  fi
   if [[ -n "$CODEX_MODEL" ]]; then
     codex_args+=(-m "$CODEX_MODEL")
   fi
@@ -909,7 +948,7 @@ EOF
 
   codex_ok=0
   codex_rc=0
-  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
+  if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$ENV_BIN" "TMPDIR=${review_tmpdir}" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
     if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" '
       include "workflow-e2e";
       (.blocking_issues | type == "array")
@@ -925,6 +964,7 @@ EOF
   else
     codex_rc=$?
   fi
+  "$RM_BIN" -rf -- "$review_tmpdir" 2>/dev/null || true
 
   if (( codex_ok == 0 )); then
     if (( codex_rc == 124 )); then
@@ -992,7 +1032,7 @@ EOF
     fi
   fi
 
-  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort" "$cycle_round")${extra_notice}"
+  review_md="$(render_review_markdown "$verdict_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_pr_state" "$effective_e2e_decision" "$e2e_reused_sha" "$e2e_downgrade_note" "$round_effort" "$cycle_round" "${review_dir}/round-history.jsonl")${extra_notice}"
   printf '%s\n' "$review_md" > "$comment_file"
 
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"

@@ -39,6 +39,7 @@ COMM_BIN="$(resolve_bin comm)"
 FLOCK_BIN="$(resolve_bin flock)"
 TIMEOUT_BIN="$(resolve_bin timeout)"
 SHA256SUM_BIN="$(resolve_bin sha256sum)"
+MV_BIN="$(resolve_bin mv)"
 
 # ===== 主工作目录与可调配置 =====
 GONGCAO_HOME="${GONGCAO_HOME:-${HOME}/.gongcao}"
@@ -1790,12 +1791,14 @@ EOF
           if [[ "$is_draft" == "true" ]]; then
             gh_state mark-pr-ready "$pr_num" || true
           fi
+          merge_out_file="${final_dir}/merge-output-${run_ts}.log"
           merge_err_file="${final_dir}/merge-error-${run_ts}.log"
-          if gh_state merge-pr "$pr_num" "$effective_merge_method" "$head_sha" 2>"$merge_err_file"; then
+          if gh_state merge-pr "$pr_num" "$effective_merge_method" "$head_sha" 2>"$merge_out_file"; then
             merged_ok=1
             final_state="done"
             final_action="MERGED (${effective_merge_method}) -> ${LABEL_PREFIX}done"
           else
+            "$MV_BIN" "$merge_out_file" "$merge_err_file" 2>/dev/null || true
             merge_err_text="$("$CAT_BIN" "$merge_err_file" 2>/dev/null || true)"
             if "$GREP_BIN" -iqE '(merge conflict|not mergeable|cannot be rebased|head branch was modified|HTTP 405|HTTP 409)' <<<"$merge_err_text"; then
               final_state="changes-requested"

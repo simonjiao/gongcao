@@ -85,6 +85,11 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 printf '%s\n' "$*" >> "$MOCK_DIR/codex-args.log"
+printf '%s\n' "${TMPDIR:-}" >> "$MOCK_DIR/codex-tmpdir.log"
+if [[ -z "${TMPDIR:-}" || ! -d "${TMPDIR:-}" ]]; then
+  printf 'Missing writable TMPDIR=%q\n' "${TMPDIR:-}" >&2
+  exit 96
+fi
 out_file=""
 while (( $# > 0 )); do
   if [[ "$1" == "-o" ]]; then
@@ -197,15 +202,21 @@ done
 PATH="$fixture/bin-no-agy:/usr/bin:/bin" bash "$fixture/workflow/check-deps.sh" --engine codex > "$fixture/deps.log" 2>&1 \
   || { cat "$fixture/deps.log" >&2; fail 'check-deps.sh --engine codex 在缺少 agy 时失败'; }
 
-# 2. 正常 completed 流程 + CODEX_REASONING_EFFORT="" 不传非法 -c 参数
+# 2. 正常 completed 流程 + CODEX_REASONING_EFFORT="" 不传非法 -c 参数 + 独立非 Git TMPDIR 注入与清理
 printf 'complete' > "$fixture/codex-mode"
 printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-tmpdir.log"
 set_issue 10 "测试正常开发" "完整需求描述-10"
 run_dev_loop codex 1 env CODEX_REASONING_EFFORT=""
 assert_calls 1 'set-state issue 10 in-review'
 if grep -Fq 'model_reasoning_effort' "$fixture/codex-args.log"; then
   fail 'CODEX_REASONING_EFFORT 为空时仍传入了 model_reasoning_effort'
 fi
+used_tmpdir="$(head -n 1 "$fixture/codex-tmpdir.log")"
+[[ "$used_tmpdir" == "$state_dir/tmp/dev-issue-10-"* ]] || fail "codex-dev 未使用独立 TMPDIR: $used_tmpdir"
+grep -Fq -- "--add-dir $used_tmpdir" "$fixture/codex-args.log" || fail 'codex-dev 未通过 --add-dir 开放独立 TMPDIR'
+[[ ! -e "$used_tmpdir" ]] || fail "codex-dev 结束后未清理临时目录: $used_tmpdir"
+grep -Fq '反例或边界场景' "$fixture/prompt-1.txt" || fail 'codex-dev 提示词缺少 QA 反例纳入维护入口指引'
 
 # 3. Codex JSON Schema 偶发不合规 -> 自动续接原会话修正一次并成功
 printf 'schema-retry' > "$fixture/codex-mode"

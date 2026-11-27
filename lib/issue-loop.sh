@@ -95,6 +95,8 @@ SLEEP_BIN="$(resolve_bin sleep)"
 TEE_BIN="$(resolve_bin tee)"
 CAT_BIN="$(resolve_bin cat)"
 FLOCK_BIN="$(resolve_bin flock)"
+RM_BIN="$(resolve_bin rm)"
+ENV_BIN="$(resolve_bin env)"
 
 # ===== 主工作目录与可调配置 =====
 REPOS_ROOT="${REPOS_ROOT:-${GONGCAO_HOME}/repos}"
@@ -188,10 +190,11 @@ REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 SESSIONS_ROOT="${SESSIONS_ROOT:-${STATE_ROOT}/sessions}"
+TMP_ROOT="${TMP_ROOT:-${STATE_ROOT}/tmp}"
 STATE_FILE="${STATE_FILE:-${STATE_ROOT}/processed_issues.txt}"
 REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
 
-"$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$SESSIONS_ROOT"
+"$MKDIR_BIN" -p "$STATE_ROOT" "$WORKTREE_ROOT" "$SESSIONS_ROOT" "$TMP_ROOT"
 "$TOUCH_BIN" "$STATE_FILE" "$REPO_GIT_LOCK"
 
 # 两种开发执行器消费同一个队列并共享开发 worktree。
@@ -703,13 +706,14 @@ run_agy_attempt() {
   if [[ -n "$current_session_id" ]]; then
     args=(--conversation "$current_session_id" "${args[@]}")
   fi
-  cd -- "$wt_dir" && "${dev_command[@]}" "${args[@]}"
+  cd -- "$wt_dir" && "$ENV_BIN" "TMPDIR=${dev_tmpdir}" "${dev_command[@]}" "${args[@]}"
 }
 
 run_codex_attempt() {
   local -a args=(
     -a never exec
     -s workspace-write
+    --add-dir "$dev_tmpdir"
     --json --color never
     --output-schema "$codex_schema_file"
     -o "$attempt_result_file"
@@ -722,7 +726,7 @@ run_codex_attempt() {
     args+=(resume "$current_session_id")
   fi
   cd -- "$wt_dir" &&
-    "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$DEV_TIMEOUT" "${dev_command[@]}" "${args[@]}" - <<<"$current_prompt"
+    "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$DEV_TIMEOUT" "$ENV_BIN" "TMPDIR=${dev_tmpdir}" "${dev_command[@]}" "${args[@]}" - <<<"$current_prompt"
 }
 
 write_codex_schema() {
@@ -1236,7 +1240,7 @@ ${body}${merge_conflict_section}${review_feedback_section}
 1. 你当前运行在专属 git worktree（分支 ${branch}）的沙箱中，先阅读相关代码并分析问题根因或需求范围。
 2. 仅完成开发实现和相关内部验证（如类型检查、构建检查、改动相关的单元测试或模块级测试）。
 3. **不需要执行 E2E（端到端）验证**（例如浏览器自动化 E2E、启动完整外部依赖服务或全链路集成环境测试）；不要在 E2E 环境准备上耗费时间。
-   - **可复用 E2E 入口资产沉淀**：若本次 Issue 引入**新的用户可见页面流程**、目标仓库维护了可复用的 QA/E2E 入口（如 \`qa/README.md\` 登记的 action 目录或维护中的 Playwright spec）、且原始 Issue 未禁止改动 \`qa/\`，当既有入口尚未覆盖时，应按仓库 \`REUSE / EXTEND\` 规范在当前 PR 中对既有入口/驱动做**最小可复用扩展**（不另建新 QA 框架），开发期仅执行其静态/语法/入口守卫/路由单测或类型检查（不要启动真实引擎或浏览器实跑），并在总结中写明供下游 \`codex-e2e\` 直接调用的命令；若已有入口覆盖、属纯后端/文档/小修，或 Issue 明确要求不改动 \`qa/\`，则保持不动。
+   - **可复用 E2E 入口资产沉淀**：若本次 Issue 引入**新的用户可见页面流程**或明确要求真实引擎/浏览器验收、目标仓库维护了可复用的 QA/E2E 入口（如 \`qa/README.md\` 登记的 action 目录或维护中的 Playwright spec）、且原始 Issue 未禁止改动 \`qa/\`，当既有入口尚未覆盖时，应按仓库 \`REUSE / EXTEND\` 规范在当前 PR 中对既有入口/驱动做**最小可复用扩展**（不另建新 QA 框架）；若 Issue 验收标准同时明确要求真实引擎/浏览器下的**反例或边界场景**（如跨对象/无权拒绝、并发或慢响应切表隔离），应一并纳入该既有维护入口，避免下游 \`codex-e2e\` 临场拼装一次性脚本反复试错。开发期仅执行其静态/语法/入口守卫/路由单测或类型检查（不要启动真实引擎或浏览器实跑），并在总结中写明供下游 \`codex-e2e\` 直接调用的命令；若已有入口覆盖、属纯后端/文档/小修，或 Issue 明确要求不改动 \`qa/\`，则保持不动。
 4. **不要执行 git add / git commit / git push，也不要修改 GitHub Issue/PR 状态**：沙箱内 .git 为只读，代码提交、推送与 PR 创建全部由外层宿主机脚本自动完成。
 ${developer_result_section}
 EOF
@@ -1270,6 +1274,9 @@ EOF
   [[ "$MAX_QUOTA_RETRIES" =~ ^[0-9]+$ ]] && max_q_retries="$MAX_QUOTA_RETRIES"
   current_session_id="$existing_session_id"
   current_prompt="$prompt"
+  # 分配位于 Git worktree 与 /tmp 之外的独立可写临时目录，避免沙箱 /tmp/.git 干扰单测（如 mkdtemp/browser-runtime 检查）
+  dev_tmpdir="${TMP_ROOT}/dev-issue-${number}-${run_ts}"
+  "$MKDIR_BIN" -p "$dev_tmpdir"
 
   while true; do
     attempt=$((attempt + 1))
@@ -1439,6 +1446,8 @@ EOF
 
     break
   done
+
+  "$RM_BIN" -rf -- "$dev_tmpdir" 2>/dev/null || true
 
   final_session_id="$current_session_id"
   dev_elapsed=$((SECONDS - dev_start_sec))
