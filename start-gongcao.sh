@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-# 一键启动 / 管理 gongcao 全链路 tmux 流水线（5 窗口：dev / review / e2e / final-gate / monitor+cleanup）
+# 一键启动 / 管理 gongcao 全链路 tmux 流水线。
 # 用法:
 #   ./start-gongcao.sh <owner/repo> [start|attach|status|stop]
 
@@ -32,7 +32,7 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   start-gongcao.sh <owner/repo> [start|attach|status|stop]
 
 示例:
-  ./start-gongcao.sh simonjiao/airdb          # 启动 5 窗口 tmux 流水线（若已运行则直接提示）
+  ./start-gongcao.sh simonjiao/airdb          # 启动 tmux 流水线（若已运行则直接提示）
   ./start-gongcao.sh simonjiao/airdb attach   # 进入 tmux 面板查看
   ./start-gongcao.sh simonjiao/airdb status   # 查看会话与窗口状态
   ./start-gongcao.sh simonjiao/airdb stop     # 停止整个 tmux 会话
@@ -44,6 +44,9 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   POLL_INTERVAL      默认 60
   BASE_BRANCH        可选基准分支
   DEV_ENGINE         开发执行器 agy 或 codex，默认 agy
+  RELEASE_ACCEPTANCE_RUNNER  可选的发布验收入口，接收报告、CI 目录和发布状态目录
+
+在发版 Issue 正文单独放一行 <!-- gongcao-release -->，合入后的候选构建会进入 release 窗口。
 
 首次启动前，请分别初始化开发与评审专用目录（不共用个人默认 ~/.codex）:
   ./agy-issue-loop.sh login      # 使用 agy 开发时
@@ -166,7 +169,14 @@ case "$ACTION" in
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "final-gate" \
       "${final_env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-final-gate-loop.sh")"
 
-    # 窗口 4：monitor（上 pane 实时总览 activity.log，下 pane 运行 cleanup-merged.sh）
+    release_env_prefix="$env_prefix"
+    if [[ -n "${RELEASE_ACCEPTANCE_RUNNER:-}" ]]; then
+      release_env_prefix+=" RELEASE_ACCEPTANCE_RUNNER=$(printf '%q' "$RELEASE_ACCEPTANCE_RUNNER")"
+    fi
+    "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "release" \
+      "${release_env_prefix} $(printf '%q' "${SCRIPT_DIR}/release-loop.sh")"
+
+    # monitor（上 pane 实时总览 activity.log，下 pane 运行 cleanup-merged.sh）
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "monitor" \
       "$(printf '%q' "$TAIL_BIN") -n 40 -F $(printf '%q' "$ACTIVITY_LOG")"
     "$TMUX_BIN" split-window -v -t "${SESSION_NAME}:monitor" \
@@ -175,9 +185,9 @@ case "$ACTION" in
     "$TMUX_BIN" select-window -t "${SESSION_NAME}:monitor"
 
     printf '已启动全链路 tmux 会话: %s\n' "$SESSION_NAME"
-    printf '  窗口列表 : [0] dev | [1] review | [2] e2e | [3] final-gate | [4] monitor (activity.log + cleanup-merged)\n'
+    printf '  窗口列表 : dev | review | e2e | final-gate | release | monitor\n'
     printf '  进入看板 : %s attach-session -t %s\n' "$TMUX_BIN" "$SESSION_NAME"
-    printf '  切换窗口 : Ctrl+b 然后按 0/1/2/3/4（或 w 列表选择）\n'
+    printf '  切换窗口 : Ctrl+b 然后按 w 列表选择\n'
     printf '  停止全部 : %s %s stop\n' "$0" "$REPO_ARG"
     ;;
 

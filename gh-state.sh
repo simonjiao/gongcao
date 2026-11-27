@@ -4,6 +4,9 @@ set -euo pipefail
 # 纯确定性 GitHub Issue / PR 状态管理工具（不调用 agy）
 # 一律使用全路径调用外部命令，所有写操作支持 DRY_RUN=1
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/release-handoff.sh"
+
 SEARCH_PATH="${PATH}:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
 resolve_bin() {
   local resolved=""
@@ -53,6 +56,7 @@ STATES=(
   "approved|2ea44f|Independent code review passed; ready for E2E verification"
   "e2e-passed|006b75|Independent E2E verification passed; ready for final gate sign-off"
   "e2e-skipped|0075ca|Code review confirmed E2E is unnecessary or prior E2E remains valid; routed directly to final gate"
+  "release-pending|1d76db|Release candidate preparation or acceptance pending"
   "ready-to-merge|0e8a16|Final gate passed; ready for merge"
   "blocked|d93f0b|Blocked or failed during automation; needs human attention"
   "done|5319e7|Completed"
@@ -75,7 +79,7 @@ usage() {
   gh-state.sh get-pr-comments <number>
   gh-state.sh get-pr-diff <number>
   gh-state.sh find-pr <head_branch>
-  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|e2e-skipped|ready-to-merge|blocked|done>
+  gh-state.sh set-state <issue|pr> <number> <todo|in-progress|in-review|changes-requested|approved|e2e-passed|e2e-skipped|ready-to-merge|release-pending|blocked|done>
   gh-state.sh comment <issue|pr> <number> <body | -> [marker]
   gh-state.sh get-comment <issue|pr> <number> [marker]
   gh-state.sh ensure-pr <issue_number> <head_branch> <base_branch> <title> [body_file]
@@ -262,7 +266,7 @@ cmd_list_prs() {
     pr list
     --state "$pr_state"
     --limit "$limit"
-    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,labels,updatedAt
+    --json number,title,body,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,mergedAt,mergeCommit,statusCheckRollup,labels,updatedAt
   )
   [[ -n "$REPO" ]] && args+=(--repo "$REPO")
   [[ -n "$filter_label" ]] && args+=(--label "$filter_label")
@@ -506,7 +510,7 @@ cmd_ensure_pr() {
   if [[ -z "$pr_body" ]]; then
     pr_body="Automated draft PR for issue #${issue_num}."
   fi
-  if [[ "$pr_body" != *"Closes #${issue_num}"* ]]; then
+  if [[ "$(release_issue_from_pr "$pr_body")" != "$issue_num" && "$pr_body" != *"Closes #${issue_num}"* ]]; then
     pr_body="${pr_body}"$'\n\n'"Closes #${issue_num}"
   fi
 

@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
+source "$SCRIPT_DIR/lib/release-handoff.sh"
 
 SEARCH_PATH="${PATH}:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
 resolve_bin() {
@@ -264,6 +265,11 @@ extract_linked_issue() {
   local pr_body="$1"
   local head_branch="$2"
   local match="" num=""
+  num="$(release_issue_from_pr "$pr_body")"
+  if [[ -n "$num" ]]; then
+    printf '%s' "$num"
+    return
+  fi
 
   match="$("$GREP_BIN" -oiE -m 1 '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<<"$pr_body" || true)"
   [[ -n "$match" ]] && num="${match##*#}"
@@ -1083,6 +1089,11 @@ while true; do
   pr_is_e2e_skipped="$("$JQ_BIN" -r --arg skip_lbl "${LABEL_PREFIX}e2e-skipped" --arg pass_lbl "${LABEL_PREFIX}e2e-passed" \
     'if any(.labels[]?.name; . == $skip_lbl) and (any(.labels[]?.name; . == $pass_lbl) | not) then "1" else "0" end' <<<"$next_pr_json")"
   issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
+  release_issue="$(release_issue_from_pr "$pr_body")"
+  issue_reference="Closes #${issue_num:-N}"
+  if [[ -n "$release_issue" ]]; then
+    issue_reference="Refs #$release_issue"
+  fi
 
   # 1. 前置检查 CI 状态（若仍有进行中的 Check，稍后重试，避免抢跑）
   # （注意：合并冲突不再盲目退回，待第 3 步本地演练与分诊判断可直接解决还是转交开发）
@@ -1565,7 +1576,7 @@ ${pr_diff_snippet:-"(空 diff)"}
      - 环境/CI 基础设施异常、证据泄漏需人工清理或需人工决策 -> 输出 \`blocked\`。
 5. **生成规范化的最终 PR 信息与 Issue 说明**：
    - \`pr_title\`：简洁清晰、符合仓库提交/PR 风格。
-   - \`pr_body\`：完整规范的中文 PR 正文（Markdown），必须包含：① 改动摘要与根因；② 验证范围与结果（区分内部单测与真实 E2E 验收）；③ 固定验收 Commit SHA（\`${head_sha}\`）与远端 QA 证据永久直链（${ev_web_url:-(无)}）；④ 已知限制或未验证项；⑤ 末尾保留 \`Closes #${issue_num:-N}\`（如有关联 Issue）。
+   - \`pr_body\`：完整规范的中文 PR 正文（Markdown），必须包含：① 改动摘要与根因；② 验证范围与结果（区分内部单测与真实 E2E 验收）；③ 固定验收 Commit SHA（\`${head_sha}\`）与远端 QA 证据永久直链（${ev_web_url:-(无)}）；④ 已知限制或未验证项；⑤ 关联 Issue 使用 \`${issue_reference}\`。
    - \`issue_closing_note\`：简明的 Issue 最终收口评论（关联 PR、固定 SHA、QA 证据直链、已知未覆盖项）。
 5.1 **必要时生成后续追踪 Issue（\`follow_up_issues\`）**：
    - 仅当 \`verdict == "merge"\` 时评估哪些非阻塞发现**确有必要**沉淀为独立的后续追踪 Issue（其他结论固定输出空数组 \`[]\`）。
@@ -1743,9 +1754,13 @@ EOF
     else
       # 先更新规范化 PR 标题与最终正文
       [[ -z "$new_pr_title" ]] && new_pr_title="$pr_title"
+      if [[ -n "$release_issue" ]]; then
+        # 保留开发循环生成的关联和发布标记，防止终审正文把封版 PR 变为自动关单。
+        new_pr_body="$pr_body"
+      fi
       if [[ -n "$new_pr_body" ]]; then
-        if [[ -n "$issue_num" && "$new_pr_body" != *"Closes #${issue_num}"* ]]; then
-          new_pr_body="${new_pr_body}"$'\n\n'"Closes #${issue_num}"
+        if [[ -n "$issue_num" && "$new_pr_body" != *"$issue_reference"* ]]; then
+          new_pr_body="${new_pr_body}"$'\n\n'"${issue_reference}"
         fi
         printf '%s\n' "$new_pr_body" > "$updated_pr_body_file"
         gh_state update-pr "$pr_num" "$new_pr_title" "$updated_pr_body_file" || true
@@ -1888,12 +1903,16 @@ EOF
   # 同步关联 Issue 评论与状态
   if [[ -n "$issue_num" ]]; then
     issue_comment_md="$final_md"
-    if [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" ]] && [[ -n "$issue_closing_note" ]]; then
+    issue_state="$final_state"
+    if [[ "$final_state" == "done" && -n "$release_issue" ]]; then
+      issue_state="release-pending"
+      issue_comment_md+=$'\n\n'"> 封版 PR 已合入。发布任务将以 GitHub 合入提交继续构建并验收候选。"
+    elif [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" ]] && [[ -n "$issue_closing_note" ]]; then
       issue_comment_md="${final_md}"$'\n\n'"#### Issue 验收收口说明"$'\n'"${issue_closing_note}"
     fi
     if [[ "$final_state" == "done" || "$final_state" == "ready-to-merge" || "$final_state" == "blocked" || "$final_state" == "approved" ]]; then
       printf '%s\n' "$issue_comment_md" | gh_state comment issue "$issue_num" - "$FINAL_GATE_COMMENT_MARKER" || true
-      gh_state set-state issue "$issue_num" "$final_state" || true
+      gh_state set-state issue "$issue_num" "$issue_state" || true
     elif [[ "$final_state" == "changes-requested" && "$AUTO_REQUEUE_ISSUE" == "1" ]]; then
       # 先写评论再切标签，避免 agy-issue-loop 抢在评论落盘前就拉走任务
       printf '%s\n' "$issue_comment_md" | gh_state comment issue "$issue_num" - "$FINAL_GATE_COMMENT_MARKER" || true

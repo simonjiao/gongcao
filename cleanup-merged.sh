@@ -3,12 +3,13 @@ set -euo pipefail
 
 # 合并后收尾与本地 worktree 清理工具（不调用 agy/codex，不直接调用 gh）
 # 扫描近期已合并（merged）的 PR：
-#   1. 若 PR 或关联 Issue 仍带有非 done 的 agy:* 标签，将其切换为 agy:done；
+#   1. 记录发布 Issue 的合入提交，其他 PR 与 Issue 按常规收口。
 #   2. 在 flock 锁保护下安全清理本地对应的 issue-<N> / review-pr-<P> / e2e-pr-<P> / final-pr-<P> worktree
 #      及已合并的本地语义分支 / 遗留 agy/issue-<N> 分支（绝不强删未合并分支）。
 
 SCRIPT_DIR="$(cd -- "$([[ "${BASH_SOURCE[0]}" == */* ]] && printf '%s' "${BASH_SOURCE[0]%/*}" || printf '.')" && pwd)"
 GH_STATE_BIN="${SCRIPT_DIR}/gh-state.sh"
+source "$SCRIPT_DIR/lib/release-handoff.sh"
 
 SEARCH_PATH="${PATH}:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin"
 resolve_bin() {
@@ -114,6 +115,11 @@ extract_linked_issue() {
   local pr_body="$1"
   local head_branch="$2"
   local match="" num=""
+  num="$(release_issue_from_pr "$pr_body")"
+  if [[ -n "$num" ]]; then
+    printf '%s' "$num"
+    return
+  fi
 
   match="$("$GREP_BIN" -oiE -m 1 '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<<"$pr_body" || true)"
   [[ -n "$match" ]] && num="${match##*#}"
@@ -151,11 +157,27 @@ run_cleanup_pass() {
   local row
   while IFS= read -r row; do
     [[ -z "$row" ]] && continue
-    local pr_num pr_body head_branch issue_num has_agy_non_done
+    local pr_num pr_body head_branch issue_num has_agy_non_done release_issue release_issue_json merge_sha base_branch
     pr_num="$("$JQ_BIN" -r '.number' <<<"$row")"
     pr_body="$("$JQ_BIN" -r '.body // ""' <<<"$row")"
     head_branch="$("$JQ_BIN" -r '.headRefName // ""' <<<"$row")"
     issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
+    release_issue="$(release_issue_from_pr "$pr_body")"
+    if [[ -n "$release_issue" ]]; then
+      merge_sha="$("$JQ_BIN" -r '.mergeCommit.oid // empty' <<<"$row")"
+      base_branch="$("$JQ_BIN" -r '.baseRefName // empty' <<<"$row")"
+      if [[ "$merge_sha" =~ ^[0-9a-f]{40}$ && ! -f "$STATE_ROOT/releases/issue-$release_issue/$merge_sha/handoff.json" ]]; then
+        if ! release_issue_json="$(gh_state get-issue "$release_issue")"; then
+          continue
+        fi
+        if "$JQ_BIN" -e '(.state | ascii_upcase) == "OPEN"' >/dev/null <<<"$release_issue_json" \
+          && { ! gh_state set-state issue "$release_issue" release-pending \
+            || ! queue_release_handoff "$release_issue" "$pr_num" "$merge_sha" "$base_branch"; }; then
+          printf '警告：PR #%s 的发布交接未写入，下次清理重试。\n' "$pr_num" >&2
+          continue
+        fi
+      fi
+    fi
 
     has_agy_non_done="$("$JQ_BIN" -r --arg prefix "$LABEL_PREFIX" --arg done_lbl "${LABEL_PREFIX}done" \
       'if any(.labels[]?.name; startswith($prefix) and . != $done_lbl) then "1" else "0" end' <<<"$row")"
@@ -178,7 +200,7 @@ run_cleanup_pass() {
 
     if [[ "$has_agy_non_done" == "1" ]]; then
       gh_state set-state pr "$pr_num" done || true
-      if [[ -n "$issue_num" ]]; then
+      if [[ -n "$issue_num" && -z "$release_issue" ]]; then
         gh_state set-state issue "$issue_num" done || true
       fi
     fi
