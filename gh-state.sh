@@ -44,6 +44,7 @@ if [[ -z "${REPO_DIR:-}" ]]; then
   fi
 fi
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
+TODO_ALIAS_LABELS="${TODO_ALIAS_LABELS:-ready-for-agent}" # 逗号分隔，等同于 ${LABEL_PREFIX}todo 的入队标签
 COMMENT_MARKER="${COMMENT_MARKER:-<!-- agy-status-comment -->}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -94,8 +95,9 @@ usage() {
   REPOS_ROOT      托管仓库根目录（默认 ~/.gongcao/repos）
   REPO_DIR        仓库目录（留空时若指定 REPO 则优先查找 REPOS_ROOT，否则为当前目录）
   REPO            GitHub 仓库 owner/repo（留空自动从 REPO_DIR 探测）
-  LABEL_PREFIX    状态标签前缀（默认 agy:）
-  COMMENT_MARKER  置顶覆盖评论标记（默认 <!-- agy-status-comment -->）
+  LABEL_PREFIX       状态标签前缀（默认 agy:）
+  TODO_ALIAS_LABELS  逗号分隔，等同于 ${LABEL_PREFIX}todo 的入队标签（默认 ready-for-agent）
+  COMMENT_MARKER     置顶覆盖评论标记（默认 <!-- agy-status-comment -->）
   DRY_RUN         设为 1 时仅打印写操作，不修改远端 GitHub
 EOF
 }
@@ -223,6 +225,34 @@ cmd_list_issues() {
   if [[ ! "$limit" =~ ^[0-9]+$ ]] || (( limit <= 0 )); then
     printf '错误：list-issues 的 limit 必须是正整数 (%q)\n' "$limit" >&2
     exit 2
+  fi
+
+  if [[ "$filter_label" == *","* ]]; then
+    local -a raw_labels=()
+    local -a combined=()
+    local lbl="" part=""
+    IFS=',' read -r -a raw_labels <<<"$filter_label"
+    for lbl in "${raw_labels[@]}"; do
+      lbl="${lbl#"${lbl%%[![:space:]]*}"}"
+      lbl="${lbl%"${lbl##*[![:space:]]}"}"
+      [[ -z "$lbl" ]] && continue
+      local -a args=(
+        issue list
+        --state "$issue_state"
+        --limit "$limit"
+        --json number,title,body,labels,state,url
+        --label "$lbl"
+      )
+      [[ -n "$REPO" ]] && args+=(--repo "$REPO")
+      part="$(run_gh "${args[@]}")"
+      combined+=("$part")
+    done
+    if (( ${#combined[@]} == 0 )); then
+      printf '[]\n'
+      return 0
+    fi
+    printf '%s\n' "${combined[@]}" | "$JQ_BIN" -s 'add | unique_by(.number) | sort_by(.number)'
+    return 0
   fi
 
   local -a args=(
@@ -363,6 +393,25 @@ cmd_set_state() {
   local labels_json=""
   labels_json="$(run_gh api "repos/${repo_slug}/issues/${number}/labels?per_page=100")"
 
+  # 构建互斥状态标签集合：所有 STATES（不含 FLAG_LABELS 如 agy:hold-merge）及 TODO_ALIAS_LABELS（如 ready-for-agent）
+  local -a managed_state_labels=()
+  local item name alias_lbl
+  for item in "${STATES[@]}"; do
+    name="${item%%|*}"
+    managed_state_labels+=("${LABEL_PREFIX}${name}")
+  done
+  if [[ -n "$TODO_ALIAS_LABELS" ]]; then
+    local -a alias_arr=()
+    IFS=',' read -r -a alias_arr <<<"$TODO_ALIAS_LABELS"
+    for alias_lbl in "${alias_arr[@]}"; do
+      alias_lbl="${alias_lbl#"${alias_lbl%%[![:space:]]*}"}"
+      alias_lbl="${alias_lbl%"${alias_lbl##*[![:space:]]}"}"
+      [[ -n "$alias_lbl" ]] && managed_state_labels+=("$alias_lbl")
+    done
+  fi
+  local managed_json=""
+  managed_json="$(printf '%s\n' "${managed_state_labels[@]}" | "$JQ_BIN" -R . | "$JQ_BIN" -s 'unique')"
+
   local has_target=0
   local has_other_state=0
   local lbl
@@ -370,7 +419,7 @@ cmd_set_state() {
     [[ -z "$lbl" ]] && continue
     if [[ "$lbl" == "$target_label" ]]; then
       has_target=1
-    elif [[ "$lbl" == "${LABEL_PREFIX}"* ]]; then
+    elif "$JQ_BIN" -e --arg lbl "$lbl" 'index($lbl) != null' >/dev/null 2>&1 <<<"$managed_json"; then
       has_other_state=1
     fi
   done < <("$JQ_BIN" -r '.[]?.name // empty' <<<"$labels_json")
@@ -382,9 +431,9 @@ cmd_set_state() {
 
   local payload=""
   payload="$("$JQ_BIN" -c \
-    --arg prefix "$LABEL_PREFIX" \
+    --argjson managed "$managed_json" \
     --arg target "$target_label" \
-    '{labels: (([.[]?.name | select(startswith($prefix) | not)] + [$target]) | unique)}' \
+    '{labels: (([.[]?.name | select(. as $n | ($managed | index($n)) == null)] + [$target]) | unique)}' \
     <<<"$labels_json")"
 
   if [[ "$DRY_RUN" == "1" ]]; then

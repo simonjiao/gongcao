@@ -39,6 +39,13 @@ case "$*" in
   'list-issues '*'agy:changes-requested'*)
     printf '[]\n'
     ;;
+  'list-issues '*'ready-for-agent'*)
+    if [[ -f "$MOCK_DIR/ready-issues.json" ]]; then
+      cat "$MOCK_DIR/ready-issues.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
   'list-issues '*)
     cat "$MOCK_DIR/issues.json"
     ;;
@@ -340,5 +347,70 @@ set_issue 17 "测试分叉保护" "需求-17"
 run_dev_loop codex 1
 assert_calls 1 'set-state issue 17 blocked'
 [[ "$(<"$fixture/codex-count")" == "0" ]] || fail '历史分叉场景不应启动 Codex'
+
+# 10. ready-for-agent 标签等同 agy:todo：仅带 ready-for-agent 的 Issue 可被认领，并与 agy:todo 合并去重按编号 FIFO 执行
+printf '[]\n' > "$fixture/issues.json"
+jq -n '[{number:18, title:"仅带ready-for-agent", body:"需求-18", url:"https://example.invalid/issues/18", state:"OPEN", labels:[{name:"ready-for-agent"}]}]' \
+  > "$fixture/ready-issues.json"
+printf 'complete' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+run_dev_loop codex 1
+assert_calls 1 'set-state issue 18 in-progress'
+assert_calls 1 'set-state issue 18 in-review'
+rm -f "$fixture/ready-issues.json"
+
+# 11. 验证真实 gh-state.sh 对 ready-for-agent 的列表合并与 set-state 替换（同时保留 agy:hold-merge 与普通标签）
+mkdir -p "$fixture/ghstate-bin"
+cat > "$fixture/ghstate-bin/gh" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+case "$1" in
+  issue)
+    # gh issue list --state open --limit 20 --json ... --label <lbl>
+    lbl=""
+    while (( $# > 0 )); do
+      if [[ "$1" == "--label" ]]; then lbl="$2"; shift 2; else shift; fi
+    done
+    case "$lbl" in
+      agy:todo)
+        printf '[{"number":30,"title":"t30"},{"number":20,"title":"t20"}]\n'
+        ;;
+      ready-for-agent)
+        printf '[{"number":10,"title":"t10"},{"number":20,"title":"t20"}]\n'
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
+    ;;
+  api)
+    if [[ "$*" == *"-X PUT"* ]]; then
+      cat > "$MOCK_DIR/gh-put-payload.json"
+      printf '{}\n'
+    else
+      printf '[{"name":"ready-for-agent"},{"name":"agy:hold-merge"},{"name":"bug"}]\n'
+    fi
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+chmod +x "$fixture/ghstate-bin/gh"
+
+merged_issues="$(PATH="$fixture/ghstate-bin:$PATH" REPO=example/issue-fixture REPO_DIR="$fixture/repo" \
+  bash "$repo_dir/gh-state.sh" list-issues open "agy:todo,ready-for-agent" 20)"
+jq -e 'map(.number) == [10, 20, 30]' <<<"$merged_issues" >/dev/null \
+  || { printf 'got: %s\n' "$merged_issues" >&2; fail 'gh-state list-issues 合并去重 ready-for-agent 失败'; }
+
+PATH="$fixture/ghstate-bin:$PATH" REPO=example/issue-fixture REPO_DIR="$fixture/repo" \
+  bash "$repo_dir/gh-state.sh" set-state issue 88 in-progress >/dev/null 2>&1
+jq -e '
+  (.labels | index("agy:in-progress")) != null
+  and (.labels | index("ready-for-agent")) == null
+  and (.labels | index("agy:hold-merge")) != null
+  and (.labels | index("bug")) != null
+' "$fixture/gh-put-payload.json" >/dev/null \
+  || { cat "$fixture/gh-put-payload.json" >&2; fail 'gh-state set-state 未清除 ready-for-agent 或误删了 hold-merge/bug'; }
 
 printf 'issue loop tests passed\n'

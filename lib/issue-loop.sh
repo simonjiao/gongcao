@@ -115,9 +115,12 @@ AUTO_PUSH_PR="${AUTO_PUSH_PR:-1}"      # 有新 commit 时是否自动 push 分�
 DRY_RUN="${DRY_RUN:-0}"                # 1=演练模式（不修改远端 GitHub、不执行 git push）
 ISSUE_STATE="${ISSUE_STATE:-open}"     # open | closed | all
 ISSUE_LIMIT="${ISSUE_LIMIT:-20}"       # 每次拉取的最大 issue 数量
-# 启用 GitHub 状态机时默认只拉取人工放行的 agy:todo；显式传 FILTER_LABEL="" 可关闭标签过滤
+TODO_ALIAS_LABELS="${TODO_ALIAS_LABELS:-ready-for-agent}" # 逗号分隔，等同于 agy:todo 的入队标签
+# 启用 GitHub 状态机时默认拉取人工放行的 agy:todo 与 ready-for-agent；显式传 FILTER_LABEL="" 可关闭标签过滤
 if [[ "$GH_SYNC_ENABLED" == "1" ]]; then
-  FILTER_LABEL="${FILTER_LABEL-${LABEL_PREFIX}todo}"
+  _default_todo_labels="${LABEL_PREFIX}todo"
+  [[ -n "$TODO_ALIAS_LABELS" ]] && _default_todo_labels+=",${TODO_ALIAS_LABELS}"
+  FILTER_LABEL="${FILTER_LABEL-${_default_todo_labels}}"
 else
   FILTER_LABEL="${FILTER_LABEL-}"
 fi
@@ -198,9 +201,40 @@ if ! "$FLOCK_BIN" -n "$dev_lock_fd"; then
   exit 1
 fi
 
-# 判断是否完全以 GitHub 状态标签作为队列真相源（人工把标签改回 agy:todo 时可自动续接）
+# 判断是否完全以 GitHub 状态标签作为队列真相源（人工把标签改回 agy:todo 或 ready-for-agent 时可自动续接）
+is_todo_queue_filter() {
+  local filter="$1"
+  [[ -n "$filter" ]] || return 1
+  local -a filter_arr=() alias_arr=()
+  local lbl="" alias_lbl="" matched=0
+  IFS=',' read -r -a filter_arr <<<"$filter"
+  IFS=',' read -r -a alias_arr <<<"$TODO_ALIAS_LABELS"
+  local seen=0
+  for lbl in "${filter_arr[@]}"; do
+    lbl="${lbl#"${lbl%%[![:space:]]*}"}"
+    lbl="${lbl%"${lbl##*[![:space:]]}"}"
+    [[ -z "$lbl" ]] && continue
+    seen=1
+    matched=0
+    if [[ "$lbl" == "${LABEL_PREFIX}todo" ]]; then
+      matched=1
+    else
+      for alias_lbl in "${alias_arr[@]}"; do
+        alias_lbl="${alias_lbl#"${alias_lbl%%[![:space:]]*}"}"
+        alias_lbl="${alias_lbl%"${alias_lbl##*[![:space:]]}"}"
+        if [[ -n "$alias_lbl" && "$lbl" == "$alias_lbl" ]]; then
+          matched=1
+          break
+        fi
+      done
+    fi
+    (( matched == 1 )) || return 1
+  done
+  (( seen == 1 ))
+}
+
 USE_LOCAL_DEDUP=1
-if [[ "$GH_SYNC_ENABLED" == "1" && "$DRY_RUN" != "1" && "$FILTER_LABEL" == "${LABEL_PREFIX}todo" ]]; then
+if [[ "$GH_SYNC_ENABLED" == "1" && "$DRY_RUN" != "1" ]] && is_todo_queue_filter "$FILTER_LABEL"; then
   USE_LOCAL_DEDUP=0
 fi
 
@@ -210,6 +244,7 @@ gh_state() {
   REPO_DIR="$REPO_ROOT" \
   REPO="$REPO" \
   LABEL_PREFIX="$LABEL_PREFIX" \
+  TODO_ALIAS_LABELS="$TODO_ALIAS_LABELS" \
   DRY_RUN="$DRY_RUN" \
   "$GH_STATE_BIN" "$@"
 }
@@ -943,7 +978,29 @@ while true; do
   fi
 
   if (( poll_failed == 0 && picked_from_changes_requested == 0 )); then
-    if ! issues_json="$(gh_state list-issues "$ISSUE_STATE" "$FILTER_LABEL" "$ISSUE_LIMIT")" \
+    if [[ "$FILTER_LABEL" == *","* ]]; then
+      _merged_parts=()
+      IFS=',' read -r -a _filter_labels <<<"$FILTER_LABEL"
+      for _flbl in "${_filter_labels[@]}"; do
+        _flbl="${_flbl#"${_flbl%%[![:space:]]*}"}"
+        _flbl="${_flbl%"${_flbl##*[![:space:]]}"}"
+        [[ -z "$_flbl" ]] && continue
+        _part_json=""
+        if ! _part_json="$(gh_state list-issues "$ISSUE_STATE" "$_flbl" "$ISSUE_LIMIT")" \
+          || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$_part_json"; then
+          poll_failed=1
+          break
+        fi
+        _merged_parts+=("$_part_json")
+      done
+      if (( poll_failed == 0 )); then
+        if (( ${#_merged_parts[@]} == 0 )); then
+          issues_json="[]"
+        else
+          issues_json="$(printf '%s\n' "${_merged_parts[@]}" | "$JQ_BIN" -s 'add | unique_by(.number) | sort_by(.number)')"
+        fi
+      fi
+    elif ! issues_json="$(gh_state list-issues "$ISSUE_STATE" "$FILTER_LABEL" "$ISSUE_LIMIT")" \
       || ! "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$issues_json"; then
       poll_failed=1
     fi
