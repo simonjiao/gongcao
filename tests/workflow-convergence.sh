@@ -47,10 +47,13 @@ case "$*" in
   'get-comment '*|'get-pr-diff '*)
     ;;
   'get-issue '*)
-    if [[ -f "$MOCK_DIR/issue.json" ]]; then
+    inum="${2:-}"
+    if [[ -n "$inum" && -f "$MOCK_DIR/issue-${inum}.json" ]]; then
+      cat "$MOCK_DIR/issue-${inum}.json"
+    elif [[ -f "$MOCK_DIR/issue.json" ]]; then
       cat "$MOCK_DIR/issue.json"
     else
-      printf '%s\n' '{"title":"Mock Issue","body":"需求正文","labels":[],"url":"https://example.invalid/issues/42"}'
+      printf '%s\n' '{"title":"Mock Issue","body":"需求正文","state":"OPEN","labels":[],"url":"https://example.invalid/issues/42"}'
     fi
     ;;
   'get-pr '*)
@@ -79,7 +82,15 @@ case "$*" in
     printf '%s\n' '{"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}'
     ;;
   'list-issues '*)
-    printf '[]\n'
+    if [[ -f "$MOCK_DIR/open-issues.json" ]]; then
+      cat "$MOCK_DIR/open-issues.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  'create-issue '*)
+    printf '%s\n' "create-issue $2" >> "$MOCK_DIR/calls"
+    printf '99\thttps://example.invalid/issues/99\tcreated\n'
     ;;
   'comment pr 7 - <!-- codex-review-comment -->')
     printf '%s\n' write-review >> "$MOCK_DIR/calls"
@@ -105,6 +116,10 @@ case "$*" in
     printf '%s\n' write-issue-e2e >> "$MOCK_DIR/calls"
     cat >/dev/null
     ;;
+  'comment issue '*' <!-- gongcao-auto-queue-comment -->')
+    printf 'comment-auto-queue issue %s\n' "$3" >> "$MOCK_DIR/calls"
+    cat > "$MOCK_DIR/auto-queue-comment-${3}.md"
+    ;;
   'comment '*)
     cat >/dev/null
     ;;
@@ -115,9 +130,9 @@ case "$*" in
       exit 1
     fi
     ;;
-  'set-state issue 42 '*)
+  'set-state issue '*)
     printf '%s\n' "$*" >> "$MOCK_DIR/calls"
-    if [[ -f "$MOCK_DIR/fail-issue-state" ]]; then
+    if [[ "$3" == "42" && -f "$MOCK_DIR/fail-issue-state" ]]; then
       rm "$MOCK_DIR/fail-issue-state"
       exit 1
     fi
@@ -589,5 +604,83 @@ grep -Fq '超出 Issue 估算上限 75 行' "$fixture/last-prompt" || fail 'Revi
 grep -Fq 'qa/browser-runtime.cjs' "$fixture/last-prompt" || fail 'Review 提示词未标出通用 QA 运行时改动'
 grep -Fq '不得在功能 PR 复审中追加跨单通用 QA 底座需求作为阻塞项' "$fixture/last-prompt" || fail 'Review 提示词缺少不追加通用 QA 底座需求的双向约束'
 grep -Fq '重复/低价值测试膨胀' "$fixture/last-prompt" || fail 'Review 提示词缺少重复测试膨胀阻塞准则'
+
+# 10. Final Gate 合并成功后按终审研判 + 宿主机硬门禁为已解除依赖的既有 Open Issue 添加 agy:todo
+cp "$fixture/original-comment" "$fixture/review-comment"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"Fixture", body:"Closes #42", url:"https://example.invalid/pull/7",
+  state:"OPEN", isDraft:false, headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", labels:[], updatedAt:"queue-next"}]' > "$fixture/pr.json"
+jq -n '{number:42, title:"前置底座", body:"普通需求", state:"OPEN", labels:[{name:"agy:e2e-passed"}], url:"https://example.invalid/issues/42"}' > "$fixture/issue-42.json"
+jq -n '{number:50, title:"下游单 A", body:"前置依赖：#42\n验收标准：完成下游 A。", state:"OPEN", labels:[{name:"enhancement"}], url:"https://example.invalid/issues/50"}' > "$fixture/issue-50.json"
+jq -n '{number:51, title:"进行中单", body:"前置依赖：#42", state:"OPEN", labels:[{name:"agy:in-progress"}], url:"https://example.invalid/issues/51"}' > "$fixture/issue-51.json"
+jq -n '{number:52, title:"别名已入队单", body:"前置依赖：#42", state:"OPEN", labels:[{name:"ready-for-agent"}], url:"https://example.invalid/issues/52"}' > "$fixture/issue-52.json"
+jq -n '{number:53, title:"人工标签单", body:"前置依赖：#42", state:"OPEN", labels:[{name:"needs-human"}], url:"https://example.invalid/issues/53"}' > "$fixture/issue-53.json"
+jq -n '{number:54, title:"需 Owner 确认单", body:"前置依赖：#42\n待 Owner 确认后再开发。", state:"OPEN", labels:[], url:"https://example.invalid/issues/54"}' > "$fixture/issue-54.json"
+jq -n '{number:55, title:"发版追踪单", body:"<!-- gongcao-release -->\n前置依赖：#42", state:"OPEN", labels:[], url:"https://example.invalid/issues/55"}' > "$fixture/issue-55.json"
+jq -n '{number:56, title:"仍有未关依赖单", body:"前置依赖：#42、#60", state:"OPEN", labels:[], url:"https://example.invalid/issues/56"}' > "$fixture/issue-56.json"
+jq -n '{number:57, title:"已关闭单", body:"前置依赖：#42", state:"CLOSED", labels:[], url:"https://example.invalid/issues/57"}' > "$fixture/issue-57.json"
+jq -n '{number:58, title:"下游单 B", body:"Depends on #42\n实现下游 B（删除前需要人工确认弹窗）。", state:"OPEN", labels:[], url:"https://example.invalid/issues/58"}' > "$fixture/issue-58.json"
+jq -n '{number:59, title:"下游单 C（超限）", body:"Depends on #42\n第三条就绪单。", state:"OPEN", labels:[], url:"https://example.invalid/issues/59"}' > "$fixture/issue-59.json"
+jq -n '{number:60, title:"未关闭前置单", body:"仍在排队", state:"OPEN", labels:[], url:"https://example.invalid/issues/60"}' > "$fixture/issue-60.json"
+jq -n '{number:99, title:"新建后续单", body:"来源 PR #7", state:"OPEN", labels:[], url:"https://example.invalid/issues/99"}' > "$fixture/issue-99.json"
+jq -s '.' "$fixture"/issue-{42,50,51,52,53,54,55,56,58,59,60}.json > "$fixture/open-issues.json"
+
+jq -n '{
+  verdict:"merge", summary:"可合入并解锁下游单", merge_method:"merge", merge_method_reason:"默认",
+  audit_checks:[], pr_title:"", pr_body:"", issue_closing_note:"已完成收口",
+  blocking_issues:[], non_blocking_notes:[],
+  follow_up_issues:[{slug:"fu-item", title:"后续改进项", priority:"P2", reason:"遗留改进", body:"详细说明"}],
+  queue_next_issues:[
+    {issue_number:42, reason:"误推当前单"},
+    {issue_number:99, reason:"误推新建后续单"},
+    {issue_number:50, reason:"前置 #42 已合入"},
+    {issue_number:50, reason:"重复项应去重"},
+    {issue_number:51, reason:"已在开发中"},
+    {issue_number:52, reason:"已有 ready-for-agent"},
+    {issue_number:53, reason:"带人工标签"},
+    {issue_number:54, reason:"需 Owner 确认"},
+    {issue_number:55, reason:"发版追踪单"},
+    {issue_number:56, reason:"仍依赖未关闭 #60"},
+    {issue_number:57, reason:"已关闭单"},
+    {issue_number:58, reason:"前置 #42 已合入，第二顺位"},
+    {issue_number:59, reason:"超出上限"}
+  ]
+}' > "$fixture/decision.json"
+
+# 10a. AUTO_MERGE=0（未实际合并）时绝不提前为下游 Issue 添加 agy:todo
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-queue-nomerge" run_loop final-gate
+assert_calls 0 'set-state issue 50 todo'
+assert_calls 0 'set-state issue 58 todo'
+grep -Fq '前置依赖：#42' "$fixture/last-prompt" || fail 'Final Gate 提示词未注入 Open Issues 正文摘要'
+grep -Fq 'queue_next_issues' "$fixture/last-prompt" || fail 'Final Gate 提示词缺少 queue_next_issues 研判准则'
+
+# 10b. AUTO_QUEUE_NEXT_ISSUES=0 时即使合并成功也不自动入队
+AUTO_MERGE=1 AUTO_QUEUE_NEXT_ISSUES=0 FINAL_ROOT="$fixture/final-queue-disabled" run_loop final-gate
+assert_calls 0 'set-state issue 50 todo'
+assert_calls 0 'set-state issue 58 todo'
+
+# 10c. AUTO_MERGE=1 合并成功后：仅 #50 与 #58 通过硬门禁并按先评论后打标切换为 agy:todo，其余全部拦截
+AUTO_MERGE=1 MAX_QUEUED_NEXT_ISSUES=2 FINAL_ROOT="$fixture/final-queue-ok" run_loop final-gate
+assert_calls 1 'comment-auto-queue issue 50'
+assert_calls 1 'set-state issue 50 todo'
+assert_calls 1 'comment-auto-queue issue 58'
+assert_calls 1 'set-state issue 58 todo'
+for blocked_inum in 42 51 52 53 54 55 56 57 59 99; do
+  assert_calls 0 "set-state issue ${blocked_inum} todo"
+done
+c50_line="$(grep -Fn 'comment-auto-queue issue 50' "$fixture/calls" | head -n 1 | cut -d: -f1)"
+s50_line="$(grep -Fn 'set-state issue 50 todo' "$fixture/calls" | head -n 1 | cut -d: -f1)"
+[[ -n "$c50_line" && -n "$s50_line" && "$c50_line" -lt "$s50_line" ]] \
+  || fail "自动入队应先写评论再切 agy:todo 标签 (comment=$c50_line, set-state=$s50_line)"
+grep -Fq '前置 #42 已合入' "$fixture/auto-queue-comment-50.md" || fail '自动入队说明评论未写入目标 Issue'
+grep -Fq '自动入队的下游/既有 Open Issue' "$fixture/final-queue-ok/pr-7/final-gate-comment.md" || fail '终审评论缺少自动入队汇总'
+grep -Fq '未自动入队的候选 Issue（宿主机硬门禁拦截）' "$fixture/final-queue-ok/pr-7/final-gate-comment.md" || fail '终审评论缺少门禁拦截明细'
+grep -Fq '仍声明依赖未关闭的 Open Issue #60' "$fixture/final-queue-ok/pr-7/final-gate-comment.md" || fail '终审评论未记录未关闭依赖拦截原因'
+grep -Fq '已达单次自动入队上限' "$fixture/final-queue-ok/pr-7/final-gate-comment.md" || fail '终审评论未记录上限拦截原因'
+jq -e '
+  ([.queued_next_issues[] | select(.status == "queued") | .number] == [50, 58])
+  and ([.queued_next_issues[] | select(.status == "skipped")] | length == 10)
+' "$fixture/final-queue-ok/pr-7/meta.json" >/dev/null \
+  || { cat "$fixture/final-queue-ok/pr-7/meta.json" >&2; fail 'meta.json 的 queued_next_issues 记录不符合预期'; }
+rm -f "$fixture"/issue-*.json "$fixture/open-issues.json" "$fixture"/auto-queue-comment-*.md
 
 printf 'workflow convergence tests passed\n'

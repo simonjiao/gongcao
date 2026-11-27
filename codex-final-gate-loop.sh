@@ -4,7 +4,7 @@ set -euo pipefail
 # 独立 Codex 终审合入门禁循环（Final Gate / Release Reviewer，默认 gpt-6.2-sol + xhigh，read-only）
 # 监听带 agy:e2e-passed 或 agy:e2e-skipped 标签的 Open PR，进行「Issue 需求 + 最终代码 + 远端 QA 证据 + CI/合并状态」
 # 四位一体终审对账：
-#   - merge           -> 更新规范 PR 标题/正文 -> 发布终审签核评论 -> Draft 转 Ready -> 自动合并（AUTO_MERGE=1, MERGE_METHOD=merge）-> 标 agy:done
+#   - merge           -> 更新规范 PR 标题/正文 -> 发布终审签核评论 -> Draft 转 Ready -> 自动合并（AUTO_MERGE=1, MERGE_METHOD=merge）-> 标 agy:done -> 按需为解除依赖的既有 Open Issue 添加 agy:todo
 #   - require_e2e     -> 免测退回：无需回退开发，直接切 agy:approved 交由 E2E 循环执行实测
 #   - request_changes -> 发布终审问题清单 -> PR 与关联 Issue 切 agy:changes-requested（超限切 blocked）
 #   - blocked         -> 切 agy:blocked 交人工裁决
@@ -57,9 +57,11 @@ REPO_NAME="${REPO_NAME:-}"                   # 可选：~/.gongcao/repos/<REPO_N
 REPO_DIR="${REPO_DIR:-}"                     # 可选：显式本地仓库路径
 AUTO_CLONE="${AUTO_CLONE:-1}"
 LABEL_PREFIX="${LABEL_PREFIX:-agy:}"
+TODO_ALIAS_LABELS="${TODO_ALIAS_LABELS:-ready-for-agent}" # 逗号分隔，等同于 ${LABEL_PREFIX}todo 的入队标签
 FINAL_GATE_LABEL="${FINAL_GATE_LABEL:-}"     # 兼容旧变量；留空时同时监听 e2e-passed 与 e2e-skipped
 FINAL_GATE_LABELS="${FINAL_GATE_LABELS:-${FINAL_GATE_LABEL:-${LABEL_PREFIX}e2e-passed,${LABEL_PREFIX}e2e-skipped}}"
 FINAL_GATE_COMMENT_MARKER="${FINAL_GATE_COMMENT_MARKER:-<!-- codex-final-gate-comment -->}"
+AUTO_QUEUE_COMMENT_MARKER="${AUTO_QUEUE_COMMENT_MARKER:-<!-- gongcao-auto-queue-comment -->}"
 E2E_COMMENT_MARKER="${E2E_COMMENT_MARKER:-<!-- codex-e2e-comment -->}"
 REVIEW_COMMENT_MARKER="${REVIEW_COMMENT_MARKER:-<!-- codex-review-comment -->}"
 E2E_EVIDENCE_BRANCH="${E2E_EVIDENCE_BRANCH:-qa/e2e-evidence}"
@@ -84,6 +86,11 @@ AUTO_REQUEUE_ISSUE="${AUTO_REQUEUE_ISSUE:-1}"
 CREATE_FOLLOWUP_ISSUES="${CREATE_FOLLOWUP_ISSUES:-1}" # 1=合并成功后自动将必要非阻塞项创建为后续追踪 Issue；0=仅保留在评论
 MAX_FOLLOWUP_ISSUES="${MAX_FOLLOWUP_ISSUES:-3}"       # 单次合入最多创建的后续追踪 Issue 数量上限（防刷单）
 FOLLOWUP_ISSUE_LABELS="${FOLLOWUP_ISSUE_LABELS:-}"    # 可选逗号分隔标签（默认留空，严禁默认附带 agy:todo 以防自举循环）
+AUTO_QUEUE_NEXT_ISSUES="${AUTO_QUEUE_NEXT_ISSUES:-1}" # 1=合并成功后按终审研判与宿主机硬门禁为已解除依赖的既有 Open Issue 添加 ${LABEL_PREFIX}todo
+MAX_QUEUED_NEXT_ISSUES="${MAX_QUEUED_NEXT_ISSUES:-2}" # 单次合入最多自动入队的既有 Open Issue 数量上限
+OPEN_ISSUES_CONTEXT_LIMIT="${OPEN_ISSUES_CONTEXT_LIMIT:-100}"
+OPEN_ISSUE_BODY_EXCERPT_CHARS="${OPEN_ISSUE_BODY_EXCERPT_CHARS:-600}"
+OPEN_ISSUES_MAX_CHARS="${OPEN_ISSUES_MAX_CHARS:-24000}"
 INIT_LABELS="${INIT_LABELS:-1}"
 PR_LIMIT="${PR_LIMIT:-20}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"
@@ -143,6 +150,7 @@ gh_state() {
   REPO_DIR="$REPO_ROOT" \
   REPO="$REPO" \
   LABEL_PREFIX="$LABEL_PREFIX" \
+  TODO_ALIAS_LABELS="$TODO_ALIAS_LABELS" \
   DRY_RUN="$DRY_RUN" \
   "$GH_STATE_BIN" "$@"
 }
@@ -154,8 +162,8 @@ printf '  Codex 配置 : %s\n' "$CODEX_PROFILE_DIR"
 printf '  工作主目录 : %s\n' "$GONGCAO_HOME"
 printf '  主仓库目录 : %s\n' "$REPO_ROOT"
 printf '  终审档案根 : %s\n' "$FINAL_ROOT"
-printf '  合入策略   : AUTO_MERGE=%s, HOLD_LABEL=%s, REQUIRE_OWNER_APPROVAL=%s, APPROVERS=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), DRY_RUN=%s\n' \
-  "$AUTO_MERGE" "$HOLD_MERGE_LABEL" "$REQUIRE_OWNER_MERGE_APPROVAL" "${MERGE_APPROVERS:-(OWNER/MEMBER/COLLABORATOR)}" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$DRY_RUN"
+printf '  合入策略   : AUTO_MERGE=%s, HOLD_LABEL=%s, REQUIRE_OWNER_APPROVAL=%s, APPROVERS=%s, 默认MERGE_METHOD=%s, 终审裁定方式=%s, 直接解简单冲突=%s, REQUIRE_SHA=%s, REQUIRE_CI=%s, 后续建单=%s(max=%s), 自动入队=%s(max=%s), DRY_RUN=%s\n' \
+  "$AUTO_MERGE" "$HOLD_MERGE_LABEL" "$REQUIRE_OWNER_MERGE_APPROVAL" "${MERGE_APPROVERS:-(OWNER/MEMBER/COLLABORATOR)}" "$MERGE_METHOD" "$FINAL_GATE_JUDGE_MERGE_METHOD" "$AUTO_RESOLVE_TRIVIAL_CONFLICT" "$REQUIRE_EVIDENCE_SHA_MATCH" "$REQUIRE_CI_PASS" "$CREATE_FOLLOWUP_ISSUES" "$MAX_FOLLOWUP_ISSUES" "$AUTO_QUEUE_NEXT_ISSUES" "$MAX_QUEUED_NEXT_ISSUES" "$DRY_RUN"
 printf '  监听标签   : %s (证据分支=%s, MAX_FINAL_ROUNDS=%s, MAX_TOTAL_FINAL_ROUNDS=%s)\n' \
   "$FINAL_GATE_LABELS" "$E2E_EVIDENCE_BRANCH" "$MAX_FINAL_ROUNDS" "$MAX_TOTAL_FINAL_ROUNDS"
 
@@ -194,7 +202,8 @@ write_final_gate_schema() {
     "issue_closing_note",
     "blocking_issues",
     "non_blocking_notes",
-    "follow_up_issues"
+    "follow_up_issues",
+    "queue_next_issues"
   ],
   "properties": {
     "verdict": {
@@ -254,6 +263,18 @@ write_final_gate_schema() {
           "priority": { "type": "string", "enum": ["P1", "P2", "P3"] },
           "reason": { "type": "string" },
           "body": { "type": "string" }
+        }
+      }
+    },
+    "queue_next_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issue_number", "reason"],
+        "properties": {
+          "issue_number": { "type": "integer", "minimum": 1 },
+          "reason": { "type": "string" }
         }
       }
     }
@@ -989,6 +1010,188 @@ evaluate_merge_authorization() {
     '{allowed: false, mode: "awaiting_owner_approval", reason: ($reason + "，尚未检测到经身份校验且绑定提交 `" + $sha + "` 的放行指令。请由 Owner/维护者在 PR #" + $pr + " 评论 `/approve-merge " + $sha + "` 后切回 `" + $lbl + "` 放行。"), approver: ""}'
 }
 
+# 将 Open Issues 快照按与当前 PR/Issue 的相关性排序并渲染为带标签与正文摘要的 Markdown（供后续去重与自动入队研判）
+render_open_issues_context() {
+  local issues_json="$1"
+  local cur_issue_num="$2"
+  local cur_pr_num="$3"
+  local rendered=""
+  rendered="$("$JQ_BIN" -r \
+    --arg cur_issue "$cur_issue_num" \
+    --arg cur_pr "$cur_pr_num" \
+    --arg prefix "$LABEL_PREFIX" \
+    --arg hold "$HOLD_MERGE_LABEL" \
+    --arg aliases "$TODO_ALIAS_LABELS" \
+    --argjson excerpt_chars "$OPEN_ISSUE_BODY_EXCERPT_CHARS" '
+    def norm_text:
+      (. // "")
+      | gsub("\r"; "")
+      | gsub("[ \t]+"; " ")
+      | gsub("\n{3,}"; "\n\n")
+      | sub("^\\s+"; "")
+      | sub("\\s+$"; "");
+    def compact_excerpt($max):
+      norm_text
+      | gsub("\n+"; " / ")
+      | if length == 0 then "(无正文)"
+        elif length > $max then .[0:$max] + "..."
+        else .
+        end;
+    ($aliases | split(",") | map(gsub("^\\s+|\\s+$"; "") | ascii_downcase) | map(select(length > 0))) as $alias_list
+    | if length == 0 then
+        "- (当前无 Open Issues)"
+      else
+        map(
+          . as $it
+          | (($it.number | tostring) == $cur_issue) as $is_cur
+          | ((($it.title // "") + "\n" + ($it.body // "")) as $txt |
+              (($cur_issue != "" and ($txt | test("#" + $cur_issue + "(?:[^0-9]|$)")))
+                or ($cur_pr != "" and ($txt | test("#" + $cur_pr + "(?:[^0-9]|$)"))))) as $mentions_cur
+          | (any(($it.labels // [])[]?.name // "";
+              startswith($prefix) or . == $hold or ((ascii_downcase) as $ln | ($alias_list | index($ln)) != null))) as $has_wf_lbl
+          | {
+              bucket: (if $is_cur then 3 elif $mentions_cur then 0 elif ($has_wf_lbl | not) then 1 else 2 end),
+              number: $it.number,
+              title: ($it.title // ""),
+              labels: ([($it.labels // [])[]?.name // empty] | if length > 0 then join(", ") else "(none)" end),
+              is_cur: $is_cur,
+              excerpt: ($it.body | compact_excerpt($excerpt_chars))
+            }
+        )
+        | sort_by([.bucket, .number])
+        | map(
+            "- #" + (.number | tostring) + ": " + .title
+            + " | labels: " + .labels
+            + (if .is_cur then " [当前合并单]" else "" end)
+            + "\n  摘要: " + .excerpt
+          )
+        | join("\n")
+      end
+  ' <<<"$issues_json")"
+
+  if (( ${#rendered} > OPEN_ISSUES_MAX_CHARS )); then
+    rendered="${rendered:0:OPEN_ISSUES_MAX_CHARS}"$'\n'"... (Open Issues 摘要已截断，已优先保留关联当前 PR/Issue 及未带工作流标签的条目)"
+  fi
+  printf '%s' "$rendered"
+}
+
+# 宿主机校验候选自动入队 Issue 是否满足硬门禁：
+#   1) 编号有效且非当前合并单、非发版单、非本次刚新建的 follow_up_issues；
+#   2) 实时复读仍为 OPEN；
+#   3) 不含任何活动状态标签（${LABEL_PREFIX}*）、入队别名标签或人工/阻塞类标签；
+#   4) 不含发版标记（<!-- gongcao-release -->）或明确要求人工/Owner 确认/禁止自动入队的措辞；
+#   5) 显式前置依赖行中不存在其他仍未关闭的 Open Issue。
+# 输出 JSON: {allowed: bool, number: int, title: string, url: string, reason: string}
+evaluate_queue_next_issue() {
+  local cand_num="$1"
+  local current_issue_num="$2"
+  local release_issue_num="$3"
+  local created_followups_json="$4"
+  local still_open_nums_json="$5"
+
+  if [[ ! "$cand_num" =~ ^[1-9][0-9]*$ ]]; then
+    "$JQ_BIN" -cn --arg raw "$cand_num" \
+      '{allowed:false, number:0, title:"", url:"", reason:("候选 Issue 编号无效：" + $raw)}'
+    return 0
+  fi
+  if [[ -n "$current_issue_num" && "$cand_num" == "$current_issue_num" ]]; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" \
+      '{allowed:false, number:$n, title:"", url:"", reason:"目标为当前刚合入的关联 Issue，禁止重新入队"}'
+    return 0
+  fi
+  if [[ -n "$release_issue_num" && "$cand_num" == "$release_issue_num" ]]; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" \
+      '{allowed:false, number:$n, title:"", url:"", reason:"目标为当前发版追踪 Issue，交由 release-loop 接续而非入队开发"}'
+    return 0
+  fi
+  if "$JQ_BIN" -e --argjson n "$cand_num" 'any(.[]; (.number | tonumber? // -1) == $n)' \
+    <<<"$created_followups_json" >/dev/null 2>&1; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" \
+      '{allowed:false, number:$n, title:"", url:"", reason:"目标为本次合入刚新建的后续追踪 Issue，禁止自举自动入队"}'
+    return 0
+  fi
+
+  local live_issue_json=""
+  if ! live_issue_json="$(gh_state get-issue "$cand_num" 2>/dev/null)" \
+    || ! "$JQ_BIN" -e 'type == "object"' >/dev/null 2>&1 <<<"$live_issue_json"; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" \
+      '{allowed:false, number:$n, title:"", url:"", reason:"无法读取目标 Issue 实时状态"}'
+    return 0
+  fi
+
+  local cand_state cand_title cand_body cand_url blocking_label
+  cand_state="$("$JQ_BIN" -r '(.state // "") | ascii_upcase' <<<"$live_issue_json")"
+  cand_title="$("$JQ_BIN" -r '.title // ""' <<<"$live_issue_json")"
+  cand_body="$("$JQ_BIN" -r '.body // ""' <<<"$live_issue_json")"
+  cand_url="$("$JQ_BIN" -r '.url // ""' <<<"$live_issue_json")"
+
+  if [[ "$cand_state" != "OPEN" ]]; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" --arg st "${cand_state:-UNKNOWN}" \
+      '{allowed:false, number:$n, title:$t, url:$u, reason:("目标 Issue 当前状态为 " + $st + "，非 OPEN")}'
+    return 0
+  fi
+
+  blocking_label="$("$JQ_BIN" -r \
+    --arg prefix "$LABEL_PREFIX" \
+    --arg hold "$HOLD_MERGE_LABEL" \
+    --arg aliases "$TODO_ALIAS_LABELS" '
+    ($aliases | split(",") | map(gsub("^\\s+|\\s+$"; "") | ascii_downcase) | map(select(length > 0))) as $alias_list
+    | ["hold","on-hold","hold-merge","do-not-merge","do-not-queue","blocked","needs-human","needs-triage","needs-decision","manual","manual-only","wontfix","duplicate","invalid","paused","waiting-for-owner"] as $manual_list
+    | [
+        (.labels // [])[]?.name // empty
+        | select(
+            startswith($prefix)
+            or . == $hold
+            or ((ascii_downcase) as $ln | ($alias_list | index($ln)) != null or ($manual_list | index($ln)) != null)
+          )
+      ] | first // empty
+  ' <<<"$live_issue_json")"
+  if [[ -n "$blocking_label" ]]; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" --arg lbl "$blocking_label" \
+      '{allowed:false, number:$n, title:$t, url:$u, reason:("目标 Issue 已带活动状态或人工控制标签 `" + $lbl + "`")}'
+    return 0
+  fi
+
+  if is_release_issue "$cand_body"; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" \
+      '{allowed:false, number:$n, title:$t, url:$u, reason:"目标 Issue 含发版标记 <!-- gongcao-release -->，需人工确认后再入队"}'
+    return 0
+  fi
+
+  if "$GREP_BIN" -iqE '待[[:space:]]*(人工|Owner)[[:space:]]*(确认|决策|决定|审批|拍板)|(需|须|应)[[:space:]]*Owner[[:space:]]*(确认|决策|决定|审批|拍板|放行)|(由|经)[[:space:]]*Owner[[:space:]]*(确认|决策|决定|审批|拍板|评估)|保留给[[:space:]]*Owner|(本单|该单|此[[:space:]]*Issue|入队前|开发前|开工前|自动入队前).{0,16}(需|待|由|经).{0,6}(人工|Owner)|(暂不|勿|禁止|不要)自动(入队|开发|派单|执行)|needs?[[:space:]]+(human|owner)[[:space:]]+(decision|approval|confirmation|sign-off)|wait(ing)?[[:space:]]+for[[:space:]]+(owner|human)|require[sd]?[[:space:]]+(owner|human)[[:space:]]+(approval|confirmation|decision)|do[[:space:]]+not[[:space:]]+auto[- ]?(queue|assign|dev|start)|manual[- ]?only' \
+    <<<"${cand_title}"$'\n'"${cand_body}"; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" \
+      '{allowed:false, number:$n, title:$t, url:$u, reason:"目标 Issue 明确要求人工/Owner 确认或禁止自动入队"}'
+    return 0
+  fi
+
+  local unresolved_dep=""
+  local dep_line="" dep_tok="" dep_num=""
+  while IFS= read -r dep_line; do
+    dep_line="${dep_line%$'\r'}"
+    [[ "$dep_line" =~ ^[[:space:]]*[-*][[:space:]]*\[[xX]\] ]] && continue
+    if "$GREP_BIN" -iqE '^[[:space:]*>-]*(\[[[:space:]]\][[:space:]]*)?(\*\*)?(depends[[:space:]]+on|blocked[[:space:]]+by|前置依赖|前置单|前置任务|依赖[[:space:]]*Issue|阻塞于)([[:space:]*:：]+|[[:space:]*:：]*#)' <<<"$dep_line"; then
+      while IFS= read -r dep_tok; do
+        dep_num="${dep_tok#\#}"
+        [[ -z "$dep_num" || "$dep_num" == "$cand_num" ]] && continue
+        if "$JQ_BIN" -e --argjson d "$dep_num" 'index($d) != null' <<<"$still_open_nums_json" >/dev/null 2>&1; then
+          unresolved_dep="$dep_num"
+          break
+        fi
+      done < <("$GREP_BIN" -oE '#[0-9]+' <<<"$dep_line" || true)
+      [[ -n "$unresolved_dep" ]] && break
+    fi
+  done <<<"$cand_body"
+  if [[ -n "$unresolved_dep" ]]; then
+    "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" --arg dep "$unresolved_dep" \
+      '{allowed:false, number:$n, title:$t, url:$u, reason:("目标 Issue 仍声明依赖未关闭的 Open Issue #" + $dep)}'
+    return 0
+  fi
+
+  "$JQ_BIN" -cn --argjson n "$cand_num" --arg t "$cand_title" --arg u "$cand_url" \
+    '{allowed:true, number:$n, title:$t, url:$u, reason:""}'
+}
+
 consecutive_poll_errors=0
 idle_announced=0
 ACTIVITY_LOG="${STATE_ROOT}/activity.log"
@@ -1453,16 +1656,12 @@ EOF
     ev_delta_section="- 自 \`${ev_tested_sha:0:10}\` 以来的增量改动统计:"$'\n''```text'$'\n'"${ev_delta_stat}"$'\n''```'
   fi
 
+  open_issues_json="[]"
   open_issues_md="- (未获取到现有 Open Issues)"
-  if _oi_json="$(gh_state list-issues open "" 50 2>/dev/null)" \
+  if _oi_json="$(gh_state list-issues open "" "$OPEN_ISSUES_CONTEXT_LIMIT" 2>/dev/null)" \
     && "$JQ_BIN" -e 'type == "array"' >/dev/null 2>&1 <<<"$_oi_json"; then
-    open_issues_md="$("$JQ_BIN" -r '
-      if length == 0 then
-        "- (当前无 Open Issues)"
-      else
-        [.[] | "- #" + (.number | tostring) + ": " + .title] | join("\n")
-      end
-    ' <<<"$_oi_json")"
+    open_issues_json="$_oi_json"
+    open_issues_md="$(render_open_issues_context "$open_issues_json" "$issue_num" "$pr_num")"
   fi
 
   if [[ "$pr_is_e2e_skipped" != "1" ]]; then
@@ -1514,7 +1713,7 @@ ${mt_base_commits:+$'\n'"- 目标分支 \`origin/${base_branch}\` 自公共祖�
 ## 关联 Issue 要求
 ${issue_section}
 
-## 当前仓库已有 Open Issues（用于后续追踪去重，严禁重复建单）
+## 当前仓库已有 Open Issues（含标签与正文摘要，用于后续追踪去重及合并后依赖解除入队研判）
 ${open_issues_md}
 
 ## 远端 QA 证据核对结果（分支 \`${E2E_EVIDENCE_BRANCH}\` @ \`${ev_branch_sha:0:10}\`）
@@ -1584,6 +1783,15 @@ ${pr_diff_snippet:-"(空 diff)"}
    - **应建单**：终审发现的真实既有隐患（例如 PR 未修改文件中的历史缺陷）、明确延后的功能/安全/可靠性/测试覆盖缺口，且具备明确代码定位与验收标准，且**未在上方 Open Issues 列表中重复存在**。
    - **严禁建单**（仅保留在 \`non_blocking_notes\`）：过程性执行记录（重试、清理日志、手动 CI 工作流说明、单测数量来源说明）、已合入 PR 的历史分支命名等琐碎事项、或已有 Open Issue 追踪的问题。
    - 最多输出 ${MAX_FOLLOWUP_ISSUES} 条；每条需提供简短英文唯一标识 \`slug\`（如 \`pg-zero-column-snapshot\`）、清晰中文 \`title\`、\`priority\`（\`P1\` / \`P2\` / \`P3\`）、简明 \`reason\` 与完整可执行的 Markdown \`body\`（含问题证据、建议改动范围与验收标准）；无必要建单时必须输出 \`[]\`。
+5.2 **合并后评估需添加 \`${LABEL_PREFIX}todo\` 入队的既有 Open Issue（\`queue_next_issues\`）**：
+   - 仅当 \`verdict == "merge"\` 时评估（其他结论固定输出 \`[]\`）；宿主机仅在实际合并成功后执行硬门禁校验并打标。
+   - **应推荐入队**：结合上方 Open Issues 列表（标签与正文摘要），找出明确依赖当前合入 Issue（\`#${issue_num:-无}\`）/ PR（\`#${pr_num}\`）且在本次合入后全部前置依赖均已满足的下游 Open Issue，或同系列/阶段中紧邻下一顺位且已具备明确验收标准的既有 Open Issue。
+   - **严禁推荐入队**：
+     - 仍依赖其他未关闭 Open Issue 的单；
+     - 已带有任何 \`${LABEL_PREFIX}*\` 状态标签、入队别名标签（\`${TODO_ALIAS_LABELS}\`）或人工/阻塞类标签（如 \`hold\`、\`blocked\`、\`needs-human\`、\`wontfix\`）的单；
+     - 明确要求人工/Owner 先行确认、决策、暂缓或禁止自动入队的单，或含 \`<!-- gongcao-release -->\` 的发版追踪单；
+     - 本次刚生成的 \`follow_up_issues\`，或与当前交付无明确依赖/衔接关系的无关 backlog 单（宁缺毋滥，无合适单时输出 \`[]\`）。
+   - 最多输出 ${MAX_QUEUED_NEXT_ISSUES} 条，按建议执行顺序排列；每条给出正整数 \`issue_number\` 与简明中文 \`reason\`。
 6. 最终输出必须严格符合 JSON Schema。
 EOF
 
@@ -1896,6 +2104,111 @@ EOF
     fi
   fi
 
+  # 仅在 PR 成功合并且开启自动入队时，按终审研判 + 宿主机硬门禁为已解除依赖/就绪的既有 Open Issue 添加 agy:todo
+  queued_next_md=""
+  skipped_next_md=""
+  queued_next_json="[]"
+  if [[ "$AUTO_QUEUE_NEXT_ISSUES" == "1" ]] && (( merged_ok == 1 )); then
+    max_qn=0
+    [[ "$MAX_QUEUED_NEXT_ISSUES" =~ ^[0-9]+$ ]] && max_qn="$MAX_QUEUED_NEXT_ISSUES"
+    still_open_nums_json="$("$JQ_BIN" -c \
+      --arg cur_issue "${issue_num:-}" \
+      --arg rel_issue "${release_issue:-}" '
+      [
+        .[]?.number | tonumber? | select(. != null)
+        | select(($cur_issue == "") or ($rel_issue != "") or ((tostring) != $cur_issue))
+      ] | unique
+    ' <<<"$open_issues_json")"
+    qn_total="$("$JQ_BIN" -r '(.queue_next_issues // []) | length' "$decision_file")"
+    qn_inspect_limit=$(( max_qn * 5 ))
+    (( qn_inspect_limit < 20 )) && qn_inspect_limit=20
+    (( qn_total > qn_inspect_limit )) && qn_total="$qn_inspect_limit"
+    qn_queued_count=0
+    qn_seen_csv=","
+    for (( idx = 0; idx < qn_total; idx++ )); do
+      qn_num="$("$JQ_BIN" -r --argjson i "$idx" '(.queue_next_issues[$i].issue_number // "") | tostring' "$decision_file")"
+      qn_reason="$("$JQ_BIN" -r --argjson i "$idx" '(.queue_next_issues[$i].reason // "")' "$decision_file")"
+      [[ -z "$qn_num" ]] && continue
+      [[ "$qn_seen_csv" == *",${qn_num},"* ]] && continue
+      qn_seen_csv+="${qn_num},"
+
+      if (( max_qn <= 0 || qn_queued_count >= max_qn )); then
+        skip_reason="已达单次自动入队上限（MAX_QUEUED_NEXT_ISSUES=${max_qn}）"
+        skipped_next_md+="- #${qn_num}（未入队：${skip_reason}）"$'\n'
+        queued_next_json="$("$JQ_BIN" -c \
+          --arg num "$qn_num" \
+          --arg reason "$qn_reason" \
+          --arg skip_reason "$skip_reason" \
+          '. + [{number: ($num | tonumber? // $num), title: "", url: "", label: "", reason: $reason, status: "skipped", skip_reason: $skip_reason}]' \
+          <<<"$queued_next_json")"
+        continue
+      fi
+
+      qn_eval_json="$(evaluate_queue_next_issue "$qn_num" "$issue_num" "$release_issue" "$created_followups_json" "$still_open_nums_json")"
+      qn_allowed="$("$JQ_BIN" -r '.allowed' <<<"$qn_eval_json")"
+      qn_title="$("$JQ_BIN" -r '.title // ""' <<<"$qn_eval_json")"
+      qn_url="$("$JQ_BIN" -r '.url // ""' <<<"$qn_eval_json")"
+      qn_guard_reason="$("$JQ_BIN" -r '.reason // ""' <<<"$qn_eval_json")"
+
+      if [[ "$qn_allowed" != "true" ]]; then
+        skipped_next_md+="- #${qn_num}${qn_title:+ ${qn_title}}（未入队：${qn_guard_reason}）"$'\n'
+        queued_next_json="$("$JQ_BIN" -c \
+          --arg num "$qn_num" \
+          --arg title "$qn_title" \
+          --arg url "$qn_url" \
+          --arg reason "$qn_reason" \
+          --arg skip_reason "$qn_guard_reason" \
+          '. + [{number: ($num | tonumber? // $num), title: $title, url: $url, label: "", reason: $reason, status: "skipped", skip_reason: $skip_reason}]' \
+          <<<"$queued_next_json")"
+        continue
+      fi
+
+      qn_comment_md="$("$CAT_BIN" <<EOF
+### Final Gate 自动入队说明
+
+- 前置 PR #${pr_num}（关联 Issue #${issue_num:-无}，Commit \`${head_sha:0:10}\`）已合入。
+- 经终审门禁研判与宿主机校验，本 Issue 已具备进入开发队列条件，已添加 \`${LABEL_PREFIX}todo\` 标签。
+- 入队依据：${qn_reason:-"前置依赖已合入"}
+EOF
+)"
+      # 先写说明评论再打入队标签，避免 dev loop 抢在评论落盘前认领任务
+      printf '%s\n' "$qn_comment_md" | gh_state comment issue "$qn_num" - "$AUTO_QUEUE_COMMENT_MARKER" || true
+      if gh_state set-state issue "$qn_num" todo; then
+        qn_queued_count=$((qn_queued_count + 1))
+        qn_status="queued"
+        [[ "$DRY_RUN" == "1" ]] && qn_status="dry-run"
+        queued_next_md+="- #${qn_num}${qn_title:+ ${qn_title}}${qn_url:+ (${qn_url})} -> \`${LABEL_PREFIX}todo\`（${qn_reason:-"前置依赖已合入"}） — \`${qn_status}\`"$'\n'
+        queued_next_json="$("$JQ_BIN" -c \
+          --arg num "$qn_num" \
+          --arg title "$qn_title" \
+          --arg url "$qn_url" \
+          --arg label "${LABEL_PREFIX}todo" \
+          --arg reason "$qn_reason" \
+          --arg status "$qn_status" \
+          '. + [{number: ($num | tonumber? // $num), title: $title, url: $url, label: $label, reason: $reason, status: $status}]' \
+          <<<"$queued_next_json")"
+      else
+        fail_reason="调用 gh-state set-state issue ${qn_num} todo 失败"
+        skipped_next_md+="- #${qn_num}${qn_title:+ ${qn_title}}（打标失败：${fail_reason}）"$'\n'
+        queued_next_json="$("$JQ_BIN" -c \
+          --arg num "$qn_num" \
+          --arg title "$qn_title" \
+          --arg url "$qn_url" \
+          --arg reason "$qn_reason" \
+          --arg skip_reason "$fail_reason" \
+          '. + [{number: ($num | tonumber? // $num), title: $title, url: $url, label: "", reason: $reason, status: "failed", skip_reason: $skip_reason}]' \
+          <<<"$queued_next_json")"
+      fi
+    done
+
+    if [[ -n "$queued_next_md" ]]; then
+      extra_notice+=$'\n\n'"#### 自动入队的下游/既有 Open Issue（由 Final Gate 添加 \`${LABEL_PREFIX}todo\`）"$'\n'"${queued_next_md%$'\n'}"
+    fi
+    if [[ -n "$skipped_next_md" ]]; then
+      extra_notice+=$'\n\n'"#### 未自动入队的候选 Issue（宿主机硬门禁拦截）"$'\n'"${skipped_next_md%$'\n'}"
+    fi
+  fi
+
   final_md="$(render_final_gate_markdown "$decision_file" "$pr_num" "$issue_num" "$head_sha" "$current_round" "$final_action" "$ev_web_url" "$effective_merge_method" "$cycle_round")${extra_notice}"
   printf '%s\n' "$final_md" > "$comment_file"
 
@@ -1951,6 +2264,7 @@ EOF
     --arg final_state "$final_state" \
     --argjson merged "$merged_ok" \
     --argjson follow_up_issues "$created_followups_json" \
+    --argjson queued_next_issues "$queued_next_json" \
     --arg updated_at "$iso_now" \
     '{
       pr_number: $pr_number,
@@ -1971,6 +2285,7 @@ EOF
       final_state: $final_state,
       merged: ($merged == 1),
       follow_up_issues: $follow_up_issues,
+      queued_next_issues: $queued_next_issues,
       updated_at: $updated_at
     }' > "$meta_file"
 

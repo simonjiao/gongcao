@@ -136,8 +136,9 @@ case "$ACTION" in
     [[ -n "${CODEX_REVIEW_HOME:-}" ]] && env_prefix+=" CODEX_REVIEW_HOME=$(printf '%q' "$CODEX_REVIEW_HOME")"
     [[ -n "${AUTO_EVALUATE_ON_MERGE:-}" ]] && env_prefix+=" AUTO_EVALUATE_ON_MERGE=$(printf '%q' "$AUTO_EVALUATE_ON_MERGE")"
     [[ -n "${AUTO_EVALUATE_MODE:-}" ]] && env_prefix+=" AUTO_EVALUATE_MODE=$(printf '%q' "$AUTO_EVALUATE_MODE")"
+    [[ -n "${TODO_ALIAS_LABELS:-}" ]] && env_prefix+=" TODO_ALIAS_LABELS=$(printf '%q' "$TODO_ALIAS_LABELS")"
     final_env_prefix="$env_prefix"
-    for name in AUTO_MERGE REQUIRE_OWNER_MERGE_APPROVAL MERGE_APPROVERS HOLD_MERGE_LABEL; do
+    for name in AUTO_MERGE REQUIRE_OWNER_MERGE_APPROVAL MERGE_APPROVERS HOLD_MERGE_LABEL AUTO_QUEUE_NEXT_ISSUES MAX_QUEUED_NEXT_ISSUES; do
       if [[ -n "${!name:-}" ]]; then
         final_env_prefix+=" ${name}=$(printf '%q' "${!name}")"
       fi
