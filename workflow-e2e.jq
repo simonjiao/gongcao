@@ -63,7 +63,9 @@ def missing_e2e_checks($checks; $files; $root; $plan):
       | [$scenarios[] | select(.id == $id)] as $matches
       | select(($matches | length) != 1 or (
           $matches[0] | (
-            .status == "passed" and (.details | nonblank)
+            .status == "passed"
+            and (.details | nonblank)
+            and (.details | test("^\\s*(NOT_RUN|未执行)\\b") | not)
             and (.evidence_paths | type == "array" and length > 0 and all(
               resolve_artifact_path($root; $files) as $norm
               | $norm != null and ($reported | index($norm)) != null

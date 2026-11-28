@@ -264,10 +264,18 @@ write_review_schema() {
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["requirement", "status", "evidence"],
+        "required": ["id", "requirement", "status", "requires_real_e2e", "disposition", "e2e_plan_ids", "waiver_ref", "evidence"],
         "properties": {
+          "id": { "type": "string" },
           "requirement": { "type": "string" },
           "status": { "type": "string", "enum": ["met", "partial", "missing"] },
+          "requires_real_e2e": { "type": "boolean" },
+          "disposition": {
+            "type": "string",
+            "enum": ["verified_evidence", "scheduled_e2e", "owner_waived", "open_blocker"]
+          },
+          "e2e_plan_ids": { "type": "array", "items": { "type": "string" } },
+          "waiver_ref": { "type": "string" },
           "evidence": { "type": "string" }
         }
       }
@@ -355,7 +363,7 @@ inspect_prior_e2e_evidence() {
   local delta_commits=""
   local best_dir=""
 
-  if [[ -e "${ev_wt}/.git" ]]; then
+  if "$GIT_BIN" -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/${E2E_EVIDENCE_BRANCH}" && [[ -e "${ev_wt}/.git" ]]; then
     branch_sha="$("$GIT_BIN" -C "$ev_wt" rev-parse HEAD 2>/dev/null || true)"
     local mf entry_dir entry_verdict rj_verdict best_ts="" entry_ts=""
 
@@ -506,8 +514,20 @@ render_review_markdown() {
     + "#### 总结\n" + .summary + "\n\n"
     + "#### Issue 要求覆盖核查\n"
     + (if (.requirements_coverage | length) > 0 then
-        "| 要求 | 状态 | 证据 |\n| --- | --- | --- |\n"
-        + ([.requirements_coverage[] | "| " + (.requirement | esc) + " | `" + .status + "` | " + (.evidence | esc) + " |"] | join("\n"))
+        "| 编号 | 要求 | 状态 | 需实测 | 放行去向 | 证据 / 依据 |\n| --- | --- | --- | --- | --- | --- |\n"
+        + ([.requirements_coverage[] |
+            "| `" + ((.id // "-") | esc) + "`"
+            + " | " + (.requirement | esc)
+            + " | `" + .status + "`"
+            + " | `" + (if .requires_real_e2e == true then "true" else "false" end) + "`"
+            + " | " + (
+                if (.disposition // "") == "scheduled_e2e" then "`scheduled_e2e` (" + (((.e2e_plan_ids // []) | join(", ")) | esc) + ")"
+                elif (.disposition // "") == "owner_waived" then "`owner_waived` (" + ((.waiver_ref // "") | esc) + ")"
+                elif (.disposition // "") != "" then "`" + (.disposition | esc) + "`"
+                else "-" end
+              )
+            + " | " + (.evidence | esc) + " |"
+          ] | join("\n"))
       else
         "- (无逐项记录)"
       end)
@@ -1056,6 +1076,11 @@ ${pr_diff_snippet:-"(空 diff)"}
    - **严禁“防御套娃”与移动球门**：当上一轮阻塞项已实质关闭、且原始 Issue 核心验收标准已满足时，**禁止针对开发按上一轮意见新增的降级/错误/防御代码继续深挖二阶、三阶极端边界并追加新的 \`blocking_issues\`**。此类有价值的次生发现一律写入 \`non_blocking_notes\`（终审合入时可自动建后续追踪 Issue）并给出 \`verdict: "approve"\`，让 PR 进入真实 E2E 验收。
    - **终轮务实放行**：若已处于最后一轮总评审（\`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`）或本轮再无进展即触发停滞暂停（\`prev_stalled_rounds + 1 >= MAX_STALLED_REVIEW_ROUNDS\`），且 Issue 核心验收已满足、契约授权已确认、无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
+   - **必验条款编号与放行去向门禁（\`requirements_coverage\` 与 \`e2e_plan\` 强对应）**：为 Issue 中的每条核心功能与必验条款分配稳定编号 \`id\`（优先沿用 Issue 正文中的显式编号如 \`REQ-VIEWER-E2E\`，否则按顺序编为 \`R1\`、\`R2\`…），并如实标注 \`requires_real_e2e\`（凡明确要求真实浏览器/真实登录/多账号/真实引擎验收的条款必须为 \`true\`）。放行（\`verdict: "approve"\`）前，**每条条款都必须有明确且可核验的 \`disposition\` 去向**，宿主机将硬性拦截遗漏：
+     - \`verified_evidence\`：当前检出已有充分证据证明满足；**对于 \`requires_real_e2e: true\` 的条款，仅当已有作为当前提交祖先的通过 E2E 证据（\`prior_e2e_has_pass=true\` 且 \`is_ancestor=true\`）时才可用 \`verified_evidence\`，禁止用单测/MockMvc 替代真实登录或真实浏览器验收**；
+     - \`scheduled_e2e\`：已排入本轮可执行的 \`e2e_plan\` 场景，\`e2e_plan_ids\` 非空且每一项 ID 均存在于 \`e2e_plan\`，同时 \`e2e_decision\` 必须为 \`run_e2e\`；
+     - \`owner_waived\`：Issue 正文或 PR 评论中存在明确的 Owner 免测/收窄批准，\`waiver_ref\` 写明具体批准依据；
+     - \`open_blocker\`：尚未满足且未排入可执行计划，此时**只能输出 \`request_changes\`**（禁止对仍为 \`partial\`/\`missing\` 且未排入 \`e2e_plan\` 也无 Owner 免测批准的条款输出 \`approve\`，也禁止在 \`e2e_checks\` 中擅自将未获豁免的必验条款写为 \`NOT_RUN\`）。
    - 按根因归并阻塞项，填写唯一且稳定的 \`id\`（小写字母、数字和连字符），并用 \`verification\` 写出覆盖该根因的可验证关闭条件。**每条 \`verification\` 必须写清「前置状态/边界输入 → 操作/触发条件 → 可观测预期结果（含成功与失败退出的清理/恢复路径）」**：例如同时写清“无可信凭证时锁定且不重提”与“取得唯一凭证后解锁并展示来源明确的时间”，或写清“从 \`enable_audit_plugin=false\` 起测，临时启用、取得唯一凭证，并在独立预检/完整入口/探针失败退出时均恢复原值”。关闭条件约束在可观测契约与测试边界层面，不硬编码内部方法名，避免后续复审再补球门。先与本 PR 历次评审的根因对照；同一根因跨评审周期沿用原 ID，新出现的类型、测试输入、调用方或文件位置作为该项的证据。
    - **上一轮阻塞项显式处置（\`previous_blocker_dispositions\`）**：首轮（本周期第 1 轮）填 \`[]\`；第 2 轮及以上复审时，**必须为上一轮每一个阻塞 \`id\` 逐项填写 \`status\`（\`closed\` 或 \`open\`）和基于当前只读工作树实测/代码核验的 \`evidence\`**。标 \`closed\` 时不得再将该 \`id\` 列入本轮 \`blocking_issues\`（严禁通过给旧阻塞改新 ID 来制造伪关闭）；标 \`open\` 时须在本轮 \`blocking_issues\` 中沿用原 \`id\`；给出 \`approve\` 时上一轮所有阻塞 \`id\` 均须显式标为 \`closed\`。
    - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件（含账号、权限、数据与服务如何准备，且确认候选版本支持）、操作和预期结果；同时在 \`e2e_plan\` 中为每条必验场景逐项填写结构化前置计划（\`id\` 如 \`E1\`、\`scenario\` 与对应场景一致、\`capability_basis\` 候选版本实际能力依据、\`entrypoint\` 维护 QA 入口或命令、\`preflight_hint\` 轻量预检方法、\`preserve_first_run\` 是否要求保留首跑原始产物不被复跑覆盖）。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。**严禁将上轮 E2E 报告中偶发或外部桌面/OS 环境故障现场（原始 Issue 未要求的条件）倒灌改写为新的 \`e2e_checks\` 前置条件**；复审沿用既有基线，仅在收到 E2E \`return_to_review\` 交接或关联 Issue 正文已更新时才允许变更 \`e2e_checks\`。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时 \`e2e_checks\` 与 \`e2e_plan\` 均填 \`[]\`。
@@ -1097,7 +1122,10 @@ EOF
   codex_ok=0
   codex_rc=0
   if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$ENV_BIN" "TMPDIR=${review_tmpdir}" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
-    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" --argjson prev_ids "$prev_blocker_ids_json" '
+    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" \
+      --argjson prev_ids "$prev_blocker_ids_json" \
+      --arg prior_pass "$prior_e2e_has_pass" \
+      --arg prior_anc "$prior_e2e_is_ancestor" '
       include "workflow-e2e";
       def valid_plan:
         if . == null then true
@@ -1124,13 +1152,54 @@ EOF
             )
           ))
         end;
+      def valid_requirements($v; $e2e_dec; $plan_ids):
+        if type != "array" then false
+        elif length == 0 then true
+        else
+          ($prior_pass == "true" and $prior_anc == "true") as $has_prior_e2e
+          | all(type == "object" and (.requirement | nonblank) and (.status == "met" or .status == "partial" or .status == "missing") and (.evidence | type == "string"))
+          and (
+            if $v != "approve" then true
+            else
+              all(. as $r |
+                $r.status != "missing"
+                and (
+                  if ($r | has("disposition")) then
+                    ($r.id | nonblank)
+                    and ($r.requires_real_e2e | type == "boolean")
+                    and ($r.disposition == "verified_evidence" or $r.disposition == "scheduled_e2e" or $r.disposition == "owner_waived")
+                    and (
+                      if $r.disposition == "scheduled_e2e" then
+                        ($e2e_dec == "run_e2e")
+                        and (($r.e2e_plan_ids | type == "array") and ($r.e2e_plan_ids | length > 0))
+                        and ($r.e2e_plan_ids | all(. as $pid | ($plan_ids | index($pid) != null)))
+                      elif $r.disposition == "owner_waived" then
+                        ($r.waiver_ref | nonblank)
+                      else
+                        # verified_evidence: partial 不可凭空放行；要求真实 E2E 的条款无既往通过 E2E 不可仅凭单测放行
+                        ($r.status == "met")
+                        and (($r.requires_real_e2e | not) or $has_prior_e2e)
+                      end
+                    )
+                  else
+                    # 兼容无 disposition 旧格式：partial 在无 e2e_plan 时禁止 approve
+                    ($r.status == "met") or (($e2e_dec == "run_e2e") and (($plan_ids | length) > 0))
+                  end
+                )
+              )
+            end
+          )
+        end;
       ([.blocking_issues[].id] | unique) as $curr_ids
+      | ([(.e2e_plan // [])[] | .id // empty] | unique) as $plan_ids
       | .verdict as $verdict
+      | .e2e_decision as $e2e_dec
       | (.blocking_issues | type == "array")
       and (.e2e_checks | valid_e2e_checks)
       and (.e2e_plan | valid_plan)
       and (.e2e_plan == null or ((.e2e_plan | length) == (.e2e_checks | length)))
       and (.previous_blocker_dispositions | valid_dispositions($curr_ids; $verdict))
+      and (.requirements_coverage | valid_requirements($verdict; $e2e_dec; $plan_ids))
       and (.requires_human_decision | type == "boolean")
       and ([.blocking_issues[].id] | all(type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and length == (unique | length))
       and (.blocking_issues | all(.verification | nonblank))

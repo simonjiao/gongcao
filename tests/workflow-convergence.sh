@@ -904,4 +904,75 @@ E2E_ROOT="$lease_e2e" E2E_CLEANUP_CMD='echo "still failing"; exit 1' run_loop e2
 assert_calls "$((before_lease_e2e + 1))" codex-e2e
 rm -f "$fixture/issue.json"
 
+# 17. 必验条款编号与 E2E 计划强对应门禁（复现 #479 / PR #491 漏网路径）
+# 17a: 查看者条款标为 partial（或 requires_real_e2e=true 却仅以单测/MockMvc 充当 verified_evidence，或 scheduled_e2e 未映射到 e2e_plan）时，宿主机拦截 approve
+req_rev="$fixture/reviews-req-gate"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"Fixture", body:"Closes #42 必验条款门禁", url:"https://example.invalid/pull/7",
+  headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", updatedAt:"req-gate-1"}]' > "$fixture/pr.json"
+jq -n '{title:"双账号查看者验收", body:"[REQ-VIEWER-E2E] 查看者用独立 Edge Guest 登录，可读不可写且 POST 返回 403", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+
+before_req_app="$(grep -Fxc -- 'set-state pr 7 approved' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"approve", summary:"遗漏查看者场景却企图放行", e2e_decision:"run_e2e", e2e_decision_reason:"仅跑编辑场景",
+  e2e_checks:["E1-editor: 编辑账号保存业务信息"],
+  e2e_plan:[{id:"E1", scenario:"E1-editor: 编辑账号保存业务信息", capability_basis:"候选支持编辑登录", entrypoint:"qa/e2e.py run", preflight_hint:"qa/e2e.py preflight", preserve_first_run:false}],
+  previous_blocker_dispositions:[], requires_human_decision:false, blocking_issues:[], non_blocking_notes:[],
+  requirements_coverage:[{
+    id:"REQ-VIEWER-E2E", requirement:"真实查看者只读与 403 写入拒绝", status:"partial",
+    requires_real_e2e:true, disposition:"verified_evidence", e2e_plan_ids:[], waiver_ref:"",
+    evidence:"MockMvc 已覆盖，真实查看者记为 NOT_RUN"
+  }]
+}' > "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test17-none" REVIEWS_ROOT="$req_rev" run_loop review
+assert_calls "$before_req_app" 'set-state pr 7 approved'
+
+# scheduled_e2e 引用了不存在的 e2e_plan ID -> 同样拦截
+jq '.requirements_coverage[0] += {disposition:"scheduled_e2e", e2e_plan_ids:["E9"]}' "$fixture/verdict.json" > "$fixture/verdict-tmp.json"
+mv "$fixture/verdict-tmp.json" "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test17-none" REVIEWS_ROOT="$req_rev" run_loop review
+assert_calls "$before_req_app" 'set-state pr 7 approved'
+
+# requires_real_e2e=true 标为 met + verified_evidence 但无既往通过 E2E -> 同样拦截（不可用单测代替真实登录）
+jq '.requirements_coverage[0] += {status:"met", disposition:"verified_evidence", e2e_plan_ids:[]}' "$fixture/verdict.json" > "$fixture/verdict-tmp.json"
+mv "$fixture/verdict-tmp.json" "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test17-none" REVIEWS_ROOT="$req_rev" run_loop review
+assert_calls "$before_req_app" 'set-state pr 7 approved'
+
+# 17b: 将查看者场景加入 e2e_plan（E2）并在 requirements_coverage 以 scheduled_e2e 映射 E2 -> 允许 approve 进入 E2E
+jq -n '{
+  verdict:"approve", summary:"查看者场景已纳入 E2E 计划", e2e_decision:"run_e2e", e2e_decision_reason:"执行编辑与查看者双账号 E2E",
+  e2e_checks:["E1-editor: 编辑账号保存业务信息", "E2-viewer: 查看者独立 Edge Guest 只读并验证写入 403"],
+  e2e_plan:[
+    {id:"E1", scenario:"E1-editor: 编辑账号保存业务信息", capability_basis:"候选支持编辑登录", entrypoint:"qa/e2e.py run", preflight_hint:"qa/e2e.py preflight", preserve_first_run:false},
+    {id:"E2", scenario:"E2-viewer: 查看者独立 Edge Guest 只读并验证写入 403", capability_basis:"QA 夹具注册临时 VIEWER", entrypoint:"qa/e2e.py run --with-viewer", preflight_hint:"qa/e2e.py preflight --with-viewer", preserve_first_run:false}
+  ],
+  previous_blocker_dispositions:[], requires_human_decision:false, blocking_issues:[], non_blocking_notes:[],
+  requirements_coverage:[{
+    id:"REQ-VIEWER-E2E", requirement:"真实查看者只读与 403 写入拒绝", status:"partial",
+    requires_real_e2e:true, disposition:"scheduled_e2e", e2e_plan_ids:["E2"], waiver_ref:"",
+    evidence:"已排入 E2 真实查看者验收计划"
+  }]
+}' > "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test17-none" REVIEWS_ROOT="$req_rev" run_loop review
+assert_calls "$((before_req_app + 1))" 'set-state pr 7 approved'
+grep -Fq 'REQ-VIEWER-E2E' "$fixture/review-comment" || fail '评审报告未渲染必验条款编号 REQ-VIEWER-E2E'
+grep -Fq '`scheduled_e2e` (E2)' "$fixture/review-comment" || fail '评审报告未渲染 scheduled_e2e (E2) 放行去向'
+
+# 17c: E2E 对查看者场景仍记 NOT_RUN 却输出 verdict=pass -> 宿主机拒绝放行（不转 e2e-passed，强制转 blocked）
+before_nr_pass="$(grep -Fxc -- 'set-state pr 7 e2e-passed' "$fixture/calls" || true)"
+before_nr_blk="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"pass", summary:"编辑通过，查看者未执行", environment:"测试环境", failure_stage:"", reproducible_in_dev_sandbox:true,
+  scenarios:[
+    {id:"E1", name:"E1-editor: 编辑账号保存业务信息", status:"passed", details:"编辑保存通过", evidence_paths:["upgrade.log"]},
+    {id:"E2", name:"E2-viewer: 查看者独立 Edge Guest 只读并验证写入 403", status:"passed", details:"NOT_RUN: 候选环境仅单账号，由 MockMvc 覆盖", evidence_paths:["upgrade.log"]}
+  ],
+  evidence_paths:["upgrade.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$fixture/e2e-viewer-not-run" run_loop e2e
+assert_calls "$before_nr_pass" 'set-state pr 7 e2e-passed'
+assert_calls "$((before_nr_blk + 1))" 'set-state pr 7 blocked'
+grep -Fq '固化到项目维护 QA 入口' "$fixture/last-prompt" || fail 'E2E 提示词未包含可复用 QA 准备交接给 Dev 的规则'
+rm -f "$fixture/issue.json"
+
 printf 'workflow convergence tests passed\n'
