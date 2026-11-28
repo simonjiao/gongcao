@@ -46,6 +46,9 @@ case "$*" in
   'get-comment issue '*'codex-review-comment'*)
     [[ -f "$MOCK_DIR/review-comment.md" ]] && cat "$MOCK_DIR/review-comment.md" || true
     ;;
+  'get-comment issue '*'codex-e2e-comment'*)
+    [[ -f "$MOCK_DIR/e2e-comment.md" ]] && cat "$MOCK_DIR/e2e-comment.md" || true
+    ;;
   'get-comment issue '*)
     ;;
   'list-issues '*'ready-for-agent'*)
@@ -161,6 +164,24 @@ case "$mode" in
       printf '{"status":"completed","summary":"已实现并补测","blocked_reason":"","commit_message":"feat: with tests","branch_name":"feat/test-size-gate","blocker_resolutions":[],"verification_matrix":[],"size_justification":""}\n' > "$out_file"
     else
       printf '{"status":"completed","summary":"已补齐四列表与规模说明","blocked_reason":"","commit_message":"feat: with tests and matrix","branch_name":"feat/test-size-gate","blocker_resolutions":[],"verification_matrix":[{"target":"验证断链状态清理","existing_entry":"frontend/src/foo.test.ts 仅有成功路径","gap":"缺少 401 竞态清理断言","action":"EXTEND","rationale":"少了会漏检会话过期后旧引用残留"}],"size_justification":"401 竞态与多分支清理需 80 行隔离单测；browser-runtime 仅补 10 行归属校验。"}\n' > "$out_file"
+    fi
+    ;;
+  e2e-guard-retry)
+    if (( count == 1 )); then
+      mkdir -p qa
+      printf 'def check_focus():\n    return True\n' > qa/catalog_driver.py
+      printf '{"status":"completed","summary":"已修 QA 驱动","blocked_reason":"","commit_message":"fix(qa): narrow focus check","branch_name":"fix/qa-focus-guard","blocker_resolutions":[],"verification_matrix":[{"target":"验证仅双窗切换阶段核对前台","existing_entry":"qa/catalog_driver.py 原先在登录前校验","gap":"登录前校验阻断清理故障模式","action":"EXTEND","rationale":"少了会导致 before-create 在登录前失败"}],"size_justification":"","e2e_regression_guard":""}\n' > "$out_file"
+    else
+      printf '{"status":"completed","summary":"已修 QA 驱动并确认清理模式不受影响","blocked_reason":"","commit_message":"fix(qa): narrow focus check","branch_name":"fix/qa-focus-guard","blocker_resolutions":[],"verification_matrix":[{"target":"验证仅双窗切换阶段核对前台","existing_entry":"qa/catalog_driver.py 原先在登录前校验","gap":"登录前校验阻断清理故障模式","action":"EXTEND","rationale":"少了会导致 before-create 在登录前失败"}],"size_justification":"","e2e_regression_guard":"前台校验仅作用于双窗复焦步骤，before-create 与 leave-private-input 清理模式不触发登录前前台拦截，已通过 python3 -m py_compile 与单测验证。"}\n' > "$out_file"
+    fi
+    ;;
+  e2e-return-retry)
+    if (( count == 1 )); then
+      printf 'e2e-fix-1\n' >> app.txt
+      printf '{"status":"completed","summary":"补了脚本但忘交证据","blocked_reason":"","commit_message":"fix: qa preflight","branch_name":"feat/e2e-return-check","blocker_resolutions":[],"verification_matrix":[],"size_justification":""}\n' > "$out_file"
+    else
+      printf 'e2e-fix-2\n' >> app.txt
+      printf '{"status":"completed","summary":"已补齐 E2E 退回项关闭证据","blocked_reason":"","commit_message":"fix: qa preflight","branch_name":"feat/e2e-return-check","blocker_resolutions":[{"id":"e1-preflight-gap","precondition_covered":"enable_audit_plugin=false 态","test_or_check":"pytest qa/test_environment.py","result":"passed"}],"verification_matrix":[],"size_justification":""}\n' > "$out_file"
     fi
     ;;
   *)
@@ -548,5 +569,60 @@ bash -euo pipefail -c '
   [[ "$(parse_issue_test_budget "生产约 110–200 行，必要测试 30–75 行")" == "75" ]]
   [[ "$(parse_issue_test_budget "无估算说明")" == "0" ]]
 '
+
+# 14. E2E 返工回归保护门禁：注入上轮 E2E 已通过子场景保护清单，改动 qa/ 缺少 e2e_regression_guard 时自动 resume 补齐
+printf '[]\n' > "$fixture/issues.json"
+jq -n '[{number:21, title:"测试 E2E 回归保护门禁", body:"UNIQUE_ISSUE_21_BODY", url:"https://example.invalid/issues/21", state:"OPEN", labels:[{name:"agy:changes-requested"}]}]' \
+  > "$fixture/changes-issues.json"
+cat > "$fixture/e2e-comment.md" <<'EOF'
+### Codex 独立 E2E 验收报告
+
+| 字段 | 值 |
+| --- | --- |
+| E2E 结论 | `return_to_dev` -> `agy:changes-requested` |
+
+#### 端到端场景结果
+| 场景 | 结果 | 详情 |
+| --- | --- | --- |
+| E1 before-create 与 leave-private-input 清理门禁 | `passed` | 两种故障模式均符合预期 |
+| E2 双窗复焦与点击 | `failed` | 副窗切回主窗超时 |
+EOF
+printf 'e2e-guard-retry' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-args.log"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 21 in-review'
+[[ "$(<"$fixture/codex-count")" == "2" ]] || fail '改动 qa/ 且缺少 e2e_regression_guard 时应触发 1 次原会话补齐'
+grep -Fq 'resume thread-abc-123' "$fixture/codex-args.log" || fail 'E2E 回归保护补齐未续接原会话'
+grep -Fq '上轮 E2E 已通过子场景（只读回归保护清单）' "$fixture/prompt-1.txt" || fail '返工提示词未注入上轮已通过子场景保护清单'
+grep -Fq 'before-create 与 leave-private-input' "$fixture/prompt-1.txt" || fail '返工提示词未列出已通过的清理门禁场景'
+line_e2e_guard="$(grep -n '上轮 E2E 已通过子场景' "$fixture/prompt-1.txt" | head -n 1 | cut -d: -f1)"
+line_issue21_body="$(grep -n 'UNIQUE_ISSUE_21_BODY' "$fixture/prompt-1.txt" | head -n 1 | cut -d: -f1)"
+[[ -n "$line_e2e_guard" && -n "$line_issue21_body" && "$line_e2e_guard" -lt "$line_issue21_body" ]] \
+  || fail "E2E 回归保护清单未置顶于 Issue 正文之前 (guard=$line_e2e_guard, body=$line_issue21_body)"
+grep -Fq 'e2e_regression_guard' "$fixture/prompt-2.txt" || fail '补齐提示词未要求填写 e2e_regression_guard'
+grep -Fq '#### E2E 已通过子场景防回归说明' "$state_dir/sessions/issue-21/summary.md" || fail 'summary 未渲染 E2E 已通过子场景防回归说明'
+rm -f "$fixture/changes-issues.json" "$fixture/e2e-comment.md"
+
+# 15. E2E return_to_dev（codex-e2e-meta）触发 Dev 置顶阻塞清单、blocker_resolutions 强校验与原会话补齐
+printf '[]\n' > "$fixture/issues.json"
+jq -n '[{number:22, title:"测试E2E退回关闭校验", body:"UNIQUE_ISSUE_22_BODY", url:"https://example.invalid/issues/22", state:"OPEN", labels:[{name:"agy:changes-requested"}]}]' \
+  > "$fixture/changes-issues.json"
+cat > "$fixture/review-comment.md" <<'EOF'
+<!-- codex-review-meta:{"head_sha":"abc123","verdict":"approve","e2e_decision":"run_e2e","e2e_reused_sha":"","e2e_checks":["E1"],"blocking_issues":[]} -->
+EOF
+cat > "$fixture/e2e-comment.md" <<'EOF'
+### Codex 独立 E2E 验收报告
+<!-- codex-e2e-meta:{"head_sha":"abc123","verdict":"return_to_dev","final_state":"changes-requested","failure_stage":"preflight","action_items":[{"id":"e1-preflight-gap","title":"缺少预检步骤","closure_criteria":"从 enable_audit_plugin=false 起测并恢复"}]} -->
+EOF
+printf 'e2e-return-retry' > "$fixture/codex-mode"
+printf '0\n' > "$fixture/codex-count"
+: > "$fixture/codex-args.log"
+run_dev_loop codex 2
+assert_calls 1 'set-state issue 22 in-review'
+[[ "$(<"$fixture/codex-count")" == "2" ]] || fail 'E2E 退回缺少 blocker_resolutions 应触发原会话补齐'
+grep -Fq 'e1-preflight-gap' "$fixture/prompt-1.txt" || fail 'E2E 退回未将 action_items 置顶注入 prompt-1'
+grep -Fq 'e1-preflight-gap' "$fixture/prompt-2.txt" || fail 'E2E 退回补齐提示词未指出缺失的 e1-preflight-gap'
+rm -f "$fixture/changes-issues.json" "$fixture/review-comment.md" "$fixture/e2e-comment.md"
 
 printf 'issue loop tests passed\n'

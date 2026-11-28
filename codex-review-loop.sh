@@ -203,6 +203,8 @@ write_review_schema() {
     "e2e_decision",
     "e2e_decision_reason",
     "e2e_checks",
+    "e2e_plan",
+    "previous_blocker_dispositions",
     "requires_human_decision",
     "requirements_coverage",
     "blocking_issues",
@@ -226,6 +228,35 @@ write_review_schema() {
     "e2e_checks": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "e2e_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "scenario", "capability_basis", "entrypoint", "preflight_hint", "preserve_first_run"],
+        "properties": {
+          "id": { "type": "string" },
+          "scenario": { "type": "string" },
+          "capability_basis": { "type": "string" },
+          "entrypoint": { "type": "string" },
+          "preflight_hint": { "type": "string" },
+          "preserve_first_run": { "type": "boolean" }
+        }
+      }
+    },
+    "previous_blocker_dispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["closed", "open"] },
+          "evidence": { "type": "string" }
+        }
+      }
     },
     "requires_human_decision": { "type": "boolean" },
     "requirements_coverage": {
@@ -436,6 +467,7 @@ render_review_markdown() {
       e2e_decision: $e2e_decision,
       e2e_reused_sha: $e2e_reused_sha,
       e2e_checks: (.e2e_checks | sort),
+      e2e_plan: (.e2e_plan // []),
       blocking_issues: [(.blocking_issues // [])[] | {id, severity, location, verification}]
     }' "$verdict_file")"
 
@@ -486,9 +518,21 @@ render_review_markdown() {
       else
         "- 无阻塞问题"
       end)
+    + (if ((.previous_blocker_dispositions // []) | length) > 0 then
+        "\n\n#### 上一轮阻塞项逐项处置\n| 阻塞编号 | 状态 | 核验依据 |\n| --- | --- | --- |\n"
+        + ([.previous_blocker_dispositions[] | "| `" + (.id | esc) + "` | `" + (.status | esc) + "` | " + (.evidence | esc) + " |"] | join("\n"))
+      else
+        ""
+      end)
     + (if .e2e_checks | length > 0 then
         "\n\n#### E2E 必验场景\n"
         + (.e2e_checks | sort | numbered_e2e_checks | map("- " + .id + " " + .description) | join("\n"))
+      else
+        ""
+      end)
+    + (if ((.e2e_plan // []) | length) > 0 then
+        "\n\n#### E2E 可执行前置计划\n| ID | 候选能力依据 | 维护入口 | 轻量预检提示 | 保留首跑 |\n| --- | --- | --- | --- | --- |\n"
+        + ([.e2e_plan[] | "| `" + (.id | esc) + "` | " + (.capability_basis | esc) + " | `" + (.entrypoint | esc) + "` | " + (.preflight_hint | esc) + " | `" + (if .preserve_first_run then "true" else "false" end) + "` |"] | join("\n"))
       else
         ""
       end)
@@ -563,6 +607,10 @@ publish_review() {
       }' "$pending_file" >> "${review_dir}/round-history.jsonl" || return 1
       "$JQ_BIN" -r '.meta.consecutive_rejections' "$pending_file" > "${review_dir}/consecutive_rejections.txt" || return 1
       "$JQ_BIN" -r '.meta.stalled_rounds // 0' "$pending_file" > "${review_dir}/stalled_rounds.txt" || return 1
+      if "$JQ_BIN" -e '.update_e2e_baseline == true and (.review.e2e_checks | type == "array") and (.review.e2e_checks | length > 0)' "$pending_file" >/dev/null 2>&1; then
+        "$JQ_BIN" '{issue_body_sha: (.issue_body_sha // ""), e2e_checks: (.review.e2e_checks | sort), updated_at: (.meta.updated_at // "")}' "$pending_file" > "${review_dir}/e2e-checks-baseline.json.tmp" || return 1
+        "$MV_BIN" "${review_dir}/e2e-checks-baseline.json.tmp" "${review_dir}/e2e-checks-baseline.json" || return 1
+      fi
       "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
       printf '%s\n' "$review_key" >> "${review_dir}/reviewed_shas.txt" || return 1
     fi
@@ -804,6 +852,8 @@ EOF
 
   # 查找关联 Issue 原文
   issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
+  issue_body=""
+  issue_body_sha=""
   issue_section="（未识别到关联 Issue，请根据 PR 描述与代码变更进行评审）"
   if [[ -n "$issue_num" ]]; then
     if issue_json="$(gh_state get-issue "$issue_num" 2>/dev/null)"; then
@@ -811,6 +861,9 @@ EOF
       issue_body="$("$JQ_BIN" -r '.body // "(empty)"' <<<"$issue_json")"
       issue_labels="$("$JQ_BIN" -r '([.labels[]?.name] | join(", ")) // "(none)"' <<<"$issue_json")"
       issue_url="$("$JQ_BIN" -r '.url // ""' <<<"$issue_json")"
+      _ib_hash="$(printf '%s' "$issue_body" | "$SHA256SUM_BIN")"
+      issue_body_sha="${_ib_hash%% *}"
+      issue_body_sha="${issue_body_sha:0:16}"
       issue_section="$("$CAT_BIN" <<EOF
 - Issue: #${issue_num} (${issue_url})
 - 标题: ${issue_title}
@@ -849,8 +902,26 @@ EOF
   fi
   prev_e2e_snippet="${prev_e2e_comment:0:8000}"
   e2e_handoff_section=""
+  is_e2e_handoff=0
   if [[ -n "$active_e2e_handoff_token" ]] || [[ "$prev_e2e_comment" == *"<!-- codex-e2e-handoff:${head_sha}:"* ]]; then
+    is_e2e_handoff=1
     e2e_handoff_section=$'\n\n'"## E2E 退回复审交接（请重点核对前置条件与 Issue 范围）"$'\n'"- 本轮由独立 E2E 验收退回复审（同一提交 \`${head_sha:0:10}\`）：E2E 指出上一轮某条必验项依赖候选版本尚未支持的能力。"$'\n'"- 请对照下方「最近一次 E2E 验收评论摘录」与原始 Issue 要求，做出明确裁定："$'\n'"  1. 若现有单测/组件测试已满足对应回归，且真实 E2E 只需保留候选版本支持的核心场景，请调整并收敛 \`e2e_checks\` 后直接 \`approve\`，交回 E2E 继续验收；"$'\n'"  2. 若确认必须实测该场景且仓库系统有可用准备路径，请给出明确可落地的 QA 准备方式（账号/权限/数据/预检/清理），输出 \`request_changes\` 交由 Dev 在同一 PR 补齐可复用 QA 资产；"$'\n'"  3. 若确需产品/Owner 授权或变更系统能力边界，请在 \`request_changes\` 中设 \`requires_human_decision: true\` 并写清待授权项。"
+  fi
+
+  # 读取既有 E2E 必验基线：若 Issue 正文未变更且非 E2E return_to_review 交接，宿主机将锁定既有 e2e_checks 防止把 E2E 故障现场倒灌为新前置条件
+  e2e_baseline_file="${review_dir}/e2e-checks-baseline.json"
+  baseline_e2e_checks="[]"
+  baseline_issue_body_sha=""
+  e2e_baseline_locked=0
+  e2e_baseline_section=""
+  if [[ -s "$e2e_baseline_file" ]] && "$JQ_BIN" -e '(.e2e_checks | type == "array") and (.e2e_checks | length > 0)' "$e2e_baseline_file" >/dev/null 2>&1; then
+    baseline_e2e_checks="$("$JQ_BIN" -c '.e2e_checks | sort' "$e2e_baseline_file")"
+    baseline_issue_body_sha="$("$JQ_BIN" -r '.issue_body_sha // ""' "$e2e_baseline_file")"
+    if (( is_e2e_handoff == 0 )) && [[ "$issue_body_sha" == "$baseline_issue_body_sha" ]]; then
+      e2e_baseline_locked=1
+      _bl_items="$("$JQ_BIN" -r -L "$SCRIPT_DIR" 'include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description' <<<"$baseline_e2e_checks")"
+      e2e_baseline_section=$'\n\n'"## 已锁定 E2E 必验基线（宿主机防漂移保护）"$'\n'"- 本 PR 既往 approve 已确立以下 \`e2e_checks\` 基线，且关联 Issue 正文未发生变更、本轮亦非 E2E \`return_to_review\` 交接。"$'\n'"- **禁止将上轮 E2E 报告中的外部 OS/桌面故障现场（如特定宿主机前台窗口状态、RDP 桌面环境异常等原始 Issue 未要求的条件）倒灌扩写进 \`e2e_checks\`**；若本轮 approve 且仍需 \`run_e2e\`，宿主机将自动沿用下方既有基线（除非走有效 \`skip_already_passed\` / \`skip_not_needed\`）："$'\n'"${_bl_items}"
+    fi
   fi
 
   review_diff_metrics_json="$(compute_diff_metrics "$GIT_BIN" "$JQ_BIN" "$review_wt" "origin/${base_branch}" HEAD)"
@@ -935,7 +1006,7 @@ EOF
 ${pr_body:-"(empty)"}
 
 ## 关联 Issue 要求
-${issue_section}${e2e_handoff_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
+${issue_section}${e2e_handoff_section}${e2e_baseline_section}${prev_review_section}${blocker_history_section}${rereview_delta_section}
 
 ## 变更规模与测试/QA 复核信号（宿主机实测）
 ${review_metrics_md}
@@ -986,7 +1057,8 @@ ${pr_diff_snippet:-"(空 diff)"}
    - **终轮务实放行**：若已处于最后一轮总评审（\`current_round >= MAX_TOTAL_REVIEW_ROUNDS\`）或本轮再无进展即触发停滞暂停（\`prev_stalled_rounds + 1 >= MAX_STALLED_REVIEW_ROUNDS\`），且 Issue 核心验收已满足、契约授权已确认、无真实崩溃或核心数据损坏，应果断 \`approve\` 放行进入 E2E。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
    - 按根因归并阻塞项，填写唯一且稳定的 \`id\`（小写字母、数字和连字符），并用 \`verification\` 写出覆盖该根因的可验证关闭条件。**每条 \`verification\` 必须写清「前置状态/边界输入 → 操作/触发条件 → 可观测预期结果（含成功与失败退出的清理/恢复路径）」**：例如同时写清“无可信凭证时锁定且不重提”与“取得唯一凭证后解锁并展示来源明确的时间”，或写清“从 \`enable_audit_plugin=false\` 起测，临时启用、取得唯一凭证，并在独立预检/完整入口/探针失败退出时均恢复原值”。关闭条件约束在可观测契约与测试边界层面，不硬编码内部方法名，避免后续复审再补球门。先与本 PR 历次评审的根因对照；同一根因跨评审周期沿用原 ID，新出现的类型、测试输入、调用方或文件位置作为该项的证据。
-   - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件（含账号、权限、数据与服务如何准备，且确认候选版本支持）、操作和预期结果。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时填写空数组。
+   - **上一轮阻塞项显式处置（\`previous_blocker_dispositions\`）**：首轮（本周期第 1 轮）填 \`[]\`；第 2 轮及以上复审时，**必须为上一轮每一个阻塞 \`id\` 逐项填写 \`status\`（\`closed\` 或 \`open\`）和基于当前只读工作树实测/代码核验的 \`evidence\`**。标 \`closed\` 时不得再将该 \`id\` 列入本轮 \`blocking_issues\`（严禁通过给旧阻塞改新 ID 来制造伪关闭）；标 \`open\` 时须在本轮 \`blocking_issues\` 中沿用原 \`id\`；给出 \`approve\` 时上一轮所有阻塞 \`id\` 均须显式标为 \`closed\`。
+   - 通过评审时，用 \`e2e_checks\` 列出本次按 Issue 和现有契约必须实测的场景。每项用一行写清前置条件（含账号、权限、数据与服务如何准备，且确认候选版本支持）、操作和预期结果；同时在 \`e2e_plan\` 中为每条必验场景逐项填写结构化前置计划（\`id\` 如 \`E1\`、\`scenario\` 与对应场景一致、\`capability_basis\` 候选版本实际能力依据、\`entrypoint\` 维护 QA 入口或命令、\`preflight_hint\` 轻量预检方法、\`preserve_first_run\` 是否要求保留首跑原始产物不被复跑覆盖）。例如，涉及延续已有数据或运行进度的改动，应说明如何基于真实的已有状态验收。**严禁将上轮 E2E 报告中偶发或外部桌面/OS 环境故障现场（原始 Issue 未要求的条件）倒灌改写为新的 \`e2e_checks\` 前置条件**；复审沿用既有基线，仅在收到 E2E \`return_to_review\` 交接或关联 Issue 正文已更新时才允许变更 \`e2e_checks\`。存在必验场景时使用 \`run_e2e\`。无额外必验场景或要求修改时 \`e2e_checks\` 与 \`e2e_plan\` 均填 \`[]\`。
 EOF
 
   round_effort="$CODEX_REASONING_EFFORT"
@@ -1017,18 +1089,52 @@ EOF
   fi
   codex_args+=(-)
 
+  prev_blocker_ids_json='[]'
+  if (( cycle_round >= 2 )) && [[ -n "$prev_verdict_file" && -s "$prev_verdict_file" ]]; then
+    prev_blocker_ids_json="$("$JQ_BIN" -c '[(.blocking_issues // [])[].id] | unique' "$prev_verdict_file" 2>/dev/null || printf '[]')"
+  fi
+
   codex_ok=0
   codex_rc=0
   if "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "$CODEX_TIMEOUT" "$ENV_BIN" "TMPDIR=${review_tmpdir}" "${CODEX_CMD[@]}" "${codex_args[@]}" < "$prompt_file" > "$events_file"; then
-    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" '
+    if [[ -s "$verdict_file" ]] && "$JQ_BIN" -e -L "$SCRIPT_DIR" --argjson prev_ids "$prev_blocker_ids_json" '
       include "workflow-e2e";
-      (.blocking_issues | type == "array")
+      def valid_plan:
+        if . == null then true
+        elif type == "array" then
+          all(type == "object"
+            and (.id | nonblank) and (.scenario | nonblank)
+            and (.capability_basis | nonblank) and (.entrypoint | nonblank)
+            and (.preflight_hint | nonblank) and (.preserve_first_run | type == "boolean"))
+        else false end;
+      def valid_dispositions($curr_ids; $v):
+        if . == null then true
+        elif type != "array" then false
+        elif ($prev_ids | length) == 0 then true
+        else
+          . as $disp
+          | ($disp | all(type == "object" and (.id | nonblank) and (.status == "closed" or .status == "open") and (.evidence | type == "string")))
+          and (($disp | map(.id) | length) == ($disp | map(.id) | unique | length))
+          and ($prev_ids | all(. as $pid |
+            ([$disp[] | select(.id == $pid)] | first) as $d
+            | $d != null
+            and (
+              ($d.status == "closed" and ($d.evidence | nonblank) and ($curr_ids | index($pid) == null))
+              or ($v != "approve" and $d.status == "open" and ($curr_ids | index($pid) != null))
+            )
+          ))
+        end;
+      ([.blocking_issues[].id] | unique) as $curr_ids
+      | (.blocking_issues | type == "array")
       and (.e2e_checks | valid_e2e_checks)
+      and (.e2e_plan | valid_plan)
+      and (.e2e_plan == null or ((.e2e_plan | length) == (.e2e_checks | length)))
+      and (.previous_blocker_dispositions | valid_dispositions($curr_ids; .verdict))
       and (.requires_human_decision | type == "boolean")
       and ([.blocking_issues[].id] | all(type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and length == (unique | length))
       and (.blocking_issues | all(.verification | nonblank))
       and ((.verdict == "approve" and (.requires_human_decision | not) and (.blocking_issues | length == 0))
-        or (.verdict == "request_changes" and (.blocking_issues | length > 0) and (.e2e_checks | length == 0)))
+        or (.verdict == "request_changes" and (.blocking_issues | length > 0) and (.e2e_checks | length == 0) and ((.e2e_plan // []) | length == 0)))
     ' "$verdict_file" >/dev/null 2>&1; then
       codex_ok=1
     fi
@@ -1064,10 +1170,34 @@ EOF
   new_consecutive_rejections=0
   new_stalled_rounds=0
   closed_prev_blockers_json='[]'
+  update_e2e_baseline=0
   if [[ "$verdict" == "approve" ]]; then
     new_consecutive_rejections=0
     new_stalled_rounds=0
     effective_e2e_decision="$raw_e2e_decision"
+    # 宿主机 e2e_checks 基线防漂移门禁：
+    # 若已有批准基线、关联 Issue 正文未更新且非 E2E return_to_review 交接，
+    # 除非满足有效的免测路由（skip_not_needed 或通过祖先校验的 skip_already_passed），否则宿主机强制沿用既有基线，阻止复审将上轮 E2E 环境故障倒灌进必验项。
+    valid_skip_bypass=0
+    if [[ "$ALLOW_SKIP_E2E" == "1" ]] && "$JQ_BIN" -e '(.e2e_checks | length) == 0' "$verdict_file" >/dev/null 2>&1; then
+      if [[ "$effective_e2e_decision" == "skip_not_needed" ]]; then
+        valid_skip_bypass=1
+      elif [[ "$effective_e2e_decision" == "skip_already_passed" && "$prior_e2e_has_pass" == "true" && "$prior_e2e_is_ancestor" == "true" && -n "$prior_e2e_sha" ]]; then
+        valid_skip_bypass=1
+      fi
+    fi
+
+    if (( e2e_baseline_locked == 1 && valid_skip_bypass == 0 )); then
+      cur_sorted_checks="$("$JQ_BIN" -c '.e2e_checks | sort' "$verdict_file")"
+      if [[ "$cur_sorted_checks" != "$baseline_e2e_checks" ]]; then
+        "$JQ_BIN" --argjson base "$baseline_e2e_checks" '.e2e_checks = $base' "$verdict_file" > "${verdict_file}.tmp"
+        "$MV_BIN" "${verdict_file}.tmp" "$verdict_file"
+        extra_notice+=$'\n\n'"> 🔒 宿主机 \`e2e_checks\` 防漂移保护：关联 Issue 正文未更新且非 E2E \`return_to_review\` 交接，已忽略本轮复审对必验项的改写/扩写并继续沿用既往批准基线。"
+      fi
+    elif "$JQ_BIN" -e '(.e2e_checks | length) > 0' "$verdict_file" >/dev/null 2>&1; then
+      update_e2e_baseline=1
+    fi
+
     if "$JQ_BIN" -e '.e2e_checks | length > 0' "$verdict_file" >/dev/null; then
       effective_e2e_decision="run_e2e"
       e2e_downgrade_note="（本轮评审列出必验场景）"
@@ -1093,7 +1223,13 @@ EOF
       progress_json="$("$JQ_BIN" -n --slurpfile prev "$prev_verdict_file" --slurpfile curr "$verdict_file" '
         ([($prev[0].blocking_issues // [])[].id] | unique) as $p
         | ([($curr[0].blocking_issues // [])[].id] | unique) as $c
-        | ($p - $c) as $closed
+        | (if ($curr[0].previous_blocker_dispositions | type) == "array" then
+            [$curr[0].previous_blocker_dispositions[]
+              | select(.status == "closed" and ((.evidence // "") | test("\\S")) and (.id as $id | ($p | index($id) != null) and ($c | index($id) == null)))
+              | .id] | unique
+           else
+            ($p - $c)
+           end) as $closed
         | {prev_count: ($p | length), closed: $closed, closed_count: ($closed | length)}
       ' 2>/dev/null || printf '{"prev_count":0,"closed":[],"closed_count":0}')"
       prev_blocker_count="$("$JQ_BIN" -r '.prev_count // 0' <<<"$progress_json")"
@@ -1131,6 +1267,8 @@ EOF
   iso_now="$("$DATE_BIN" --iso-8601=seconds)"
   "$JQ_BIN" -n \
     --arg review_key "$review_key" \
+    --arg issue_body_sha "$issue_body_sha" \
+    --argjson update_e2e_baseline "$update_e2e_baseline" \
     --rawfile comment "$comment_file" \
     --slurpfile review "$verdict_file" \
     --argjson elapsed "$((SECONDS - task_start_sec))" \
@@ -1156,6 +1294,8 @@ EOF
     --arg updated_at "$iso_now" \
     '{
       review_key: $review_key,
+      issue_body_sha: $issue_body_sha,
+      update_e2e_baseline: ($update_e2e_baseline == 1),
       comment: $comment,
       review: $review[0],
       elapsed: $elapsed,

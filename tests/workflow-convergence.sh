@@ -110,6 +110,10 @@ case "$*" in
     ;;
   'comment pr 7 - <!-- codex-e2e-comment -->')
     printf '%s\n' write-e2e >> "$MOCK_DIR/calls"
+    if [[ -f "$MOCK_DIR/fail-e2e-comment" ]]; then
+      rm "$MOCK_DIR/fail-e2e-comment"
+      exit 1
+    fi
     cat > "$MOCK_DIR/e2e-comment"
     ;;
   'comment issue 42 - <!-- codex-e2e-comment -->')
@@ -164,6 +168,8 @@ case "$2" in
     sed "s|__ARTIFACTS_DIR__|${artifact_dir}|g" "$MOCK_DIR/result.json" > "$2"
     if [[ ! -f "$MOCK_DIR/skip-artifact" ]]; then
       printf '%s\n' '实测通过' > "${artifact_dir}/upgrade.log"
+      mkdir -p "${artifact_dir}/runs/E1/attempt-1"
+      printf '%s\n' '首跑原始证据' > "${artifact_dir}/runs/E1/attempt-1/report.log"
     fi
     ;;
   */decision-*)
@@ -682,5 +688,220 @@ jq -e '
 ' "$fixture/final-queue-ok/pr-7/meta.json" >/dev/null \
   || { cat "$fixture/final-queue-ok/pr-7/meta.json" >&2; fail 'meta.json 的 queued_next_issues 记录不符合预期'; }
 rm -f "$fixture"/issue-*.json "$fixture/open-issues.json" "$fixture"/auto-queue-comment-*.md
+
+# 11. Review e2e_checks 基线防漂移门禁：Issue 正文未更新且非 E2E return_to_review 交接时，忽略复审改写并沿用批准基线；Issue 正文更新后允许变更
+drift_rev="$fixture/reviews-e2e-drift"
+rm -f "$fixture/e2e-comment"
+jq -n '{number:42, title:"双窗引用核对", body:"原始 Issue 要求：核对双 Guest 真实失焦与复焦。", state:"OPEN", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"DriftGuard", body:"Closes #42 首轮提交", url:"https://example.invalid/pull/7",
+  state:"OPEN", isDraft:true, headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", labels:[], updatedAt:"drift-1"}]' > "$fixture/pr.json"
+jq -n '{
+  verdict:"approve", summary:"首轮批准", e2e_decision:"run_e2e", e2e_decision_reason:"实测",
+  e2e_checks:["核对双 Guest 真实失焦与复焦"], requires_human_decision:false,
+  requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$drift_rev" run_loop review
+[[ -s "$drift_rev/pr-7/e2e-checks-baseline.json" ]] || fail '首轮 approve 未写入 e2e-checks-baseline.json'
+
+# 复审（Issue 正文未改、非 return_to_review 交接）试图将 E2E 环境故障现场倒灌进 e2e_checks -> 宿主机强制沿用基线
+set_pr_body 'Closes #42 返工后复审'
+jq -n '{
+  verdict:"approve", summary:"复审批准", e2e_decision:"run_e2e", e2e_decision_reason:"实测",
+  e2e_checks:["从 Windows Terminal 持有前台的已解锁桌面启动并核对双 Guest"], requires_human_decision:false,
+  requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$drift_rev" run_loop review
+grep -Fq '## 已锁定 E2E 必验基线（宿主机防漂移保护）' "$fixture/last-prompt" || fail '复审提示词未注入已锁定 E2E 必验基线'
+grep -Fq '宿主机 `e2e_checks` 防漂移保护' "$fixture/review-comment" || fail '复审改写必验项时未记录防漂移保护说明'
+grep -F 'codex-review-meta:' "$fixture/review-comment" | grep -Fq '核对双 Guest 真实失焦与复焦' || fail '宿主机未保留既有 e2e_checks 基线'
+if grep -F 'codex-review-meta:' "$fixture/review-comment" | grep -Fq 'Windows Terminal'; then
+  fail '复审倒灌的外部桌面环境条件未被宿主机拦截'
+fi
+
+# 当关联 Issue 正文已更新后，允许 Review 更新 e2e_checks 并刷新基线
+jq -n '{number:42, title:"双窗引用核对", body:"更新后的 Issue 要求：先定向证明 Terminal 前台到所属主 Guest。", state:"OPEN", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+set_pr_body 'Closes #42 Issue 正文已更新后复审'
+jq -n '{
+  verdict:"approve", summary:"按更新后 Issue 调整必验项", e2e_decision:"run_e2e", e2e_decision_reason:"实测",
+  e2e_checks:["先定向证明 Terminal 前台到所属主 Guest"], requires_human_decision:false,
+  requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$drift_rev" run_loop review
+grep -F 'codex-review-meta:' "$fixture/review-comment" | grep -Fq '先定向证明 Terminal 前台到所属主 Guest' || fail 'Issue 更新后未放行新的 e2e_checks'
+jq -e '.e2e_checks == ["先定向证明 Terminal 前台到所属主 Guest"]' "$drift_rev/pr-7/e2e-checks-baseline.json" >/dev/null || fail 'Issue 更新后未刷新 e2e-checks-baseline.json'
+
+# 12. E2E 宿主机硬门禁：reproducible_in_dev_sandbox=false 直接阻断 return_to_dev；同 failure_stage 连续复发提前短路 blocked
+# 12a. reproducible_in_dev_sandbox=false -> 立即覆写为 blocked（不退回 changes-requested，且不写入 verified_shas 以便人工排障后同 SHA 重跑）
+cp "$fixture/original-comment" "$fixture/review-comment"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"E2EGuard", body:"Closes #42", url:"https://example.invalid/pull/7",
+  state:"OPEN", isDraft:true, headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", labels:[], updatedAt:"e2e-guard-1"}]' > "$fixture/pr.json"
+e2e_nonrepro="$fixture/e2e-nonrepro"
+before_blk_12a="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+before_cr_12a="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"return_to_dev", summary:"Windows Terminal 持有前台导致登录前失败", environment:"Windows RDP",
+  failure_stage:"login-main", reproducible_in_dev_sandbox:false,
+  scenarios:[{id:"E1", name:"主窗登录", status:"failed", details:"Terminal 持有前台 66456", evidence_paths:[]}],
+  evidence_paths:[],
+  failure_details:[{title:"RDP 前台锁导致主 Guest 无法激活", reproduction:"RDP 桌面运行", observed:"activation-window-covered", expected:"取得主 Guest 前台"}],
+  remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$e2e_nonrepro" run_loop e2e
+assert_calls "$((before_blk_12a + 1))" 'set-state pr 7 blocked'
+assert_calls "$before_cr_12a" 'set-state pr 7 changes-requested'
+grep -Fq '宿主机硬路由拦截' "$e2e_nonrepro/pr-7/e2e-comment.md" || fail 'non-reproducible 拦截未写入 E2E 评论'
+jq -e '.host_route_override == "non_reproducible_in_dev_sandbox" and .reproducible_in_dev_sandbox == false and .failure_stage == "login-main"' "$e2e_nonrepro/pr-7/meta.json" >/dev/null \
+  || { cat "$e2e_nonrepro/pr-7/meta.json" >&2; fail 'non-reproducible 的 meta.json 记录不符合预期'; }
+[[ ! -s "$e2e_nonrepro/pr-7/verified_shas.txt" ]] || fail '被宿主机拦截切 blocked 时不应记录 verified_shas'
+
+# 12b. 同 failure_stage 连续 2 轮 return_to_dev -> 在 MAX_E2E_ROUNDS=3 前由 MAX_REPEAT_E2E_STAGE=2 短路切 blocked
+e2e_repeat="$fixture/e2e-repeat-stage"
+before_blk_12b="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+before_cr_12b="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"return_to_dev", summary:"首次在 login-main 失败", environment:"Windows RDP",
+  failure_stage:"login-main", reproducible_in_dev_sandbox:true,
+  scenarios:[{id:"E1", name:"主窗登录", status:"failed", details:"caption-unavailable", evidence_paths:[]}],
+  evidence_paths:[],
+  failure_details:[{title:"login-main 首次失败", reproduction:"运行入口", observed:"caption-unavailable", expected:"通过登录"}],
+  remaining_risks:[]
+}' > "$fixture/result.json"
+MAX_E2E_ROUNDS=3 MAX_REPEAT_E2E_STAGE=2 E2E_ROOT="$e2e_repeat" run_loop e2e
+assert_calls "$((before_cr_12b + 1))" 'set-state pr 7 changes-requested'
+assert_calls "$before_blk_12b" 'set-state pr 7 blocked'
+
+# 第二轮使用更新后的评审场景 key 模拟新提交/重跑，仍在同一 failure_stage=login-main 失败 -> 短路 blocked
+sed 's/检查结果/检查第二轮结果/' "$fixture/original-comment" > "$fixture/review-comment"
+jq '.[0].updatedAt = "e2e-guard-2"' "$fixture/pr.json" > "$fixture/pr-tmp.json"
+mv "$fixture/pr-tmp.json" "$fixture/pr.json"
+MAX_E2E_ROUNDS=3 MAX_REPEAT_E2E_STAGE=2 E2E_ROOT="$e2e_repeat" run_loop e2e
+assert_calls "$((before_blk_12b + 1))" 'set-state pr 7 blocked'
+assert_calls "$((before_cr_12b + 1))" 'set-state pr 7 changes-requested'
+grep -Fq '## 本周期历史 E2E 失败检查点' "$fixture/last-prompt" || fail 'E2E 提示词未注入历史失败检查点'
+grep -Fq '宿主机防盲猜短路' "$e2e_repeat/pr-7/e2e-comment.md" || fail '重复检查点短路未写入 E2E 评论'
+jq -e '.host_route_override == "repeat_failure_stage" and .failure_stage == "login-main"' "$e2e_repeat/pr-7/meta.json" >/dev/null \
+  || { cat "$e2e_repeat/pr-7/meta.json" >&2; fail '重复检查点短路的 meta.json 记录不符合预期'; }
+rm -f "$fixture/issue.json"
+
+# 13. 复审显式逐项处置（previous_blocker_dispositions）防改名伪关闭 + e2e_plan 与首跑产物哈希校验
+disp_rev="$fixture/reviews-disp"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"Fixture", body:"Closes #42 显式处置 R1", url:"https://example.invalid/pull/7",
+  headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", updatedAt:"disp-r1"}]' > "$fixture/pr.json"
+jq -n '{title:"显式处置", body:"需求正文", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+jq -n '{
+  verdict:"request_changes", summary:"首轮阻塞", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], e2e_plan:[], previous_blocker_dispositions:[], requires_human_decision:false,
+  requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[{id:"orig-blocker", severity:"major", location:"a.ts:1", description:"问题", suggestion:"修复", verification:"输入 false -> 输出 true"}]
+}' > "$fixture/verdict.json"
+REVIEWS_ROOT="$disp_rev" run_loop review
+
+# R2a: 换名伪关闭（previous_blocker_dispositions 未处置 orig-blocker）-> 必须被 Schema 门禁拒绝，不写入状态
+before_disp_state="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"request_changes", summary:"企图换名", e2e_decision:"run_e2e", e2e_decision_reason:"",
+  e2e_checks:[], e2e_plan:[], previous_blocker_dispositions:[], requires_human_decision:false,
+  requirements_coverage:[], non_blocking_notes:[],
+  blocking_issues:[{id:"renamed-blocker", severity:"major", location:"a.ts:1", description:"换名", suggestion:"修复", verification:"输入 false -> 输出 true"}]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 显式处置 R2a 换名'
+REVIEWS_ROOT="$disp_rev" run_loop review
+assert_calls "$before_disp_state" 'set-state pr 7 changes-requested'
+
+# R2b: 显式关闭 orig-blocker 并附带 e2e_plan（preserve_first_run=true）-> 通过评审
+before_disp_app="$(grep -Fxc -- 'set-state pr 7 approved' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"approve", summary:"显式关闭通过", e2e_decision:"run_e2e", e2e_decision_reason:"需实测首跑",
+  e2e_checks:["保留首跑并验证升级"],
+  e2e_plan:[{id:"E1", scenario:"保留首跑并验证升级", capability_basis:"候选支持升级", entrypoint:"qa/metadata-evidence.py list", preflight_hint:"检查入口注册", preserve_first_run:true}],
+  previous_blocker_dispositions:[{id:"orig-blocker", status:"closed", evidence:"test_false 通过"}],
+  requires_human_decision:false, requirements_coverage:[], blocking_issues:[], non_blocking_notes:[]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 显式处置 R2b 通过'
+REVIEWS_ROOT="$disp_rev" run_loop review
+assert_calls "$((before_disp_app + 1))" 'set-state pr 7 approved'
+grep -Fq '上一轮阻塞项逐项处置' "$fixture/review-comment" || fail '评审报告未渲染上一轮阻塞项逐项处置表'
+grep -Fq 'E2E 可执行前置计划' "$fixture/review-comment" || fail '评审报告未渲染 E2E 可执行前置计划表'
+
+# 14. preserve_first_run 校验 + manifest.json SHA256 防篡改校验
+# 14a: 仅给普通平铺 upgrade.log（无 attempt-1 首跑路径）-> E2E 门禁转为 blocked
+before_fr_blk="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"pass", summary:"只有平铺报告", environment:"测试环境", failure_stage:"", reproducible_in_dev_sandbox:true,
+  scenarios:[{id:"E1", name:"保留首跑并验证升级", status:"passed", details:"通过", evidence_paths:["upgrade.log"]}],
+  evidence_paths:["upgrade.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$fixture/e2e-first-run-miss" run_loop e2e
+assert_calls "$((before_fr_blk + 1))" 'set-state pr 7 blocked'
+
+# 14b: 给出 runs/E1/attempt-1/report.log -> E2E 通过并写 file_hashes -> 终审验证通过 -> 篡改归档文件后终审拦截
+jq -n '{
+  verdict:"pass", summary:"首跑留存通过", environment:"测试环境", failure_stage:"", reproducible_in_dev_sandbox:true,
+  scenarios:[{id:"E1", name:"保留首跑并验证升级", status:"passed", details:"通过", evidence_paths:["runs/E1/attempt-1/report.log"]}],
+  evidence_paths:["runs/E1/attempt-1/report.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+before_fr_pass="$(grep -Fxc -- 'set-state pr 7 e2e-passed' "$fixture/calls" || true)"
+E2E_ROOT="$fixture/e2e-first-run-ok" PUBLISH_EVIDENCE=1 run_loop e2e
+assert_calls "$((before_fr_pass + 1))" 'set-state pr 7 e2e-passed'
+git -C "$fixture/archive" pull -q origin qa/e2e-evidence
+latest_entry="$(ls -dt "$fixture/archive/pr-7/"* | head -n 1)"
+jq -e '.file_hashes["artifacts/runs/E1/attempt-1/report.log"].sha256 | length == 64' "$latest_entry/manifest.json" >/dev/null \
+  || fail 'manifest.json 缺少归档产物 SHA256 哈希'
+before_fr_ready="$(grep -Fxc -- 'set-state pr 7 ready-to-merge' "$fixture/calls" || true)"
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-hash-ok" run_loop final-gate
+assert_calls "$((before_fr_ready + 1))" 'set-state pr 7 ready-to-merge'
+
+# 篡改归档文件内容 -> Final-Gate 必须阻断
+printf 'tampered\n' > "$latest_entry/artifacts/runs/E1/attempt-1/report.log"
+commit_archive tamper-artifact
+before_tamper_blk="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-hash-tamper" run_loop final-gate
+assert_calls "$((before_tamper_blk + 1))" 'set-state pr 7 blocked'
+grep -Fq 'QA 归档文件哈希校验失败' "$fixture/final-hash-tamper/pr-7/final-gate-comment.md" || fail '终审未拦截被篡改的归档产物'
+
+# 15. E2E 持久化交接重试（pending-e2e.json）：写评论与 Issue 切标失败后不重跑 codex-e2e，且正确续完
+retry_e2e="$fixture/e2e-handoff-retry"
+before_e2e_calls="$(grep -Fxc -- codex-e2e "$fixture/calls" || true)"
+before_e2e_wr="$(grep -Fxc -- write-e2e "$fixture/calls" || true)"
+touch "$fixture/fail-e2e-comment" "$fixture/fail-issue-state"
+E2E_ROOT="$retry_e2e" run_loop e2e
+E2E_ROOT="$retry_e2e" run_loop e2e
+# 模拟 PR 已切离 agy:approved，残留 Issue 交接在下次轮询自动续完
+cp "$fixture/pr.json" "$fixture/pr-e2e-bak.json"
+printf '[]\n' > "$fixture/pr.json"
+E2E_ROOT="$retry_e2e" run_loop e2e
+mv "$fixture/pr-e2e-bak.json" "$fixture/pr.json"
+assert_calls "$((before_e2e_calls + 1))" codex-e2e
+assert_calls "$((before_e2e_wr + 2))" write-e2e
+[[ ! -f "$retry_e2e/pr-7/pending-e2e.json" ]] || fail 'E2E 交接完成后仍残留 pending-e2e.json'
+[[ -s "$retry_e2e/pr-7/attempts.jsonl" ]] || fail 'E2E 未写入 attempts.jsonl 结构化记录'
+
+# 16. 宿主机轻量预检零 Token 短路（exit 10 -> return_to_dev，exit 11 -> return_to_review）与资源租约阻断叠加
+before_pf_e2e="$(grep -Fxc -- codex-e2e "$fixture/calls" || true)"
+before_pf_cr="$(grep -Fxc -- 'set-state pr 7 changes-requested' "$fixture/calls" || true)"
+E2E_ROOT="$fixture/e2e-pf-dev" E2E_PREFLIGHT_CMD='echo "missing qa action"; exit 10' run_loop e2e
+assert_calls "$before_pf_e2e" codex-e2e
+assert_calls "$((before_pf_cr + 1))" 'set-state pr 7 changes-requested'
+grep -Fq 'codex-e2e-meta:' "$fixture/e2e-comment" || fail 'E2E 评论未写入 codex-e2e-meta'
+grep -Fq 'preflight-return_to_dev' "$fixture/e2e-comment" || fail '预检 exit 10 未写入结构化 preflight-return_to_dev 项'
+
+before_pf_rev="$(grep -Fxc -- 'set-state pr 7 in-review' "$fixture/calls" || true)"
+E2E_ROOT="$fixture/e2e-pf-rev" E2E_PREFLIGHT_CMD='echo "single credential only"; exit 11' run_loop e2e
+assert_calls "$before_pf_e2e" codex-e2e
+assert_calls "$((before_pf_rev + 1))" 'set-state pr 7 in-review'
+grep -Fq "<!-- codex-e2e-handoff:${MOCK_SHA}:" "$fixture/e2e-comment" || fail '预检 exit 11 未写入 E2E 退回复审交接标记'
+
+# 资源清理失败保留 cleanup_failed 租约，并阻止下一次叠加启动 codex-e2e
+lease_e2e="$fixture/e2e-lease"
+before_lease_e2e="$(grep -Fxc -- codex-e2e "$fixture/calls" || true)"
+E2E_ROOT="$lease_e2e" E2E_CLEANUP_CMD='echo "destroy failed"; exit 1' run_loop e2e
+assert_calls "$((before_lease_e2e + 1))" codex-e2e
+[[ -f "$lease_e2e/active-leases/pr-7.json" ]] || fail '清理失败后未保留 active-leases 租约'
+jq -e '.status == "cleanup_failed"' "$lease_e2e/active-leases/pr-7.json" >/dev/null || fail '租约状态应为 cleanup_failed'
+# 移除 verified_shas 模拟下轮重试 -> 因租约补偿清理仍失败，必须阻止再次调用 codex-e2e
+: > "$lease_e2e/pr-7/verified_shas.txt"
+E2E_ROOT="$lease_e2e" E2E_CLEANUP_CMD='echo "still failing"; exit 1' run_loop e2e
+assert_calls "$((before_lease_e2e + 1))" codex-e2e
+rm -f "$fixture/issue.json"
 
 printf 'workflow convergence tests passed\n'

@@ -192,6 +192,7 @@ REPO_SLUG="${REPO_SLUG//[^a-zA-Z0-9._-]/_}"
 STATE_ROOT="${STATE_ROOT:-${STATE_BASE}/${REPO_SLUG}}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${STATE_ROOT}/worktrees}"
 SESSIONS_ROOT="${SESSIONS_ROOT:-${STATE_ROOT}/sessions}"
+E2E_ROOT="${E2E_ROOT:-${STATE_ROOT}/e2e}"
 TMP_ROOT="${TMP_ROOT:-${STATE_ROOT}/tmp}"
 STATE_FILE="${STATE_FILE:-${STATE_ROOT}/processed_issues.txt}"
 REPO_GIT_LOCK="${STATE_ROOT}/repo-git.lock"
@@ -770,7 +771,8 @@ write_codex_schema() {
         "additionalProperties": false
       }
     },
-    "size_justification": {"type": "string"}
+    "size_justification": {"type": "string"},
+    "e2e_regression_guard": {"type": "string"}
   },
   "required": [
     "status",
@@ -780,7 +782,8 @@ write_codex_schema() {
     "branch_name",
     "blocker_resolutions",
     "verification_matrix",
-    "size_justification"
+    "size_justification",
+    "e2e_regression_guard"
   ],
   "additionalProperties": false
 }
@@ -807,6 +810,7 @@ validate_codex_result() {
     length == 1 and (.[0] |
       ([.summary, .blocked_reason, .commit_message, .branch_name] | all(type == "string"))
       and (.size_justification == null or (.size_justification | type == "string"))
+      and (.e2e_regression_guard == null or (.e2e_regression_guard | type == "string"))
       and (.blocker_resolutions | valid_resolutions)
       and (.verification_matrix | valid_matrix)
       and (
@@ -890,6 +894,33 @@ extract_review_blockers_json() {
   else
     "$JQ_BIN" -sc 'unique_by(.id)' <<<"$items_jsonl" 2>/dev/null || printf '[]'
   fi
+}
+
+# 从最新 E2E 验收评论的 codex-e2e-meta 提取 fail / return_to_dev 需关闭项
+extract_e2e_action_items_json() {
+  local e2e_comment="${1:-}"
+  if [[ -z "$e2e_comment" ]]; then
+    printf '[]'
+    return 0
+  fi
+  "$JQ_BIN" -Rsr '
+    "<!-- codex-e2e-meta:" as $prefix
+    | split("\n")
+    | map(rtrimstr("\r") | select(startswith($prefix) and endswith(" -->")))
+    | last
+    | if . == null then "[]"
+      else (ltrimstr($prefix) | rtrimstr(" -->") | (try fromjson catch null))
+      | if type != "object" then "[]"
+        elif (.verdict != "fail" and .verdict != "return_to_dev") then "[]"
+        elif (.action_items | type) == "array" and (.action_items | length) > 0 then
+          ([.action_items[]
+            | select((.id | type == "string") and (.id | test("\\S")))
+            | {id: .id, verification: (if ((.closure_criteria // "") | test("\\S")) then .closure_criteria else (.title // "") end)}]
+           | unique_by(.id) | tojson)
+        else "[]"
+        end
+      end
+  ' <<<"$e2e_comment" 2>/dev/null || printf '[]'
 }
 
 # 确定性校验：返工完成时，每条预期阻塞 ID 都须提供非空的前置覆盖、对应测试与结果
@@ -977,6 +1008,96 @@ check_verification_and_size_evidence() {
           + "\n  请先核查并精简重复/低价值测试或收回非必要的通用 QA 运行时改动；若确属必要，请在 `size_justification` 中逐项说明理由。"
         else empty end)
       ] | join("\n")
+    end
+  ' "$result_file" 2>/dev/null || true)"
+
+  if [[ -n "$missing_report" ]]; then
+    printf '%s\n' "$missing_report"
+    return 1
+  fi
+  return 0
+}
+
+# 从本地最近一次 E2E result-*.json（优先）或远端 E2E 评论 Markdown 中提取上轮已通过的子场景列表（JSON 数组）
+extract_e2e_passed_scenarios_json() {
+  local pr_num="${1:-}"
+  local e2e_comment="${2:-}"
+
+  if [[ -n "$pr_num" && -d "${E2E_ROOT}/pr-${pr_num}" ]]; then
+    local latest_rf="" _rf=""
+    for _rf in "${E2E_ROOT}/pr-${pr_num}"/result-*.json; do
+      [[ -s "$_rf" ]] && latest_rf="$_rf"
+    done
+    if [[ -n "$latest_rf" ]]; then
+      local from_json=""
+      if from_json="$("$JQ_BIN" -c '
+        if type == "object" and (.verdict // "") != "pass" then
+          [(.scenarios // [])[] | select(.status == "passed") | {id: (.id // ""), name: (.name // ""), details: ((.details // "")[0:180])}]
+        else
+          []
+        end
+      ' "$latest_rf" 2>/dev/null)"; then
+        printf '%s' "$from_json"
+        return 0
+      fi
+    fi
+  fi
+
+  if [[ -z "$e2e_comment" || "$e2e_comment" == *'`pass` ->'* ]]; then
+    printf '[]'
+    return 0
+  fi
+
+  local in_table=0 line="" clean_line="" items_jsonl=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    clean_line="${line%$'\r'}"
+    if [[ "$clean_line" == "#### 端到端场景结果"* ]]; then
+      in_table=1
+      continue
+    fi
+    if (( in_table == 1 )); then
+      if [[ "$clean_line" == "#### "* || "$clean_line" == "<!-- "* ]]; then
+        break
+      fi
+      if [[ "$clean_line" =~ ^\|[[:space:]]*([^|]+)[[:space:]]*\|[[:space:]]*\`passed\`[[:space:]]*\|[[:space:]]*([^|]*)\| ]]; then
+        local s_name="${BASH_REMATCH[1]}" s_det="${BASH_REMATCH[2]}"
+        s_name="${s_name#"${s_name%%[![:space:]]*}"}"
+        s_name="${s_name%"${s_name##*[![:space:]]}"}"
+        s_det="${s_det#"${s_det%%[![:space:]]*}"}"
+        s_det="${s_det%"${s_det##*[![:space:]]}"}"
+        [[ -n "$s_name" ]] && items_jsonl+="$("$JQ_BIN" -nc --arg name "$s_name" --arg details "${s_det:0:180}" '{id:"", name:$name, details:$details}')"$'\n'
+      fi
+    fi
+  done <<<"$e2e_comment"
+
+  if [[ -z "$items_jsonl" ]]; then
+    printf '[]'
+  else
+    "$JQ_BIN" -sc '.' <<<"$items_jsonl" 2>/dev/null || printf '[]'
+  fi
+}
+
+# 确定性校验：E2E 返工且上轮存在已通过子场景时，若本轮改动了 qa/ 文件，必须提交 e2e_regression_guard 说明未收紧公共前置门禁破坏已通过路径
+check_e2e_regression_guard() {
+  local result_file="$1"
+  local metrics_json="$2"
+  local passed_scenarios_json="$3"
+
+  if [[ -z "$metrics_json" || -z "$passed_scenarios_json" || "$passed_scenarios_json" == "[]" ]]; then
+    return 0
+  fi
+
+  local missing_report=""
+  missing_report="$("$JQ_BIN" -r \
+    --argjson metrics "$metrics_json" \
+    --argjson passed "$passed_scenarios_json" '
+    def filled: type == "string" and test("\\S");
+    if .status != "completed" then ""
+    elif (($metrics.qa.added // 0) + ($metrics.qa.deleted // 0)) > 0 and (($passed | length) > 0) and ((.e2e_regression_guard // "") | filled | not) then
+      "- 本轮为 E2E 返工且改动了 `qa/` 文件（+" + (($metrics.qa.added // 0)|tostring) + "/-" + (($metrics.qa.deleted // 0)|tostring) + " 行），但 `e2e_regression_guard` 为空；上轮已通过子场景："
+      + ([$passed[] | (if (.id | filled) then .id + " " else "" end) + .name] | join("、"))
+      + "。请核查本次改动未收紧所有子场景/故障清理模式的公共前置 gate（如登录前窗口前台锁），并在 `e2e_regression_guard` 中写明保护方式与本地验证结果。"
+    else ""
     end
   ' "$result_file" 2>/dev/null || true)"
 
@@ -1403,28 +1524,52 @@ while true; do
       "Agent 已认领该 Issue，正在独立 worktree 中分析与开发。"
   fi
 
-  # 若本轮是评审、E2E 或终审打回（changes-requested），拉取最新反馈并提取结构化阻塞清单
+  # 若本轮是评审、E2E 或终审打回（changes-requested），拉取最新反馈并提取结构化阻塞清单与 E2E 已通过子场景保护清单
   review_feedback_section=""
   rework_checklist_section=""
+  e2e_regression_guard_section=""
   expected_review_blockers_json="[]"
+  e2e_passed_scenarios_json="[]"
   if (( picked_from_changes_requested == 1 )) && [[ "$GH_SYNC_ENABLED" == "1" ]]; then
     review_feedback="$(gh_state get-comment issue "$number" "$REVIEW_COMMENT_MARKER" 2>/dev/null || true)"
     e2e_feedback="$(gh_state get-comment issue "$number" "$E2E_COMMENT_MARKER" 2>/dev/null || true)"
     final_gate_feedback="$(gh_state get-comment issue "$number" "$FINAL_GATE_COMMENT_MARKER" 2>/dev/null || true)"
-    if [[ -n "$review_feedback" ]]; then
-      expected_review_blockers_json="$(extract_review_blockers_json "$review_feedback")"
-      if [[ "$expected_review_blockers_json" != "[]" ]]; then
-        rework_checklist_md="$("$JQ_BIN" -r '
-          [.[] | "- `" + .id + "`" + (if ((.verification // "") | test("\\S")) then "\n  - 关闭条件：" + .verification else "" end)] | join("\n")
-        ' <<<"$expected_review_blockers_json" 2>/dev/null || true)"
-        if [[ -n "$rework_checklist_md" ]]; then
-          rework_checklist_section=$'\n\n'"### 本轮待关闭阻塞项与关闭条件（请逐项核验并提交对应证据）"$'\n'"${rework_checklist_md}"$'\n'"- 提交前请逐条核对上述每项关闭条件中的**前置状态/边界输入、操作与预期结果**（包括关闭态/异常退出恢复路径；若关闭条件要求从某个关闭态起测，仅测开启态不算关闭），并在返回结果的 \`blocker_resolutions\` 中按阻塞编号逐项填写 \`precondition_covered\`、\`test_or_check\` 与 \`result\`。真实 Doris 与浏览器 E2E 仍交由独立 E2E 执行。"
+    rework_pr_num=""
+    if [[ -s "$meta_file" ]]; then
+      rework_pr_num="$("$JQ_BIN" -r 'first((.pr_url // "") | capture("/pull/(?<n>[0-9]+)").n) // ""' "$meta_file" 2>/dev/null || true)"
+    fi
+    if [[ -z "$rework_pr_num" ]]; then
+      _pr_lu="$(gh_state find-pr "$branch" 2>/dev/null || true)"
+      [[ -n "$_pr_lu" ]] && rework_pr_num="${_pr_lu%%$'\t'*}"
+    fi
+    if [[ -n "$e2e_feedback" || -n "$rework_pr_num" ]]; then
+      e2e_passed_scenarios_json="$(extract_e2e_passed_scenarios_json "$rework_pr_num" "$e2e_feedback")"
+      if [[ "$e2e_passed_scenarios_json" != "[]" ]]; then
+        e2e_passed_md="$("$JQ_BIN" -r '
+          [.[] | "- " + (if ((.id // "") | test("\\S")) then "`" + .id + "` " else "" end) + .name + (if ((.details // "") | test("\\S")) then "：" + .details else "" end)] | join("\n")
+        ' <<<"$e2e_passed_scenarios_json" 2>/dev/null || true)"
+        if [[ -n "$e2e_passed_md" ]]; then
+          e2e_regression_guard_section=$'\n\n'"### 上轮 E2E 已通过子场景（只读回归保护清单）"$'\n'"以下子场景在上一轮真实 E2E 中已通过，本轮修复必须保持其不受破坏："$'\n'"${e2e_passed_md}"$'\n'"- **严禁**把针对单一失败场景的新增前置校验（如登录前窗口前台锁、环境断言）放到所有子场景或清理故障模式的公共入口之前，导致已通过路径在进入测试点前即被阻断；"$'\n'"- 若本轮改动了 \`qa/\` 文件，必须在返回结果的 \`e2e_regression_guard\` 中说明如何保证上述已通过子场景不受影响及对应的本地静态/单元测试验证；"$'\n'"- 若根因属于离线 sandbox 无法复现与验证的外部 OS/桌面交互限制（如 Windows RDP foreground lock），请勿盲目堆叠无法本地验证的 hack，直接输出 \`status: \"blocked\"\` 写清所需的人工/环境确认项。"
         fi
       fi
+    fi
+    if [[ -n "$review_feedback" ]]; then
+      expected_review_blockers_json="$(extract_review_blockers_json "$review_feedback")"
       review_feedback_section+=$'\n\n'"### 独立代码评审反馈（请优先逐项修复以下阻塞问题）"$'\n'"${review_feedback}"
     fi
     if [[ -n "$e2e_feedback" ]]; then
+      if [[ "$expected_review_blockers_json" == "[]" ]]; then
+        expected_review_blockers_json="$(extract_e2e_action_items_json "$e2e_feedback")"
+      fi
       review_feedback_section+=$'\n\n'"### 独立 E2E 验收反馈（请重点修复以下端到端失败项，或在同一 PR 补齐报告指出的可复用 QA 脚本/准备步骤缺口）"$'\n'"${e2e_feedback}"
+    fi
+    if [[ "$expected_review_blockers_json" != "[]" ]]; then
+      rework_checklist_md="$("$JQ_BIN" -r '
+        [.[] | "- `" + .id + "`" + (if ((.verification // "") | test("\\S")) then "\n  - 关闭条件：" + .verification else "" end)] | join("\n")
+      ' <<<"$expected_review_blockers_json" 2>/dev/null || true)"
+      if [[ -n "$rework_checklist_md" ]]; then
+        rework_checklist_section=$'\n\n'"### 本轮待关闭阻塞项与关闭条件（请逐项核验并提交对应证据）"$'\n'"${rework_checklist_md}"$'\n'"- 提交前请逐条核对上述每项关闭条件中的**前置状态/边界输入、操作与预期结果**（包括关闭态/异常退出恢复路径；若关闭条件要求从某个关闭态起测，仅测开启态不算关闭），并在返回结果的 \`blocker_resolutions\` 中按阻塞编号逐项填写 \`precondition_covered\`、\`test_or_check\` 与 \`result\`。真实 Doris 与浏览器 E2E 仍交由独立 E2E 执行。"
+      fi
     fi
     if [[ -n "$final_gate_feedback" ]]; then
       review_feedback_section+=$'\n\n'"### 终审合入门禁反馈（请优先修复以下终审阻塞项）"$'\n'"${final_gate_feedback}"
@@ -1443,7 +1588,8 @@ while true; do
    - 若本轮为评审返工且上方列出了待关闭阻塞编号，必须在 \`blocker_resolutions\` 中逐项列出每个阻塞 \`id\` 对应的 \`precondition_covered\`（覆盖的前置状态/边界输入）、\`test_or_check\`（执行的内部测试或检查）与 \`result\`（通过结果）；非评审返工或无阻塞编号时返回空数组 \`[]\`。
    - **验证覆盖与复用表（\`verification_matrix\`）**：只要本轮新增或修改了任何内部测试或 \`qa/\` 文件，必须在 \`verification_matrix\` 中逐项列出 \`target\`（验证目标）、\`existing_entry\`（已有测试/QA 入口及源码断言）、\`gap\`（现有覆盖缺口）、\`action\`（\`REUSE\` / \`EXTEND\` / \`NEW\`）与 \`rationale\`（为何必要、少了会漏掉什么）；未改动测试与 \`qa/\` 时返回 \`[]\`。
    - **测试/QA 规模与范围说明（\`size_justification\`）**：若测试增量超出 Issue 估算（或超过生产代码 1.5 倍且 > 80 行）、\`qa/\` 驱动新增超过 150 行、或触及通用 QA 运行时/基础设施文件，应先核查并精简冗余测试或收回非必要改动；确属必要时必须在 \`size_justification\` 中逐项说明理由，否则留空 \`""\`。
-   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入（\`blocker_resolutions\` 与 \`verification_matrix\` 可为空数组 \`[]\`，\`size_justification\` 可为空 \`""\`）。
+   - **E2E 已通过子场景防回归说明（\`e2e_regression_guard\`）**：当本轮为 E2E 返工、上方列出了「上轮 E2E 已通过子场景」且改动了 \`qa/\` 文件时，必须在 \`e2e_regression_guard\` 中说明为何不会阻断已通过子场景/清理模式及本地验证结果；其他情况留空 \`""\`。
+   - 遇到无法处理的阻塞时，设置 \`status\` 为 \`blocked\`，在 \`blocked_reason\` 中说明阻塞原因和所需的人工输入（\`blocker_resolutions\` 与 \`verification_matrix\` 可为空数组 \`[]\`，\`size_justification\` 与 \`e2e_regression_guard\` 可为空 \`""\`）。
    - \`commit_message\` 可填写一行简明的提交消息。按以下要求填写 \`branch_name\`，无需命名时留空。${branch_prompt_line}
 6. GitHub 的读写均由外层脚本执行，请使用上面的 Issue 和反馈信息。
 EOF
@@ -1464,8 +1610,8 @@ EOF
 )"
   fi
 
-  if (( picked_from_changes_requested == 1 )) && [[ -n "${merge_conflict_section}${rework_checklist_section}${review_feedback_section}" ]]; then
-    issue_and_feedback_block="${merge_conflict_section}${rework_checklist_section}${review_feedback_section}"$'\n\n'"### 关联 Issue 原始要求"$'\n'"${body}"
+  if (( picked_from_changes_requested == 1 )) && [[ -n "${merge_conflict_section}${rework_checklist_section}${e2e_regression_guard_section}${review_feedback_section}" ]]; then
+    issue_and_feedback_block="${merge_conflict_section}${rework_checklist_section}${e2e_regression_guard_section}${review_feedback_section}"$'\n\n'"### 关联 Issue 原始要求"$'\n'"${body}"
   else
     issue_and_feedback_block=$'\n\n'"### Issue 内容"$'\n'"${body}${merge_conflict_section}${review_feedback_section}"
   fi
@@ -1565,6 +1711,7 @@ EOF
       elif [[ "$DEV_ENGINE" == "codex" ]]; then
         missing_blocker_part=""
         missing_verify_part=""
+        missing_e2e_guard_part=""
         if [[ "$expected_review_blockers_json" != "[]" ]]; then
           if ! missing_blocker_part="$(check_blocker_evidence "$attempt_result_file" "$expected_review_blockers_json")"; then
             :
@@ -1574,8 +1721,17 @@ EOF
         if ! missing_verify_part="$(check_verification_and_size_evidence "$attempt_result_file" "$live_metrics_json" "$issue_test_budget")"; then
           :
         fi
-        if [[ -n "$missing_blocker_part" || -n "$missing_verify_part" ]]; then
-          missing_evidence="${missing_blocker_part}${missing_blocker_part:+$'\n'}${missing_verify_part}"
+        if [[ "$e2e_passed_scenarios_json" != "[]" ]]; then
+          if ! missing_e2e_guard_part="$(check_e2e_regression_guard "$attempt_result_file" "$live_metrics_json" "$e2e_passed_scenarios_json")"; then
+            :
+          fi
+        fi
+        if [[ -n "$missing_blocker_part" || -n "$missing_verify_part" || -n "$missing_e2e_guard_part" ]]; then
+          missing_evidence=""
+          [[ -n "$missing_blocker_part" ]] && missing_evidence+="${missing_blocker_part}"$'\n'
+          [[ -n "$missing_verify_part" ]] && missing_evidence+="${missing_verify_part}"$'\n'
+          [[ -n "$missing_e2e_guard_part" ]] && missing_evidence+="${missing_e2e_guard_part}"$'\n'
+          missing_evidence="${missing_evidence%$'\n'}"
           printf 'Codex 返回的验证/规模证据不完整：\n%s\n' "$missing_evidence" >> "$attempt_stderr_file"
           last_missing_evidence="$missing_evidence"
           is_evidence_error=1
@@ -1612,7 +1768,7 @@ EOF
       schema_retries=$((schema_retries + 1))
       printf '[%s] 警告：Issue #%s 第 %d 次执行返回的结构化结果无效，3s 后续接原会话 (%s) 修正输出（第 %d/%d 次重试）...\n' \
         "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$schema_retries" "$max_s_retries" >&2
-      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空、blocked_reason=\"\"，并按要求填写 blocker_resolutions、verification_matrix 与 size_justification；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
+      current_prompt="你上一次最终输出未能通过开发结果 JSON Schema 校验。请保留当前 worktree 中已完成的代码改动（不要执行 git commit/push），确认工作区状态后严格按 JSON Schema 返回有效结果：完成时 status=\"completed\"、summary 非空、blocked_reason=\"\"，并按要求填写 blocker_resolutions、verification_matrix、size_justification 与 e2e_regression_guard；受阻时 status=\"blocked\" 且 blocked_reason 非空。"
       if [[ -z "$current_session_id" ]]; then
         current_prompt="${prompt}"$'\n\n'"${current_prompt}"
       fi
@@ -1624,7 +1780,7 @@ EOF
       evidence_retries=$((evidence_retries + 1))
       printf '[%s] 警告：Issue #%s 第 %d 次执行缺少评审阻塞或测试规模证据，3s 后续接原会话 (%s) 补齐（第 %d/%d 次重试）...\n' \
         "$("$DATE_BIN" '+%F %T')" "$number" "$attempt" "${current_session_id:-new}" "$evidence_retries" "$max_e_retries" >&2
-      current_prompt="你上一次提交的结果缺少以下必交证据（宿主机实测工作树相对 ${base_ref} 的变更规模：$(render_diff_metrics_markdown "$JQ_BIN" "$live_metrics_json" "$issue_test_budget" | tr '\n' ' ')）："$'\n'"${missing_evidence}"$'\n\n'"请保留当前 worktree 中已完成的有效代码改动（不要执行 git commit/push）："$'\n'"1. 若缺少评审阻塞项关闭证据且尚未覆盖要求的前置状态/边界输入/失败恢复路径，请先补齐定向内部测试并运行通过（真实 Doris 与浏览器仍由独立 E2E 执行）；"$'\n'"2. 若触发了测试/QA 规模或通用 QA 运行时复核信号，请先自查并精简重复/低价值测试或收回非必要改动；确属必要则在 size_justification 中写清原因；"$'\n'"3. 在 verification_matrix 中逐项补齐每个测试/QA 改动的 target、existing_entry、gap、action（REUSE/EXTEND/NEW）与 rationale，并按 JSON Schema 返回完整结果。"
+      current_prompt="你上一次提交的结果缺少以下必交证据（宿主机实测工作树相对 ${base_ref} 的变更规模：$(render_diff_metrics_markdown "$JQ_BIN" "$live_metrics_json" "$issue_test_budget" | tr '\n' ' ')）："$'\n'"${missing_evidence}"$'\n\n'"请保留当前 worktree 中已完成的有效代码改动（不要执行 git commit/push）："$'\n'"1. 若缺少评审阻塞项关闭证据且尚未覆盖要求的前置状态/边界输入/失败恢复路径，请先补齐定向内部测试并运行通过（真实 Doris 与浏览器仍由独立 E2E 执行）；"$'\n'"2. 若触发了测试/QA 规模或通用 QA 运行时复核信号，请先自查并精简重复/低价值测试或收回非必要改动；确属必要则在 size_justification 中写清原因；"$'\n'"3. 若本轮为 E2E 返工且改动了 qa/ 文件，请核查未收紧公共前置 gate 破坏上轮已通过的子场景，并在 e2e_regression_guard 中写明保护方式与本地验证结果；"$'\n'"4. 在 verification_matrix 中逐项补齐每个测试/QA 改动的 target、existing_entry、gap、action（REUSE/EXTEND/NEW）与 rationale，并按 JSON Schema 返回完整结果。"
       if [[ -z "$current_session_id" ]]; then
         current_prompt="${prompt}"$'\n\n'"${current_prompt}"
       fi
@@ -1762,6 +1918,9 @@ EOF
           else "" end)
         + (if (.size_justification | filled) then
             "\n\n#### 测试/QA 规模与范围说明\n" + .size_justification
+          else "" end)
+        + (if (.e2e_regression_guard | filled) then
+            "\n\n#### E2E 已通过子场景防回归说明\n" + .e2e_regression_guard
           else "" end)
       ' "$attempt_result_file" > "$summary_file"
       "$JQ_BIN" -r '.blocked_reason' "$attempt_result_file" > "$blocked_file"
