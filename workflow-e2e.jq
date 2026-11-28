@@ -1,5 +1,14 @@
 def nonblank: type == "string" and test("\\S");
 
+def valid_plan_id:
+  type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$");
+
+def valid_e2e_plan:
+  type == "array"
+  and length > 0
+  and all(type == "object" and (.id | valid_plan_id))
+  and (([.[] | .id] | length) == ([.[] | .id] | unique | length));
+
 def valid_e2e_checks:
   type == "array"
   and all(nonblank and (test("[\\r\\n]") | not))
@@ -34,6 +43,21 @@ def approved_e2e_plan($sha; $previous_sha):
 def numbered_e2e_checks:
   to_entries | map({id: ("E" + ((.key + 1) | tostring)), description: .value});
 
+def required_e2e_items($checks; $plan):
+  if ($checks | type == "array" and length == 0) then
+    []
+  elif ($plan | valid_e2e_plan) then
+    [$plan[] | {
+      id: .id,
+      description: (if (.scenario | nonblank) then .scenario else .id end),
+      preserve_first_run: (.preserve_first_run == true)
+    }]
+  elif ($checks | type == "array") then
+    $checks | numbered_e2e_checks | map(. + {preserve_first_run: false})
+  else
+    []
+  end;
+
 def resolve_artifact_path($root; $files):
   if nonblank then
     ($root | rtrimstr("/")) as $base
@@ -55,11 +79,8 @@ def is_first_run_evidence_path:
 def missing_e2e_checks($checks; $files; $root; $plan):
   (.scenarios | if type == "array" then map(objects) else [] end) as $scenarios
   | (.evidence_paths | if type == "array" then map(resolve_artifact_path($root; $files) | select(. != null)) else [] end) as $reported
-  | ($plan | if type == "array" then . else [] end) as $plan_arr
-  | $checks | numbered_e2e_checks
-  | map(.id as $id | .description as $desc
-      | ([$plan_arr[] | select(type == "object" and ((.id // "") == $id or (.scenario // "") == $desc))] | first // null) as $pitem
-      | (($pitem != null) and ($pitem.preserve_first_run == true)) as $need_first_run
+  | required_e2e_items($checks; $plan)
+  | map(.id as $id | (.preserve_first_run == true) as $need_first_run
       | [$scenarios[] | select(.id == $id)] as $matches
       | select(($matches | length) != 1 or (
           $matches[0] | (

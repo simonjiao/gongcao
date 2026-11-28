@@ -546,13 +546,17 @@ render_review_markdown() {
       end)
     + (if .e2e_checks | length > 0 then
         "\n\n#### E2E 必验场景\n"
-        + (.e2e_checks | sort | numbered_e2e_checks | map("- " + .id + " " + .description) | join("\n"))
+        + (if ((.e2e_plan // []) | valid_e2e_plan) then
+            (.e2e_checks | map("- " + .) | join("\n"))
+          else
+            (.e2e_checks | sort | numbered_e2e_checks | map("- " + .id + " " + .description) | join("\n"))
+          end)
       else
         ""
       end)
     + (if ((.e2e_plan // []) | length) > 0 then
-        "\n\n#### E2E 可执行前置计划\n| ID | 候选能力依据 | 维护入口 | 轻量预检提示 | 保留首跑 |\n| --- | --- | --- | --- | --- |\n"
-        + ([.e2e_plan[] | "| `" + (.id | esc) + "` | " + (.capability_basis | esc) + " | `" + (.entrypoint | esc) + "` | " + (.preflight_hint | esc) + " | `" + (if .preserve_first_run then "true" else "false" end) + "` |"] | join("\n"))
+        "\n\n#### E2E 可执行前置计划\n| ID | 场景 | 候选能力依据 | 维护入口 | 轻量预检提示 | 保留首跑 |\n| --- | --- | --- | --- | --- | --- |\n"
+        + ([.e2e_plan[] | "| `" + (.id | esc) + "` | " + (.scenario | esc) + " | " + (.capability_basis | esc) + " | `" + (.entrypoint | esc) + "` | " + (.preflight_hint | esc) + " | `" + (if .preserve_first_run then "true" else "false" end) + "` |"] | join("\n"))
       else
         ""
       end)
@@ -628,7 +632,7 @@ publish_review() {
       "$JQ_BIN" -r '.meta.consecutive_rejections' "$pending_file" > "${review_dir}/consecutive_rejections.txt" || return 1
       "$JQ_BIN" -r '.meta.stalled_rounds // 0' "$pending_file" > "${review_dir}/stalled_rounds.txt" || return 1
       if "$JQ_BIN" -e '.update_e2e_baseline == true and (.review.e2e_checks | type == "array") and (.review.e2e_checks | length > 0)' "$pending_file" >/dev/null 2>&1; then
-        "$JQ_BIN" '{issue_body_sha: (.issue_body_sha // ""), e2e_checks: (.review.e2e_checks | sort), updated_at: (.meta.updated_at // "")}' "$pending_file" > "${review_dir}/e2e-checks-baseline.json.tmp" || return 1
+        "$JQ_BIN" '{issue_body_sha: (.issue_body_sha // ""), e2e_checks: (.review.e2e_checks | sort), e2e_plan: (.review.e2e_plan // []), updated_at: (.meta.updated_at // "")}' "$pending_file" > "${review_dir}/e2e-checks-baseline.json.tmp" || return 1
         "$MV_BIN" "${review_dir}/e2e-checks-baseline.json.tmp" "${review_dir}/e2e-checks-baseline.json" || return 1
       fi
       "$JQ_BIN" '.meta' "$pending_file" > "${review_dir}/meta.json" || return 1
@@ -931,16 +935,18 @@ EOF
   # 读取既有 E2E 必验基线：若 Issue 正文未变更且非 E2E return_to_review 交接，宿主机将锁定既有 e2e_checks 防止把 E2E 故障现场倒灌为新前置条件
   e2e_baseline_file="${review_dir}/e2e-checks-baseline.json"
   baseline_e2e_checks="[]"
+  baseline_e2e_plan="[]"
   baseline_issue_body_sha=""
   e2e_baseline_locked=0
   e2e_baseline_section=""
   if [[ -s "$e2e_baseline_file" ]] && "$JQ_BIN" -e '(.e2e_checks | type == "array") and (.e2e_checks | length > 0)' "$e2e_baseline_file" >/dev/null 2>&1; then
     baseline_e2e_checks="$("$JQ_BIN" -c '.e2e_checks | sort' "$e2e_baseline_file")"
+    baseline_e2e_plan="$("$JQ_BIN" -c '.e2e_plan // []' "$e2e_baseline_file")"
     baseline_issue_body_sha="$("$JQ_BIN" -r '.issue_body_sha // ""' "$e2e_baseline_file")"
     if (( is_e2e_handoff == 0 )) && [[ "$issue_body_sha" == "$baseline_issue_body_sha" ]]; then
       e2e_baseline_locked=1
-      _bl_items="$("$JQ_BIN" -r -L "$SCRIPT_DIR" 'include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description' <<<"$baseline_e2e_checks")"
-      e2e_baseline_section=$'\n\n'"## 已锁定 E2E 必验基线（宿主机防漂移保护）"$'\n'"- 本 PR 既往 approve 已确立以下 \`e2e_checks\` 基线，且关联 Issue 正文未发生变更、本轮亦非 E2E \`return_to_review\` 交接。"$'\n'"- **禁止将上轮 E2E 报告中的外部 OS/桌面故障现场（如特定宿主机前台窗口状态、RDP 桌面环境异常等原始 Issue 未要求的条件）倒灌扩写进 \`e2e_checks\`**；若本轮 approve 且仍需 \`run_e2e\`，宿主机将自动沿用下方既有基线（除非走有效 \`skip_already_passed\` / \`skip_not_needed\`）："$'\n'"${_bl_items}"
+      _bl_items="$("$JQ_BIN" -r -L "$SCRIPT_DIR" --argjson checks "$baseline_e2e_checks" --argjson plan "$baseline_e2e_plan" 'include "workflow-e2e"; required_e2e_items($checks; $plan)[] | "- " + .id + " " + .description' <<<"null")"
+      e2e_baseline_section=$'\n\n'"## 已锁定 E2E 必验基线（宿主机防漂移保护）"$'\n'"- 本 PR 既往 approve 已确立以下 \`e2e_checks\` / \`e2e_plan\` 基线，且关联 Issue 正文未发生变更、本轮亦非 E2E \`return_to_review\` 交接。"$'\n'"- **禁止将上轮 E2E 报告中的外部 OS/桌面故障现场（如特定宿主机前台窗口状态、RDP 桌面环境异常等原始 Issue 未要求的条件）倒灌扩写进 \`e2e_checks\` 或篡改 \`e2e_plan\` 编号**；若本轮 approve 且仍需 \`run_e2e\`，宿主机将自动沿用下方既有基线（除非走有效 \`skip_already_passed\` / \`skip_not_needed\`）："$'\n'"${_bl_items}"
     fi
   fi
 
@@ -1131,9 +1137,10 @@ EOF
         if . == null then true
         elif type == "array" then
           all(type == "object"
-            and (.id | nonblank) and (.scenario | nonblank)
+            and (.id | valid_plan_id) and (.scenario | nonblank)
             and (.capability_basis | nonblank) and (.entrypoint | nonblank)
             and (.preflight_hint | nonblank) and (.preserve_first_run | type == "boolean"))
+          and (([.[] | .id] | length) == ([.[] | .id] | unique | length))
         else false end;
       def valid_dispositions($curr_ids; $v):
         if . == null then true
@@ -1259,10 +1266,14 @@ EOF
 
     if (( e2e_baseline_locked == 1 && valid_skip_bypass == 0 )); then
       cur_sorted_checks="$("$JQ_BIN" -c '.e2e_checks | sort' "$verdict_file")"
-      if [[ "$cur_sorted_checks" != "$baseline_e2e_checks" ]]; then
-        "$JQ_BIN" --argjson base "$baseline_e2e_checks" '.e2e_checks = $base' "$verdict_file" > "${verdict_file}.tmp"
+      cur_plan_json="$("$JQ_BIN" -c '.e2e_plan // []' "$verdict_file")"
+      if [[ "$cur_sorted_checks" != "$baseline_e2e_checks" ]] || [[ "$baseline_e2e_plan" != "[]" && "$cur_plan_json" != "$baseline_e2e_plan" ]]; then
+        "$JQ_BIN" --argjson base "$baseline_e2e_checks" --argjson base_plan "$baseline_e2e_plan" '
+          .e2e_checks = $base
+          | if ($base_plan | length) > 0 then .e2e_plan = $base_plan else . end
+        ' "$verdict_file" > "${verdict_file}.tmp"
         "$MV_BIN" "${verdict_file}.tmp" "$verdict_file"
-        extra_notice+=$'\n\n'"> 🔒 宿主机 \`e2e_checks\` 防漂移保护：关联 Issue 正文未更新且非 E2E \`return_to_review\` 交接，已忽略本轮复审对必验项的改写/扩写并继续沿用既往批准基线。"
+        extra_notice+=$'\n\n'"> 🔒 宿主机 \`e2e_checks\` 防漂移保护（含 \`e2e_plan\`）：关联 Issue 正文未更新且非 E2E \`return_to_review\` 交接，已忽略本轮复审对必验项或计划编号的改写/扩写并继续沿用既往批准基线。"
       fi
     elif "$JQ_BIN" -e '(.e2e_checks | length) > 0' "$verdict_file" >/dev/null 2>&1; then
       update_e2e_baseline=1

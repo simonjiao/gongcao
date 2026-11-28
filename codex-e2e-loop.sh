@@ -189,6 +189,13 @@ calc_backoff() {
 
 write_e2e_schema() {
   local schema_file="$1"
+  local req_checks="${2:-[]}"
+  local req_plan="${3:-[]}"
+  local allowed_ids_json="[]"
+  allowed_ids_json="$("$JQ_BIN" -c -L "$SCRIPT_DIR" --argjson checks "$req_checks" --argjson plan "$req_plan" '
+    include "workflow-e2e";
+    required_e2e_items($checks; $plan) | [.[].id]
+  ' <<<"null" 2>/dev/null || printf '[]')"
   "$CAT_BIN" > "$schema_file" <<'EOF'
 {
   "type": "object",
@@ -263,6 +270,11 @@ write_e2e_schema() {
   }
 }
 EOF
+  if [[ "$allowed_ids_json" != "[]" ]]; then
+    "$JQ_BIN" --argjson ids "$allowed_ids_json" '
+      .properties.scenarios.items.properties.id = { "type": "string", "enum": ($ids + [""]) }
+    ' "$schema_file" > "${schema_file}.tmp" && "$MV_BIN" "${schema_file}.tmp" "$schema_file"
+  fi
 }
 
 extract_linked_issue() {
@@ -536,12 +548,12 @@ publish_e2e_evidence() {
     }' > "${dest_dir}/manifest.json"
   printf 'manifest.json\n' >> "$archived_list_file"
 
-  "$GIT_BIN" -C "$ev_wt" add -- "$rel_dir" >&2
-  "$GIT_BIN" -C "$ev_wt" commit -m "qa(e2e): archive evidence for PR #${pr_num} (${head_sha:0:10}, ${verdict})" >&2
+  "$GIT_BIN" -C "$ev_wt" add -- "$rel_dir" >&2 || return 1
+  "$GIT_BIN" -C "$ev_wt" commit -m "qa(e2e): archive evidence for PR #${pr_num} (${head_sha:0:10}, ${verdict})" >&2 || return 1
 
   if ! "$GIT_BIN" -C "$ev_wt" push -u origin "$E2E_EVIDENCE_BRANCH" >&2; then
-    "$GIT_BIN" -C "$ev_wt" pull --rebase origin "$E2E_EVIDENCE_BRANCH" >&2
-    "$GIT_BIN" -C "$ev_wt" push -u origin "$E2E_EVIDENCE_BRANCH" >&2
+    "$GIT_BIN" -C "$ev_wt" pull --rebase origin "$E2E_EVIDENCE_BRANCH" >&2 || return 1
+    "$GIT_BIN" -C "$ev_wt" push -u origin "$E2E_EVIDENCE_BRANCH" >&2 || return 1
   fi
 
   local ev_sha
@@ -1131,7 +1143,7 @@ EOF
   result_file="${e2e_dir}/result-${run_ts}.json"
   comment_file="${e2e_dir}/e2e-comment.md"
   meta_file="${e2e_dir}/meta.json"
-  write_e2e_schema "$schema_file"
+  write_e2e_schema "$schema_file" "$required_checks" "$required_plan"
 
   issue_num="$(extract_linked_issue "$pr_body" "$head_branch")"
   issue_section="（未识别到关联 Issue，请依据 PR 描述与变更内容设计并执行端到端验证）"
@@ -1155,18 +1167,21 @@ EOF
 
   required_checks_section=""
   if [[ "$required_checks" != "[]" ]]; then
-    required_checks_section=$'\n\n'"## 当前提交的 E2E 必验场景"$'\n'
-    required_checks_section+="$("$JQ_BIN" -r -L "$SCRIPT_DIR" '
-      include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description
-    ' <<<"$required_checks")"
-  fi
-  if [[ "$required_plan" != "[]" ]]; then
-    required_checks_section+=$'\n\n'"## 评审结构化前置计划（e2e_plan）"$'\n'
-    required_checks_section+="$("$JQ_BIN" -r '
-      .[] | "- `" + (.id // "") + "` · 入口 `" + (.entrypoint // "") + "` · 能力依据：" + (.capability_basis // "")
-        + " · 轻量预检：" + (.preflight_hint // "")
-        + (if .preserve_first_run == true then " · **必须保留首跑产物于 `attempt-1/` 目录不被覆盖**" else "" end)
-    ' <<<"$required_plan" 2>/dev/null || true)"
+    if "$JQ_BIN" -e -L "$SCRIPT_DIR" 'include "workflow-e2e"; valid_e2e_plan' <<<"$required_plan" >/dev/null 2>&1; then
+      required_checks_section=$'\n\n'"## 当前提交的 E2E 必验场景（权威 ID 与前置计划，\`scenarios[].id\` 必须严格使用下列 ID）"$'\n'
+      required_checks_section+="$("$JQ_BIN" -r '
+        .[] | "- `" + (.id // "") + "` " + (.scenario // "") + " · 入口 `" + (.entrypoint // "") + "` · 能力依据：" + (.capability_basis // "")
+          + " · 轻量预检：" + (.preflight_hint // "")
+          + (if .preserve_first_run == true then " · **必须保留首跑产物于 `attempt-1/` 目录不被覆盖**" else "" end)
+      ' <<<"$required_plan" 2>/dev/null || true)"
+      required_checks_section+=$'\n\n'"### 评审补充细则（e2e_checks 原文，不重新编号）"$'\n'
+      required_checks_section+="$("$JQ_BIN" -r '.[] | "- " + .' <<<"$required_checks")"
+    else
+      required_checks_section=$'\n\n'"## 当前提交的 E2E 必验场景"$'\n'
+      required_checks_section+="$("$JQ_BIN" -r -L "$SCRIPT_DIR" '
+        include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description
+      ' <<<"$required_checks")"
+    fi
   fi
   plan_file="${e2e_dir}/plan-${run_ts}.json"
   printf '%s\n' "$required_plan" > "$plan_file"
@@ -1347,7 +1362,7 @@ ${pr_diff_snippet:-"(空 diff)"}
    - \`blocked\`：**仅当确实缺少外部权限、产品/Owner 授权或外部验收环境/OS 桌面约束无法自行恢复时**才使用 \`blocked\`；必须在 \`failure_details\` 或 \`remaining_risks\` 中写清**需要谁做什么**才能解除阻塞，不要把 QA 脚本缺失或必验项前提不成立笼统判为 \`blocked\`，也不要用本机单测冒充真实 E2E 通过。
 6. 最终输出必须严格符合提供的 JSON Schema，使用简洁清晰的中文表述。
    - 填写 \`failure_stage\`（\`pass\` 时填 \`""\`；非 \`pass\` 时填写简短稳定的英文 kebab-case 检查点标识，如 \`login-main\`、\`preflight\`、\`focus-handoff\`、\`cleanup-gate\`，若与上轮相同检查点复发则沿用原标识）与 \`reproducible_in_dev_sandbox\`（\`pass\` 时填 \`true\`；非 \`pass\` 时如实判断离线 Dev sandbox 能否确定性复现并验证修复，外部 OS/桌面/RDP/宿主机环境约束必须填 \`false\`）；在 \`failure_details\` 中为每条失败/退回项填写稳定的 kebab-case \`id\` 与可验证的 \`closure_criteria\`（前置状态 → 操作 → 预期结果），供下游 Dev 逐项提交关闭证据。
-   - 每个评审必验场景用一个 \`scenarios\` 条目记录，原样填写 \`id\`（如 \`E1\`），用 \`name\` 和 \`details\` 描述实测。逐项填写相对于 \`${artifacts_dir}\` 的 \`scenarios[].evidence_paths\`（若评审 \`e2e_plan\` 要求保留首跑，须包含 \`attempt-1/\` 下的独立首跑证据路径），并把这些路径也列在顶层 \`evidence_paths\` 中。其他场景的 \`id\` 留空。**所有必验场景必须真实执行并全部为 \`passed\` 且留存证据后才允许输出 \`pass\`**；若任一必验场景未执行（\`NOT_RUN\`）或仅靠单测替代，禁止标为 \`passed\` 或输出 \`pass\`，应按原因选择 \`return_to_dev\` / \`return_to_review\` / \`blocked\`。
+   - 每个评审必验场景用一个 \`scenarios\` 条目记录，原样填写上方必验清单中的权威 \`id\`（优先以 \`e2e_plan\` 中的 \`id\` 如 \`E0\`、\`REQ-VIEWER-E2E\` 为准，禁止自行改名或顺延重编；无 \`e2e_plan\` 时按 \`E1\`、\`E2\` 填写），用 \`name\` 和 \`details\` 描述实测。逐项填写相对于 \`${artifacts_dir}\` 的 \`scenarios[].evidence_paths\`（若评审 \`e2e_plan\` 要求保留首跑，须包含 \`attempt-1/\` 下的独立首跑证据路径），并把这些路径也列在顶层 \`evidence_paths\` 中。其他额外场景的 \`id\` 留空 \`""\`。**所有必验场景必须真实执行并全部为 \`passed\` 且留存证据后才允许输出 \`pass\`**；若任一必验场景未执行（\`NOT_RUN\`）或仅靠单测替代，禁止标为 \`passed\` 或输出 \`pass\`，应按原因选择 \`return_to_dev\` / \`return_to_review\` / \`blocked\`。
 EOF
 
   codex_ok=0

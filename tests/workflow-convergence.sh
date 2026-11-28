@@ -269,13 +269,14 @@ assert_calls 1 'set-state pr 7 blocked'
 grep -Fq 'E1 缺少唯一的通过记录' "$new_e2e_root/pr-7/e2e-comment.md" || fail '无实际证据的场景被接受'
 rm "$fixture/skip-artifact"
 
-git --git-dir="$fixture/origin" worktree add -q "$fixture/archive" qa/e2e-evidence
+git clone -q -b qa/e2e-evidence "$fixture/origin" "$fixture/archive"
 archives=("$fixture/archive/pr-7/"*)
 [[ "${#archives[@]}" == "1" && -f "${archives[0]}/artifacts/upgrade.log" ]] || fail 'E2E 证据归档失败'
 entry="${archives[0]}"
 commit_archive() {
   git -C "$fixture/archive" add -A
   git -C "$fixture/archive" -c user.name=Test -c user.email=test@example.invalid commit -qm "$1"
+  git -C "$fixture/archive" push -q origin qa/e2e-evidence
 }
 jq -n '{
   verdict:"merge", summary:"可合入", merge_method:"merge", merge_method_reason:"默认",
@@ -973,6 +974,102 @@ E2E_ROOT="$fixture/e2e-viewer-not-run" run_loop e2e
 assert_calls "$before_nr_pass" 'set-state pr 7 e2e-passed'
 assert_calls "$((before_nr_blk + 1))" 'set-state pr 7 blocked'
 grep -Fq '固化到项目维护 QA 入口' "$fixture/last-prompt" || fail 'E2E 提示词未包含可复用 QA 准备交接给 Dev 的规则'
+
+# 18. 非连续/语义化 e2e_plan ID（E0 / E1 / REQ-VIEWER-E2E / E2）全链路编号交接回归（复现 PR #491 误拦）
+id_rev="$fixture/reviews-plan-ids"
+jq -n --arg sha "$MOCK_SHA" '[{number: 7, title:"Fixture", body:"Closes #42 编号交接回归", url:"https://example.invalid/pull/7",
+  headRefName:"main", baseRefName:"main", headRefOid:$sha, mergeable:"MERGEABLE", updatedAt:"plan-ids-1"}]' > "$fixture/pr.json"
+jq -n '{title:"语义化场景编号", body:"[REQ-VIEWER-E2E] 查看者独立 Guest 验收", labels:[], url:"https://example.invalid/issues/42"}' > "$fixture/issue.json"
+
+# 18a: 重复 e2e_plan[].id 与含空白字符的非法 ID 均在 Review 宿主机门禁拦截
+before_id_app="$(grep -Fxc -- 'set-state pr 7 approved' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"approve", summary:"重复 ID", e2e_decision:"run_e2e", e2e_decision_reason:"测试",
+  e2e_checks:["E0 预检", "E1 正常轮"],
+  e2e_plan:[
+    {id:"E1", scenario:"预检", capability_basis:"支持", entrypoint:"qa/run.py", preflight_hint:"preflight", preserve_first_run:true},
+    {id:"E1", scenario:"正常轮", capability_basis:"支持", entrypoint:"qa/run.py", preflight_hint:"preflight", preserve_first_run:true}
+  ],
+  previous_blocker_dispositions:[], requires_human_decision:false, blocking_issues:[], non_blocking_notes:[], requirements_coverage:[]
+}' > "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test18-none" REVIEWS_ROOT="$id_rev" run_loop review
+assert_calls "$before_id_app" 'set-state pr 7 approved'
+
+jq '.e2e_plan[1].id = "REQ VIEWER"' "$fixture/verdict.json" > "$fixture/verdict-tmp.json"
+mv "$fixture/verdict-tmp.json" "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test18-none" REVIEWS_ROOT="$id_rev" run_loop review
+assert_calls "$before_id_app" 'set-state pr 7 approved'
+
+# 18b: 合法的 E0 / E1 / REQ-VIEWER-E2E / E2 通过 Review，评审评论不再叠加冲突的 E1..E4 前缀
+jq -n '{
+  verdict:"approve", summary:"四项语义化编号通过评审", e2e_decision:"run_e2e", e2e_decision_reason:"执行四项验收",
+  e2e_checks:["E0 双账号预检", "E1 编辑正常轮", "REQ-VIEWER-E2E 查看者只读与 403", "E2 清理故障轮"],
+  e2e_plan:[
+    {id:"E0", scenario:"双账号预检", capability_basis:"支持双账号", entrypoint:"qa/run.py --preflight", preflight_hint:"preflight", preserve_first_run:true},
+    {id:"E1", scenario:"编辑正常轮", capability_basis:"支持编辑", entrypoint:"qa/run.py", preflight_hint:"preflight", preserve_first_run:true},
+    {id:"REQ-VIEWER-E2E", scenario:"查看者只读与 403", capability_basis:"QA 夹具 VIEWER", entrypoint:"qa/run.py", preflight_hint:"preflight", preserve_first_run:true},
+    {id:"E2", scenario:"清理故障轮", capability_basis:"支持故障注入", entrypoint:"qa/run.py --fault", preflight_hint:"preflight", preserve_first_run:true}
+  ],
+  previous_blocker_dispositions:[], requires_human_decision:false, blocking_issues:[], non_blocking_notes:[],
+  requirements_coverage:[{
+    id:"REQ-VIEWER-E2E", requirement:"查看者只读与写入 403", status:"partial",
+    requires_real_e2e:true, disposition:"scheduled_e2e", e2e_plan_ids:["REQ-VIEWER-E2E"], waiver_ref:"",
+    evidence:"已纳入 REQ-VIEWER-E2E 验收计划"
+  }]
+}' > "$fixture/verdict.json"
+E2E_EVIDENCE_BRANCH="qa/test18-none" REVIEWS_ROOT="$id_rev" run_loop review
+assert_calls "$((before_id_app + 1))" 'set-state pr 7 approved'
+! grep -Fq -- '- E4 REQ-VIEWER-E2E' "$fixture/review-comment" || fail '评审评论不应再给 e2e_plan 场景叠加合成 E4 前缀'
+! grep -Fq -- '- E1 E0' "$fixture/review-comment" || fail '评审评论不应再给 E0 场景叠加合成 E1 前缀'
+
+# 18c: E2E schema 动态约束 enum；漏报 REQ-VIEWER-E2E 精确报 REQ-VIEWER-E2E（非 E4）；四项齐全通过 E2E + Final-Gate
+before_id_blk="$(grep -Fxc -- 'set-state pr 7 blocked' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"pass", summary:"漏报查看者场景", environment:"zapto", failure_stage:"", reproducible_in_dev_sandbox:true,
+  scenarios:[
+    {id:"E0", name:"预检", status:"passed", details:"预检通过", evidence_paths:["runs/E1/attempt-1/report.log"]},
+    {id:"E1", name:"正常轮", status:"passed", details:"正常轮通过", evidence_paths:["runs/E1/attempt-1/report.log"]},
+    {id:"E2", name:"故障轮", status:"passed", details:"故障轮通过", evidence_paths:["runs/E1/attempt-1/report.log"]}
+  ],
+  evidence_paths:["runs/E1/attempt-1/report.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$fixture/e2e-plan-ids-miss" run_loop e2e
+assert_calls "$((before_id_blk + 1))" 'set-state pr 7 blocked'
+jq -e '.properties.scenarios.items.properties.id.enum == ["E0","E1","REQ-VIEWER-E2E","E2",""]' "$fixture/e2e-plan-ids-miss/pr-7/schema.json" >/dev/null \
+  || fail 'E2E schema.json 未按权威 e2e_plan ID 生成动态 enum 约束'
+! grep -Fq -- '- E4 REQ-VIEWER-E2E' "$fixture/last-prompt" || fail 'E2E 提示词不应再出现合成 E4 前缀'
+grep -Fq 'REQ-VIEWER-E2E 缺少唯一的通过记录' "$fixture/e2e-plan-ids-miss/pr-7/e2e-comment.md" || fail '漏报查看者场景时未按真实 ID REQ-VIEWER-E2E 报错'
+
+before_id_pass="$(grep -Fxc -- 'set-state pr 7 e2e-passed' "$fixture/calls" || true)"
+jq -n '{
+  verdict:"pass", summary:"四项语义化编号全部实测通过", environment:"zapto", failure_stage:"", reproducible_in_dev_sandbox:true,
+  scenarios:[
+    {id:"E0", name:"预检", status:"passed", details:"预检通过", evidence_paths:["runs/E1/attempt-1/report.log"]},
+    {id:"E1", name:"正常轮", status:"passed", details:"正常轮通过", evidence_paths:["runs/E1/attempt-1/report.log"]},
+    {id:"REQ-VIEWER-E2E", name:"查看者", status:"passed", details:"查看者只读且 403", evidence_paths:["runs/E1/attempt-1/report.log"]},
+    {id:"E2", name:"故障轮", status:"passed", details:"故障轮通过", evidence_paths:["runs/E1/attempt-1/report.log"]}
+  ],
+  evidence_paths:["runs/E1/attempt-1/report.log"], failure_details:[], remaining_risks:[]
+}' > "$fixture/result.json"
+E2E_ROOT="$fixture/e2e-plan-ids-ok" PUBLISH_EVIDENCE=1 run_loop e2e
+assert_calls "$((before_id_pass + 1))" 'set-state pr 7 e2e-passed'
+
+before_id_ready="$(grep -Fxc -- 'set-state pr 7 ready-to-merge' "$fixture/calls" || true)"
+AUTO_MERGE=0 FINAL_ROOT="$fixture/final-plan-ids-ok" run_loop final-gate
+assert_calls "$((before_id_ready + 1))" 'set-state pr 7 ready-to-merge'
+
+# 18d: 宿主机防漂移基线同时锁定 e2e_checks 与 e2e_plan（Issue 未变更时复审试图改写计划编号会被完整恢复）
+jq -n '{
+  verdict:"approve", summary:"企图篡改基线计划", e2e_decision:"run_e2e", e2e_decision_reason:"漂移",
+  e2e_checks:["漂移项"],
+  e2e_plan:[{id:"DRIFT-1", scenario:"漂移场景", capability_basis:"支持", entrypoint:"qa/drift.py", preflight_hint:"preflight", preserve_first_run:false}],
+  previous_blocker_dispositions:[], requires_human_decision:false, blocking_issues:[], non_blocking_notes:[], requirements_coverage:[]
+}' > "$fixture/verdict.json"
+set_pr_body 'Closes #42 编号交接回归 R2 漂移'
+E2E_EVIDENCE_BRANCH="qa/test18-none" REVIEWS_ROOT="$id_rev" run_loop review
+grep -Fq '防漂移保护' "$fixture/review-comment" || fail '未触发防漂移保护提示'
+jq -eRs -L "$fixture/workflow" 'include "workflow-e2e"; review_metadata | [.e2e_plan[].id] == ["E0","E1","REQ-VIEWER-E2E","E2"]' < "$fixture/review-comment" >/dev/null \
+  || fail '防漂移保护未同步恢复 e2e_plan 权威编号'
 rm -f "$fixture/issue.json"
 
 printf 'workflow convergence tests passed\n'

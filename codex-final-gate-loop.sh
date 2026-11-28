@@ -1627,9 +1627,9 @@ EOF
   required_checks_section=""
   checks_key_suffix=""
   if [[ "$required_checks" != "[]" ]]; then
-    required_checks_section="$("$JQ_BIN" -r -L "$SCRIPT_DIR" '
-      include "workflow-e2e"; numbered_e2e_checks[] | "- " + .id + " " + .description
-    ' <<<"$required_checks")"
+    required_checks_section="$("$JQ_BIN" -r -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson plan "$required_plan" '
+      include "workflow-e2e"; required_e2e_items($required; $plan)[] | "- " + .id + " " + .description
+    ' <<<"null")"
     checks_hash="$(printf '%s' "$required_checks" | "$SHA256SUM_BIN")"
     checks_key_suffix=":${checks_hash%% *}"
     archived_checks_hash="$("$JQ_BIN" -r '.review_checks_hash // ""' <<<"$ev_manifest_json" 2>/dev/null || true)"
