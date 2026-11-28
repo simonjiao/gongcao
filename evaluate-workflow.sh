@@ -278,17 +278,23 @@ fi
         empty_cnt=$((empty_cnt + 1))
       fi
     done
+    attempts_arr="[]"
+    if [[ -s "${d}/attempts.jsonl" ]]; then
+      attempts_arr="$("$JQ_BIN" -s 'map(select(type == "object")) | unique_by(.attempt_id // tostring)' "${d}/attempts.jsonl" 2>/dev/null || printf '[]')"
+    fi
     "$JQ_BIN" -n \
       --argjson pr_number "$pnum" \
       --argjson meta "$meta" \
       --argjson empty_results "$empty_cnt" \
-      --argjson results "$results_arr" '
+      --argjson results "$results_arr" \
+      --argjson attempts "$attempts_arr" '
       ($meta.issue_number // "" | tostring | if test("^[0-9]+$") then tonumber else null end) as $inum
       | {
           pr_number: $pr_number,
           issue_number: $inum,
           empty_results: $empty_results,
-          results: $results
+          results: $results,
+          attempts: $attempts
         }
     '
   done

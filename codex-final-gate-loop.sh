@@ -876,8 +876,36 @@ render_final_gate_markdown() {
 read_review_handoff() {
   "$JQ_BIN" -eRsc -L "$SCRIPT_DIR" --arg sha "$1" --arg parent "${2:-}" '
     include "workflow-e2e";
-    review_metadata | .e2e_checks = approved_e2e_checks($sha; $parent)
+    review_metadata
+    | .e2e_checks = approved_e2e_checks($sha; $parent)
+    | .e2e_plan = approved_e2e_plan($sha; $parent)
   '
+}
+
+verify_manifest_file_hashes() {
+  local entry_dir="$1"
+  local manifest_file="${entry_dir}/manifest.json"
+  [[ -f "$manifest_file" ]] || return 0
+  if ! "$JQ_BIN" -e '(.file_hashes | type) == "object" and (.file_hashes | length) > 0' "$manifest_file" >/dev/null 2>&1; then
+    return 0
+  fi
+  local rel="" expected_sha="" actual_sha="" bad_files=""
+  while IFS=$'\t' read -r rel expected_sha; do
+    [[ -z "$rel" ]] && continue
+    if [[ ! -f "${entry_dir}/${rel}" ]]; then
+      bad_files+="${rel}(缺失) "
+      continue
+    fi
+    actual_sha="$("$SHA256SUM_BIN" "${entry_dir}/${rel}" 2>/dev/null | awk '{print $1}')"
+    if [[ -z "$actual_sha" || "$actual_sha" != "$expected_sha" ]]; then
+      bad_files+="${rel}(哈希不匹配) "
+    fi
+  done < <("$JQ_BIN" -r '.file_hashes | to_entries[] | [.key, (.value.sha256 // "")] | @tsv' "$manifest_file" 2>/dev/null || true)
+  if [[ -n "$bad_files" ]]; then
+    printf '%s' "${bad_files% }"
+    return 1
+  fi
+  return 0
 }
 
 record_resolved_conflict_sha() {
@@ -1489,6 +1517,7 @@ EOF
   rm_e2e_reused_sha=""
   review_skip_valid=0
   required_checks="[]"
+  required_plan="[]"
   review_parent_sha=""
   if [[ -n "$resolved_from_sha" ]]; then
     if [[ "$("$GIT_BIN" -C "$REPO_ROOT" rev-parse "${head_sha}^1" 2>/dev/null || true)" == "$resolved_from_sha" ]] \
@@ -1499,6 +1528,7 @@ EOF
   if [[ -z "$review_handoff_error" ]]; then
     if review_handoff="$(read_review_handoff "$head_sha" "$review_parent_sha" <<<"$prev_review_comment" 2>&1)"; then
       required_checks="$("$JQ_BIN" -c '.e2e_checks' <<<"$review_handoff")"
+      required_plan="$("$JQ_BIN" -c '.e2e_plan // []' <<<"$review_handoff")"
       rm_e2e_decision="$("$JQ_BIN" -r '.e2e_decision // ""' <<<"$review_handoff")"
       rm_e2e_reused_sha="$("$JQ_BIN" -r '.e2e_reused_sha // ""' <<<"$review_handoff")"
     else
@@ -1610,9 +1640,11 @@ EOF
     else
       artifact_files="$("$FIND_BIN" "${ev_entry_dir}/artifacts" -type f -printf '%P\0' 2>/dev/null \
         | "$JQ_BIN" -Rsc 'split("\u0000") | map(select(length > 0))' || printf '[]')"
-      if ! missing_checks="$("$JQ_BIN" -ec -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" '
+      if ! hash_err="$(verify_manifest_file_hashes "$ev_entry_dir")"; then
+        required_checks_error="QA 归档文件哈希校验失败（产物缺失或被篡改）：${hash_err}。"
+      elif ! missing_checks="$("$JQ_BIN" -ec -L "$SCRIPT_DIR" --argjson required "$required_checks" --argjson files "$artifact_files" --argjson plan "$required_plan" '
         include "workflow-e2e";
-        select(type == "object" and .verdict == "pass") | missing_e2e_checks($required; $files)
+        select(type == "object" and .verdict == "pass") | missing_e2e_checks($required; $files; ""; $plan)
       ' <<<"$ev_result_json")"; then
         required_checks_error="QA 归档缺少有效的通过结论。"
       elif [[ "$missing_checks" != "[]" ]]; then

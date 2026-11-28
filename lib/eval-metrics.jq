@@ -111,8 +111,31 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
           ) as $status
         | ($rev.verdicts // []) as $rev_verdicts
         | ($e2e.results // []) as $e2e_results
+        | ($e2e.attempts // []) as $e2e_attempts_all
+        | (if $since != "" then [$e2e_attempts_all[] | select(((.ts // "")[0:10]) >= $since or ((.ts // "") == ""))] else $e2e_attempts_all end) as $e2e_attempts
         | ($fin.decisions // []) as $fin_decisions
         | ([$rev_ev[] | select(.outcome == "approve" or .outcome == "request_changes")]) as $rev_verdict_ev
+        | ([$e2e_ev[] | select(.outcome == "crash-blocked")] | length) as $e2e_crash_ev
+        | ([$e2e_attempts[] | select(.route_category == "crash_blocked")] | length) as $e2e_crash_att
+        | ([($e2e.empty_results // 0), $e2e_crash_ev, $e2e_crash_att] | max) as $e2e_crash_total
+        | (if ($e2e_attempts | length) > 0 then
+            ([$e2e_attempts[] | select(.route_category == "product_fail")] | length)
+           else
+            ([$e2e_ev[] | select(.outcome == "fail")] | length)
+           end) as $e2e_product_fails
+        | (if ($e2e_attempts | length) > 0 then
+            ([$e2e_attempts[] | select(.route_category == "qa_return_to_dev" or .route_category == "preflight_return_to_dev")] | length)
+           else
+            ([$e2e_ev[] | select(.outcome == "return_to_dev")] | length)
+           end) as $e2e_return_to_dev
+        | (if ($e2e_attempts | length) > 0 then
+            ([$e2e_attempts[] | select(.route_category == "capability_return_to_review" or .route_category == "preflight_return_to_review")] | length)
+           else
+            ([$e2e_ev[] | select(.outcome == "return_to_review")] | length)
+           end) as $e2e_return_to_review
+        | ([$e2e_attempts[] | select((.route_category // "") | startswith("preflight_"))] | length) as $e2e_preflight_sc
+        | ([$e2e_attempts[] | select(.cleanup_ok == false)] | length) as $e2e_cleanup_fails
+        | ([$e2e_ev[] | select(.outcome == "blocked" or .outcome == "crash-blocked")] | length) as $e2e_blocked_total
         | {
             pr_number: $pr,
             issue_number: $issue,
@@ -135,9 +158,14 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
               review_conflict_requeues: ([$rev_ev[] | select(.outcome == "conflict-requeued")] | length),
               e2e_runs: ($e2e_ev | length),
               e2e_passes: ([$e2e_ev[] | select(.outcome == "pass")] | length),
-              e2e_fails: ([$e2e_ev[] | select(.outcome == "fail" or .outcome == "return_to_dev" or .outcome == "return_to_review")] | length),
-              e2e_blocked: ([$e2e_ev[] | select(.outcome == "blocked")] | length),
-              e2e_crashes: ($e2e.empty_results // 0),
+              e2e_fails: ($e2e_product_fails + $e2e_return_to_dev + $e2e_return_to_review),
+              e2e_product_fails: $e2e_product_fails,
+              e2e_return_to_dev: $e2e_return_to_dev,
+              e2e_return_to_review: $e2e_return_to_review,
+              e2e_preflight_short_circuits: $e2e_preflight_sc,
+              e2e_cleanup_failures: $e2e_cleanup_fails,
+              e2e_blocked: $e2e_blocked_total,
+              e2e_crashes: $e2e_crash_total,
               e2e_skipped: (if any($rev_ev[]; .target_state == "agy:e2e-skipped") then 1 else 0 end),
               final_runs: ($fin_ev | length),
               final_merges: ([$fin_ev[] | select(.outcome == "merge")] | length),
@@ -226,6 +254,11 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
           e2e_runs: ([$prs[].counts.e2e_runs] | add // 0),
           e2e_passes: ([$prs[].counts.e2e_passes] | add // 0),
           e2e_fails: ([$prs[].counts.e2e_fails] | add // 0),
+          e2e_product_fails: ([$prs[].counts.e2e_product_fails] | add // 0),
+          e2e_return_to_dev: ([$prs[].counts.e2e_return_to_dev] | add // 0),
+          e2e_return_to_review: ([$prs[].counts.e2e_return_to_review] | add // 0),
+          e2e_preflight_short_circuits: ([$prs[].counts.e2e_preflight_short_circuits] | add // 0),
+          e2e_cleanup_failures: ([$prs[].counts.e2e_cleanup_failures] | add // 0),
           e2e_blocked: ([$prs[].counts.e2e_blocked] | add // 0),
           e2e_crashes: ([$prs[].counts.e2e_crashes] | add // 0),
           e2e_skipped: ([$prs[].counts.e2e_skipped] | add // 0),
@@ -262,6 +295,7 @@ def build_metrics($events; $sessions; $reviews; $e2es; $finals; $filter_prs; $si
           schema_errors: ([$prs[].dev_signals.schema_errors] | add // 0),
           conflict_requeues: ([$prs[].counts.review_conflict_requeues] | add // 0),
           e2e_crashes: ([$prs[].counts.e2e_crashes] | add // 0),
+          e2e_cleanup_failures: ([$prs[].counts.e2e_cleanup_failures] | add // 0),
           final_crashes: ([$prs[].counts.final_crashes] | add // 0)
         }
       },
@@ -288,8 +322,9 @@ def render_metrics_markdown($repo_label):
   + " | " + ($st.review_duration_sec | fmt_dur) + " | "
   + (if $s.first_pass_rates_pct.review_r1 != null then "\($s.first_pass_rates_pct.review_r1)%" else "-" end) + " |\n"
   + "| E2E 验收 (e2e) | " + ($st.e2e_runs | tostring) + " | " + ($st.e2e_passes | tostring)
-  + " | " + ($st.e2e_fails | tostring) + " | " + ($st.e2e_blocked | tostring)
-  + " | 空结果/崩溃 " + ($st.e2e_crashes | tostring)
+  + " | " + ($st.e2e_fails | tostring) + " (产品" + ($st.e2e_product_fails | tostring) + "/QA退Dev" + ($st.e2e_return_to_dev | tostring) + "/退Review" + ($st.e2e_return_to_review | tostring) + ")"
+  + " | " + ($st.e2e_blocked | tostring)
+  + " | 崩溃 " + ($st.e2e_crashes | tostring) + " / 预检短路 " + ($st.e2e_preflight_short_circuits | tostring) + " / 清理失败 " + ($st.e2e_cleanup_failures | tostring)
   + " | " + ($st.e2e_duration_sec | fmt_dur) + " | "
   + (if $s.first_pass_rates_pct.e2e_r1 != null then "\($s.first_pass_rates_pct.e2e_r1)%" else "-" end) + " |\n"
   + "| 终审合入 (final-gate) | " + ($st.final_runs | tostring) + " | " + ($st.final_merges | tostring)

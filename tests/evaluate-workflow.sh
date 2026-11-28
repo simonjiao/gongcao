@@ -150,4 +150,34 @@ if PATH="$fixture/bin:$PATH" GONGCAO_HOME="$fixture/home" CODEX_REVIEW_HOME="$fi
 fi
 grep -Fq 'evaluate-workflow.sh login' "$fixture/missing.log" || fail '缺少 login 初始化提示'
 
+# 5. 验证 E2E 细分统计（产品失败 / QA退Dev / 退Review / 预检短路 / 清理失败）与无结果文件 crash-blocked 计入
+mkdir -p "$fixture/state/e2e/pr-300" "$fixture/state/sessions/issue-30"
+printf '{"issue_number":30,"title":"测试细化指标","pr_url":"https://github.com/example/app/pull/300","status":"blocked"}\n' \
+  > "$fixture/state/sessions/issue-30/meta.json"
+printf '{"issue_number":"30"}\n' > "$fixture/state/e2e/pr-300/meta.json"
+cat >> "$fixture/state/activity.log" <<'EOF'
+[2026-11-27 10:00:00] [codex-e2e] PR #300 (Issue #30, r1) -> return_to_dev (agy:changes-requested, 20s) preflight
+[2026-11-27 10:05:00] [codex-e2e] PR #300 (Issue #30, r2) -> return_to_review (agy:in-review, 15s) preflight
+[2026-11-27 10:10:00] [codex-e2e] PR #300 (Issue #30, r3) -> crash-blocked (agy:blocked, 100s) events.log
+EOF
+cat > "$fixture/state/e2e/pr-300/attempts.jsonl" <<'EOF'
+{"attempt_id":"a1","pr_number":300,"issue_number":"30","head_sha":"aaa","round":1,"verdict":"return_to_dev","final_state":"changes-requested","route_category":"preflight_return_to_dev","cleanup_ok":true,"duration_sec":20,"ts":"2026-11-27T10:00:00+08:00"}
+{"attempt_id":"a1","pr_number":300,"issue_number":"30","head_sha":"aaa","round":1,"verdict":"return_to_dev","final_state":"changes-requested","route_category":"preflight_return_to_dev","cleanup_ok":true,"duration_sec":20,"ts":"2026-11-27T10:00:00+08:00"}
+{"attempt_id":"a2","pr_number":300,"issue_number":"30","head_sha":"aaa","round":2,"verdict":"return_to_review","final_state":"in-review","route_category":"preflight_return_to_review","cleanup_ok":false,"duration_sec":15,"ts":"2026-11-27T10:05:00+08:00"}
+{"attempt_id":"a3","pr_number":300,"issue_number":"30","head_sha":"aaa","round":3,"verdict":"crash-blocked","final_state":"blocked","route_category":"crash_blocked","cleanup_ok":false,"duration_sec":100,"ts":"2026-11-27T10:10:00+08:00"}
+EOF
+GONGCAO_HOME="$fixture/home" REPO=example/app EVAL_ROOT="$fixture/eval-breakdown" \
+  bash "$repo_dir/evaluate-workflow.sh" --state-dir "$fixture/state" --pr 300 --metrics-only --output "$fixture/out-breakdown.md" \
+  >/dev/null 2>&1
+bd_json="$(ls "$fixture/eval-breakdown"/metrics-*.json | tail -n 1)"
+jq -e '
+  .summary.stage_totals.e2e_return_to_dev == 1
+  and .summary.stage_totals.e2e_return_to_review == 1
+  and .summary.stage_totals.e2e_preflight_short_circuits == 2
+  and .summary.stage_totals.e2e_cleanup_failures == 2
+  and .summary.stage_totals.e2e_crashes == 1
+  and .summary.stage_totals.e2e_blocked == 1
+' "$bd_json" >/dev/null || { cat "$bd_json" >&2; fail 'E2E 细分统计与 crash-blocked 计入不符合预期'; }
+grep -Fq 'QA退Dev1/退Review1' "$fixture/out-breakdown.md" || fail 'Markdown 报告未渲染 E2E 细分统计'
+
 printf 'evaluate workflow tests passed\n'

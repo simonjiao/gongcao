@@ -44,6 +44,9 @@ if [[ -z "$REPO_ARG" || "$REPO_ARG" == "-h" || "$REPO_ARG" == "--help" ]]; then
   POLL_INTERVAL      默认 60
   BASE_BRANCH        可选基准分支
   DEV_ENGINE         开发执行器 agy 或 codex，默认 agy
+  E2E_ENV_FILE       可选：项目私有 E2E 环境说明文件路径
+  E2E_PREFLIGHT_CMD  可选：宿主机 E2E 轻量预检命令（exit 0=通过，10=退Dev，11=退Review，其他=blocked）
+  E2E_CLEANUP_CMD    可选：宿主机幂等资源清理命令（每次验收结束、超时崩溃、启动补偿与 stop 时触发）
   RELEASE_ACCEPTANCE_RUNNER  可选的发布验收入口，接收报告、CI 目录和发布状态目录
 
 在发版 Issue 正文单独放一行 <!-- gongcao-release -->，合入后的候选构建会进入 release 窗口。
@@ -83,6 +86,17 @@ case "$ACTION" in
 
   stop)
     if "$TMUX_BIN" has-session -t "$SESSION_NAME" 2>/dev/null; then
+      # 停止前先向 e2e 面板发送 SIGINT，给宿主机资源租约清理留出宽限窗口
+      if "$TMUX_BIN" list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx 'e2e'; then
+        "$TMUX_BIN" send-keys -t "${SESSION_NAME}:e2e" C-c 2>/dev/null || true
+        _stop_wait=0
+        while (( _stop_wait < 15 )); do
+          _pane_dead="$("$TMUX_BIN" display-message -p -t "${SESSION_NAME}:e2e" '#{pane_dead}' 2>/dev/null || printf '1')"
+          [[ "$_pane_dead" == "1" ]] && break
+          sleep 1
+          _stop_wait=$((_stop_wait + 1))
+        done
+      fi
       "$TMUX_BIN" kill-session -t "$SESSION_NAME"
       printf '已停止 tmux 会话: %s\n' "$SESSION_NAME"
     else
@@ -163,8 +177,14 @@ case "$ACTION" in
       "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-review-loop.sh")"
 
     # 窗口 2：e2e (codex-e2e-loop.sh)
+    e2e_env_prefix="$env_prefix"
+    for name in E2E_ENV_FILE E2E_PREFLIGHT_CMD E2E_CLEANUP_CMD E2E_ON_CRASH_CLEANUP_CMD; do
+      if [[ -n "${!name:-}" ]]; then
+        e2e_env_prefix+=" ${name}=$(printf '%q' "${!name}")"
+      fi
+    done
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "e2e" \
-      "${env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-e2e-loop.sh")"
+      "${e2e_env_prefix} $(printf '%q' "${SCRIPT_DIR}/codex-e2e-loop.sh")"
 
     # 窗口 3：final-gate (codex-final-gate-loop.sh: 终审对账 + 更新信息 + 自动合并)
     "$TMUX_BIN" new-window -t "$SESSION_NAME:" -n "final-gate" \

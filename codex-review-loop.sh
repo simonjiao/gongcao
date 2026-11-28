@@ -1125,11 +1125,12 @@ EOF
           ))
         end;
       ([.blocking_issues[].id] | unique) as $curr_ids
+      | .verdict as $verdict
       | (.blocking_issues | type == "array")
       and (.e2e_checks | valid_e2e_checks)
       and (.e2e_plan | valid_plan)
       and (.e2e_plan == null or ((.e2e_plan | length) == (.e2e_checks | length)))
-      and (.previous_blocker_dispositions | valid_dispositions($curr_ids; .verdict))
+      and (.previous_blocker_dispositions | valid_dispositions($curr_ids; $verdict))
       and (.requires_human_decision | type == "boolean")
       and ([.blocking_issues[].id] | all(type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and length == (unique | length))
       and (.blocking_issues | all(.verification | nonblank))

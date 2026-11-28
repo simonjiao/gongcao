@@ -23,6 +23,14 @@ def approved_e2e_checks($sha; $previous_sha):
   else error("评审必验场景格式无效")
   end;
 
+def approved_e2e_plan($sha; $previous_sha):
+  if type != "object" then []
+  elif .head_sha != $sha and ($previous_sha == "" or .head_sha != $previous_sha) then []
+  elif .verdict != "approve" then []
+  elif (.e2e_plan | type) == "array" then .e2e_plan
+  else []
+  end;
+
 def numbered_e2e_checks:
   to_entries | map({id: ("E" + ((.key + 1) | tostring)), description: .value});
 
@@ -41,11 +49,17 @@ def resolve_artifact_path($root; $files):
     null
   end;
 
-def missing_e2e_checks($checks; $files; $root):
+def is_first_run_evidence_path:
+  test("(^|/)(attempt-1|run-1|first-run)([/._-]|$)");
+
+def missing_e2e_checks($checks; $files; $root; $plan):
   (.scenarios | if type == "array" then map(objects) else [] end) as $scenarios
   | (.evidence_paths | if type == "array" then map(resolve_artifact_path($root; $files) | select(. != null)) else [] end) as $reported
+  | ($plan | if type == "array" then . else [] end) as $plan_arr
   | $checks | numbered_e2e_checks
-  | map(.id as $id
+  | map(.id as $id | .description as $desc
+      | ([$plan_arr[] | select(type == "object" and ((.id // "") == $id or (.scenario // "") == $desc))] | first // null) as $pitem
+      | (($pitem != null) and ($pitem.preserve_first_run == true)) as $need_first_run
       | [$scenarios[] | select(.id == $id)] as $matches
       | select(($matches | length) != 1 or (
           $matches[0] | (
@@ -54,9 +68,16 @@ def missing_e2e_checks($checks; $files; $root):
               resolve_artifact_path($root; $files) as $norm
               | $norm != null and ($reported | index($norm)) != null
             ))
+            and (
+              ($need_first_run | not)
+              or (.evidence_paths | any(resolve_artifact_path($root; $files) | . != null and is_first_run_evidence_path))
+            )
           ) | not
         ))
       | .id);
 
+def missing_e2e_checks($checks; $files; $root):
+  missing_e2e_checks($checks; $files; $root; []);
+
 def missing_e2e_checks($checks; $files):
-  missing_e2e_checks($checks; $files; "");
+  missing_e2e_checks($checks; $files; ""; []);
